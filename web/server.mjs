@@ -157,7 +157,7 @@ async function startAgent({newSession, sessionId, projectName = ''}) {
   // keeps the bounded shell tool available in the web runtime.
   const agentEnv = {...process.env};
   const setDefault = (name, value) => { if (!agentEnv[name]) agentEnv[name] = value; };
-  setDefault('VIMAX_CONTEXT_WINDOW_TOKENS', '1100000');
+  setDefault('VIMAX_CONTEXT_WINDOW_TOKENS', '900000');
   setDefault('VIMAX_MAX_TOOL_RESULT_CHARS', '20000');
   setDefault('VIMAX_ENABLE_RUN_SHELL', '1');
   const child = spawn(command, [...args, 'main_agent.py', '--jsonl', '--stdin-repl', ...sessionArgs], {
