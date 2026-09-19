@@ -149,9 +149,18 @@ async function startAgent({newSession, sessionId, projectName = ''}) {
       ? ['--session', sessionId]
       : [];
   activeSessionId = sessionId;
+  // Inject ViMax agent defaults unless the user already overrode them in the
+  // environment. Keeps the agent's request within the model context window:
+  // VIMAX_CONTEXT_WINDOW_TOKENS raises the auto-compaction trigger to ~1.1M
+  // (deepseek-v4-flash-0731 has a 1.31M window), and VIMAX_MAX_TOOL_RESULT_CHARS
+  // caps the tool-output copy replayed to the LLM.
+  const agentEnv = {...process.env};
+  const setDefault = (name, value) => { if (!agentEnv[name]) agentEnv[name] = value; };
+  setDefault('VIMAX_CONTEXT_WINDOW_TOKENS', '1100000');
+  setDefault('VIMAX_MAX_TOOL_RESULT_CHARS', '20000');
   const child = spawn(command, [...args, 'main_agent.py', '--jsonl', '--stdin-repl', ...sessionArgs], {
     cwd: repoRoot,
-    env: process.env,
+    env: agentEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   agentProcess = child;

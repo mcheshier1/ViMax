@@ -176,3 +176,56 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(data_url, json.dumps(events))
             self.assertNotIn(data_url, json.dumps(loop.history))
             self.assertNotIn(data_url, (index.logs_dir / "tool_calls.jsonl").read_text(encoding="utf-8"))
+
+
+    async def test_oversized_tool_result_is_truncated_for_llm_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            big = "Z" * 50000
+
+            def hello(args):
+                return ToolResult("hello", True, big)
+
+            registry = ToolRegistry([ToolSpec("hello", "Say hello", hello, schema={})])
+            llm = CapturingLLM(
+                [
+                    AssistantMessage(tool_calls=[ToolCall(name="hello", arguments={})]),
+                    AssistantMessage(text="done"),
+                ]
+            )
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            events = [event async for event in loop.stream_events("go")]
+            # The second LLM call is the one made after the tool runs.
+            tool_messages = [message for message in llm.calls[1] if message.get("role") == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertIn("[truncated", tool_messages[0]["content"])
+            # default VIMAX_MAX_TOOL_RESULT_CHARS cap is 20000
+            self.assertLessEqual(len(tool_messages[0]["content"]), 20000 + 80)
+            # the full result is still what the session/event stream records
+            self.assertTrue(any(event["type"] == "tool_result" and event["tool_result"]["content"] == big for event in events))
+
+
+    async def test_compaction_refires_mid_tool_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+
+            def hello(args):
+                return ToolResult("hello", True, "hello result")
+
+            registry = ToolRegistry([ToolSpec("hello", "Say hello", hello, schema={})])
+            # Low threshold so the accumulated history blows past it inside the loop.
+            compactor = ContextCompactor(None, token_threshold=1200, buffer_tokens=0, preserve_last_n=2, summary_max_chars=2000)
+            replies = [AssistantMessage(tool_calls=[ToolCall(name="hello", arguments={})]) for _ in range(3)]
+            replies.append(AssistantMessage(text="final"))
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), FakeLLM(replies), compactor)
+            loop.history = [
+                {"role": "user", "content": "old " + "a" * 2000},
+                {"role": "assistant", "content": "old ans " + "b" * 2000},
+                {"role": "user", "content": "mid " + "c" * 2000},
+                {"role": "assistant", "content": "mid ans " + "d" * 2000},
+            ]
+            events = [event async for event in loop.stream_events("generate")]
+            compact_phases = [event.get("phase") for event in events if event["type"] == "status" and event.get("phase") == "compact"]
+            self.assertGreaterEqual(len(compact_phases), 2)  # fired more than just the turn-start check
+            self.assertEqual(loop.history[0]["role"], "system")  # compaction replaced history head
+            self.assertEqual(loop.history[-1]["content"], "final")

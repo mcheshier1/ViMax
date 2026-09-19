@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -15,6 +16,26 @@ from .tool_executor import ToolExecutor
 from .tools import ToolRegistry, build_builtin_registry
 
 MAX_TOOL_PASSES = 50
+
+
+def _max_tool_result_chars() -> int:
+    """Max characters of a single tool result replayed to the LLM.
+
+    Tool outputs (e.g. large JSON artifacts or verbose tool dumps) are forwarded
+    verbatim to the next LLM sample. That unbounded replay is what can blow past
+    the model context window mid-turn. This caps the replayed copy only; the
+    authoritative result is still stored via the session index / tool executor.
+    """
+    try:
+        return max(0, int(os.environ.get("VIMAX_MAX_TOOL_RESULT_CHARS", "20000")))
+    except ValueError:
+        return 20000
+
+
+def _clip_tool_content(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 60)].rstrip() + f"\n... [truncated for LLM context; full result stored separately]"
 
 
 class AgentLoop:
@@ -56,7 +77,11 @@ class AgentLoop:
             parts = self.prompt_builder.build_parts(user_input)
             system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
         yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": self.prompt_builder.trace(parts)}
-        runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}]
+        # Messages accumulated *inside this turn* (assistant tool-calls + tool
+        # results + any tool-provided image blocks). Kept separate from
+        # self.history so history can be compacted mid-turn without losing the
+        # live in-turn messages. Rebuilt into the request on every sample.
+        in_turn: list[dict[str, Any]] = []
         assistant_turns: list[dict[str, Any]] = []
         tool_rounds: list[dict[str, Any]] = []
         transitions: list[dict[str, str]] = []
@@ -64,8 +89,22 @@ class AgentLoop:
         final_text = ""
         status = "completed"
         tool_round = 0
+        _max_result_chars = _max_tool_result_chars()
 
         while True:
+            # Re-check compaction before every sample — not just at turn start.
+            # History can grow past the model window while tools run, so guard the
+            # request again here.
+            if self.context_compactor.should_preflight_compact(
+                [*self.history, {"role": "user", "content": user_input}, *in_turn],
+                system_tokens=_prompt_tokens(parts),
+                tools_tokens=_tool_schema_tokens(tool_schemas),
+            ):
+                yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
+                await self.compact_history(reason="token-pressure")
+                parts = self.prompt_builder.build_parts(user_input)
+                system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+            runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}, *in_turn]
             yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
             try:
                 assistant = await self.llm.complete(runtime_messages, tools=tool_schemas)
@@ -91,7 +130,7 @@ class AgentLoop:
                 break
             tool_round += 1
             yield {"type": "status", "turn_id": control.turn_id, "phase": "executing_tools", "message": f"Running tools (round {tool_round})"}
-            runtime_messages.append({"role": "assistant", "content": assistant.text or "", "tool_calls": [_openai_tool_call(call) for call in assistant.tool_calls]})
+            in_turn.append({"role": "assistant", "content": assistant.text or "", "tool_calls": [_openai_tool_call(call) for call in assistant.tool_calls]})
             round_results: list[ToolResult] = []
             round_model_content: list[dict[str, Any]] = []
 
@@ -115,11 +154,16 @@ class AgentLoop:
                 round_results.append(result)
                 all_tool_results.append(result)
                 yield {"type": "tool_result", "turn_id": control.turn_id, "tool_result": result.as_dict()}
-                runtime_messages.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": json.dumps(result.as_dict(), ensure_ascii=False)})
+                tool_content = json.dumps(result.as_dict(), ensure_ascii=False)
+                if len(tool_content) > _max_result_chars:
+                    # Cap only the copy replayed to the LLM; the authoritative,
+                    # full result is still stored by the tool executor / session.
+                    tool_content = _clip_tool_content(tool_content, _max_result_chars)
+                in_turn.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": tool_content})
                 if result.model_content:
                     round_model_content.extend(result.model_content)
             if round_model_content:
-                runtime_messages.append(
+                in_turn.append(
                     {
                         "role": "user",
                         "content": [

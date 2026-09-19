@@ -96,9 +96,10 @@ class ImageGeneratorOpenRouterAPI:
             "model": self.model,
             "prompt": request_prompt,
             "n": 1,
-            "quality": kwargs.get("quality", self.quality),
-            "background": kwargs.get("background", self.background),
         }
+        if self.model.startswith("openai/"):
+            payload["quality"] = kwargs.get("quality", self.quality)
+            payload["background"] = kwargs.get("background", self.background)
         compression = kwargs.get("output_compression", self.output_compression)
         if compression is not None:
             payload["output_compression"] = compression
