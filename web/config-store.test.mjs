@@ -2,7 +2,7 @@ import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
+import {readAgentConfig, readClipSettings, saveAgentConfig} from './config-store.mjs';
 
 const roots = [];
 
@@ -26,6 +26,39 @@ async function fixture() {
 }
 
 describe('agent config store', () => {
+  it('reads the clip length from the config, which outranks the environment', async () => {
+    const root = await fixture();
+    await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['video:', '  model: some/video-model', '  clip_seconds: 8', ''].join('\n'));
+    // A duration exported into the environment is invisible from the project and set every
+    // clip of a sequence to 5 seconds while its dialogue needed 8, so the file wins.
+    process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '5';
+    try {
+      expect(await readClipSettings(root)).toEqual({seconds: 8, model: 'some/video-model'});
+    } finally {
+      delete process.env.VIMAX_OPENROUTER_VIDEO_DURATION;
+    }
+  });
+
+  it('falls back to the environment, then to eight seconds', async () => {
+    const root = await fixture();
+    process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '10';
+    try {
+      expect((await readClipSettings(root)).seconds).toBe(10);
+    } finally {
+      delete process.env.VIMAX_OPENROUTER_VIDEO_DURATION;
+    }
+    expect((await readClipSettings(root)).seconds).toBe(8);
+  });
+
+  it('keeps a clip length through a save from the settings page', async () => {
+    const root = await fixture();
+    await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['video:', '  model: some/video-model', '  clip_seconds: 8', ''].join('\n'));
+
+    await saveAgentConfig(root, {sections: {video: {model: 'other/video-model'}}});
+
+    expect((await readClipSettings(root)).seconds).toBe(8);
+  });
+
   it('never returns stored API keys', async () => {
     const root = await fixture();
     const config = await readAgentConfig(root);

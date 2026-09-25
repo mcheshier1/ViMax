@@ -57,6 +57,10 @@ class PromptBuilder:
         session = snapshot.get("session") or {}
         checklist = snapshot.get("artifact_checklist") or {}
         lines = [f"Active session: {snapshot.get('active_session_id') or '<none>'}", f"Working dir: {session.get('working_dir', '<none>')}", f"Stage: {session.get('stage', '<none>')}"]
+        style = str(session.get("style", "") or "").strip()
+        lines.append(f"Style: {style or '<unset; confirm with the user before rendering>'}")
+        if style:
+            lines.append("This style is interpolated into the character portrait prompt and inherited by every later frame. Quote it verbatim when asking the user to confirm the rendered look.")
         compacted_summary = str(session.get("compacted_summary", "") or "").strip()
         lines.extend(["", "Session context summary:"])
         if compacted_summary:

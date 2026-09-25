@@ -1,5 +1,6 @@
 from typing import List, Optional, Literal
 import asyncio
+import math
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt
 
@@ -46,6 +47,7 @@ The user will provide the following input.
 - Keep character names in visual descriptions and speaker fields consistent with the character list. In visual descriptions, enclose names in angle brackets (e.g., <Alice>), but not in dialogue or speaker fields.
 - When describing visual elements, it is necessary to indicate the position of the element within the frame. For example, Character A is on the left side of the frame, facing toward the right, with a table in front of him. The table is positioned slightly to the left of the center of the frame. Ensure that invisible elements are not included. For instance, do not describe someone behind a closed door if they cannot be seen.
 - Avoid unsafe content (violence, discrimination, etc.) in visual descriptions. Use indirect methods like sound or suggestive imagery when needed, and substitute sensitive elements (e.g., ketchup for blood).
+- Every shot's visual description must state the location and what surrounds the subject, even for a close-up (e.g. "in the living room, the green couch and the trophy shelf behind her"). A close-up that names no surroundings has nothing for the image model to place the character in, and renders against a blank backdrop.
 - Assign at most one dialogue line per character per shot. Each line of dialogue should correspond to a shot.
 - Each shot requires an independent description without reference to each other.
 - When the shot focuses on a character, describe which specific body part the focus is on.
@@ -66,6 +68,10 @@ human_prompt_template_design_storyboard = \
 <USER_REQUIREMENT>
 {user_requirement_str}
 </USER_REQUIREMENT>
+
+<RENDER_CONSTRAINT>
+{runtime_str}
+</RENDER_CONSTRAINT>
 """
 
 
@@ -94,6 +100,7 @@ Additionally, you will receive a sequence of potential characters, each containi
 [Guidelines]
 - Ensure all output values (except keys) match the language used in the script.
 - Ensure the first and last frame descriptions are pure "snapshots," containing no ongoing actions (e.g., "He is about to stand up" is unacceptable; it should be "He is sitting on the chair, leaning slightly forward").
+- Every first and last frame description must name the location and what is behind and around the subject, in even the tightest close-up (e.g. "in the living room, the green couch and the trophy shelf behind her"). A description that only characterizes a person leaves the image model nothing to place them in, and renders them against a blank studio backdrop, which then lands in the finished film as a white card.
 - In the motion description, you must clearly distinguish between camera movement and on-screen movement. Use professional cinematic terminology (e.g., dolly shot, pan, zoom, etc.) as precisely as possible to describe camera movement.
 - In the motion description, you cannot directly use character names to refer to characters; instead, you should use the characters' visible characteristics to refer to them. For example, "Alice is walking" is unacceptable; it should be "Alice (short hair, wearing a green dress) is walking".
 - The last frame description must be logically consistent with the first frame description and the motion description. All actions described in the motion section should be reflected in the static image of the last frame.
@@ -182,6 +189,7 @@ class StoryboardArtist:
         characters: List[CharacterInScene],
         user_requirement: Optional[str] = None,
         retry_timeout: int = 150,
+        clip_seconds: Optional[int] = None,
     ) -> List[ShotBriefDescription]:
 
         class StoryboardResponse(BaseModel):
@@ -192,11 +200,19 @@ class StoryboardArtist:
         script_str = script.strip()
         characters_str = "\n".join([f"Character {index}: {char}" for index, char in enumerate(characters)])
         user_requirement_str = user_requirement.strip() if user_requirement else ""
+        # A plan cannot meet a runtime it cannot see: each shot renders as a fixed
+        # number of seconds, so the shot count is the only lever the storyboard has.
+        runtime_str = (
+            f"Every shot is rendered as {clip_seconds} seconds of video, so the shot count is what sets the runtime of the finished film. "
+            f"Plan no more shots than the requested runtime allows: at most {math.floor(60 / clip_seconds)} shots per minute asked for."
+            if isinstance(clip_seconds, int) and clip_seconds > 0
+            else ""
+        )
 
         parser = PydanticOutputParser(pydantic_object=StoryboardResponse)
         messages = [
             ('system', system_prompt_template_design_storyboard.format(format_instructions=parser.get_format_instructions())),
-            ('human', human_prompt_template_design_storyboard.format(script_str=script_str, characters_str=characters_str, user_requirement_str=user_requirement_str)),
+            ('human', human_prompt_template_design_storyboard.format(script_str=script_str, characters_str=characters_str, user_requirement_str=user_requirement_str, runtime_str=runtime_str)),
         ]
         chain = self.chat_model | parser
         response: StoryboardResponse = await asyncio.wait_for(

@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import json
 import logging
@@ -13,8 +14,9 @@ from interfaces import *
 from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
 from utils.provider_presets import resolve_chat_model_config
+from utils.text import safe_path_component
 
-
+from .render_contract import DEFAULT_RENDER_PHASE, ModelScopedArtifacts, RenderOutcome, normalize_phase
 
 
 TModel = TypeVar("TModel")
@@ -78,7 +80,7 @@ def _scoped_progress(progress, **scope):
     return emit
 
 
-class Script2VideoPipeline:
+class Script2VideoPipeline(ModelScopedArtifacts):
 
     def __init__(
         self,
@@ -103,6 +105,76 @@ class Script2VideoPipeline:
         self.character_portrait_events = {}
         self.shot_desc_events = {}
         self.frame_events = {}
+        # Set from the video model's catalogue at render start; assumed until then.
+        self.frame_bracketing = True
+        # What a render has already drawn a video for: one video per render, clips and
+        # transitions both, because a video costs many times a frame (see `_claim_video`).
+        self._video_drawn_by = ""
+        # Shots whose frames this render is not drawing, because the transition video that
+        # would have produced them was deferred past the one-video rule.
+        self._deferred_frame_shots: set[int] = set()
+
+    def _claim_video(self, what: str) -> bool:
+        """Whether this render may draw a video, recording what it is for.
+
+        A clip costs many times a keyframe, and a render that names no shots is how a batch
+        nobody chose gets bought: nine clips went out in one run of this sequence. A
+        transition video is a paid clip too, drawn while stills are rendered, so a stills
+        pass over two parented cameras billed two of them without saying so. The first
+        caller to ask draws it; every other caller is told no and reports what it is
+        leaving for the next render.
+        """
+        if self._video_drawn_by:
+            return False
+        self._video_drawn_by = what
+        return True
+
+    def reference_image_limit(self) -> Optional[int]:
+        """Reference images the image model accepts, or ``None`` when unbounded.
+
+        Read from the generator at selection time: the limit comes from a
+        catalogue fetched on the first image request, which happens well after
+        this pipeline is constructed, and a provider that refused a request may
+        have narrowed it further since.
+        """
+        return getattr(self.image_generator, "reference_limit", None)
+
+    def clip_seconds(self) -> Optional[int]:
+        """Seconds of video each shot renders as.
+
+        The storyboard needs this to meet a requested runtime: the shot count is
+        what sets the length of the finished film, and a plan cannot size itself
+        against a duration it cannot see.
+        """
+        return getattr(self.video_generator, "clip_seconds", None)
+
+    async def _brackets_clips(self) -> bool:
+        """Whether the video model accepts an end keyframe.
+
+        A clip generated between two keyframes cannot wander; given only a start
+        frame the model invents the rest of the shot, which is why the room drifts
+        across a clip and the cut into the next shot reads as a jump. Generating an
+        end keyframe for a model that rejects one would burn image calls for
+        nothing, so the answer comes from the model's own catalogue.
+        """
+        probe = getattr(self.video_generator, "supports_last_frame", None)
+        if probe is None:
+            # Providers without a capability catalogue (the yunwu/Veo generator)
+            # take both frames.
+            return True
+        return bool(await probe())
+
+    def _frame_stills(self, shot_descriptions: List[ShotDescription]) -> List[str]:
+        """Keyframes video generation will consume, in shot order."""
+        stills: List[str] = []
+        for shot_description in shot_descriptions:
+            first_frame = self.frame_path(shot_description.idx, "first_frame")
+            if os.path.exists(first_frame):
+                stills.append(first_frame)
+            last_frame = self.frame_path(shot_description.idx, "last_frame")
+            if os.path.exists(last_frame):
+                stills.append(last_frame)
+        return stills
 
 
     async def plan_text_artifacts(
@@ -123,6 +195,8 @@ class Script2VideoPipeline:
         self.character_portrait_events = {}
         self.shot_desc_events = {}
         self.frame_events = {}
+        self._video_drawn_by = ""
+        self._deferred_frame_shots = set()
 
         if characters is None:
             _emit_text_plan_progress(progress, "extract_characters", "Extracting characters from script")
@@ -143,6 +217,7 @@ class Script2VideoPipeline:
             characters=characters,
             user_requirement=user_requirement,
             quiet=quiet,
+            clip_seconds=self.clip_seconds(),
         )
         _emit_text_plan_progress(progress, "decompose_shots", "Decomposing shot visual descriptions", {"shot_count": len(storyboard)})
         shot_descriptions = await self.decompose_visual_descriptions(
@@ -201,8 +276,19 @@ class Script2VideoPipeline:
         character_portraits_registry: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
         quiet: bool = False,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
-    ):
-        _emit_render_progress(progress, "render_start", "Starting script2video render")
+        stop_after: str = DEFAULT_RENDER_PHASE,
+        revision_notes: Dict[str, str] | None = None,
+        only_shots: Optional[List[int]] = None,
+    ) -> RenderOutcome:
+        stop_after = normalize_phase(stop_after)
+        # A redo names shots, and a run works on those shots: the stills of the others are left
+        # for their own turn rather than drawn because a phase run was the easier way to ask.
+        only_set = {int(idx) for idx in only_shots} if only_shots else None
+        # What a human said was wrong with the shots being redrawn, by shot. A redraw
+        # without it repeats the mistake the note describes.
+        self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
+        _emit_render_progress(progress, "render_start", "Starting script2video render", {"stop_after": stop_after})
+        self.frame_bracketing = await self._brackets_clips()
         if characters is None:
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
             characters = await self.extract_characters(script=script, quiet=quiet)
@@ -225,7 +311,7 @@ class Script2VideoPipeline:
                 self.character_portrait_events[character.idx] = asyncio.Event()
 
         if character_portraits_registry is None:
-            character_portraits_registry_path = os.path.join(self.working_dir, "character_portraits_registry.json")
+            character_portraits_registry_path = self.portraits_registry_path()
             if os.path.exists(character_portraits_registry_path):
                 with open(character_portraits_registry_path, "r", encoding="utf-8") as f:
                     character_portraits_registry = json.load(f)
@@ -246,6 +332,16 @@ class Script2VideoPipeline:
                 print(f"☑️ Generated {len(character_portraits_registry)} character portraits and saved to {character_portraits_registry_path}.")
                 _emit_render_progress(progress, "character_portraits_done", "Character portraits ready", {"count": len(character_portraits_registry)})
 
+        if stop_after == "portraits":
+            stills = self.portrait_stills(character_portraits_registry)
+            _emit_render_progress(
+                progress,
+                "portraits_ready",
+                "Character portraits ready for style review",
+                {"character_count": len(character_portraits_registry), "still_count": len(stills), "awaiting_confirmation": "stills", "style": style},
+            )
+            return self.render_outcome("portraits", style, stills=stills, awaiting="stills")
+
 
 
         # design shots
@@ -255,6 +351,7 @@ class Script2VideoPipeline:
             characters=characters,
             user_requirement=user_requirement,
             quiet=quiet,
+            clip_seconds=self.clip_seconds(),
         )
         _emit_render_progress(progress, "storyboard_ready", "Storyboard ready", {"shot_count": len(storyboard)})
 
@@ -276,6 +373,12 @@ class Script2VideoPipeline:
         _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
 
         priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
+        # Warm the image model's catalogue before any references are assembled: the reference
+        # limit comes from it, and the first frame of a run would otherwise be built as if the
+        # model took any number of them — one over the limit fails with nothing to learn from.
+        prepare = getattr(self.image_generator, "prepare", None)
+        if prepare is not None:
+            await prepare()
         _emit_render_progress(progress, "frames_start", "Generating frames for cameras", {"camera_count": len(camera_tree), "shot_count": len(shot_descriptions)})
         tasks = [
             self.generate_frames_for_single_camera(
@@ -285,22 +388,81 @@ class Script2VideoPipeline:
                 character_portraits_registry=character_portraits_registry,
                 priority_shot_idxs=priority_shot_idxs,
                 progress=progress,
+                only_shots=only_shots,
             )
             for camera in camera_tree
+            # A camera holding none of the named shots has nothing to draw: its cached frames
+            # still serve as references, and redrawing them is not what was asked for.
+            if only_set is None or only_set & set(camera.active_shot_idxs)
         ]
 
-        _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
-        video_tasks = [
-            self.generate_video_for_single_shot(
-                shot_description=shot_description,
-                progress=progress,
+        # Keyframes decide the look of the finished video and are the expensive part
+        # to get wrong, so the stills phase hands them back for review before any
+        # video generation is paid for.
+        if stop_after == "stills":
+            await asyncio.gather(*tasks)
+            stills = self._frame_stills(shot_descriptions)
+            _emit_render_progress(
+                progress,
+                "stills_ready",
+                "Keyframes ready for review",
+                {"shot_count": len(shot_descriptions), "still_count": len(stills), "awaiting_confirmation": "video"},
             )
+            return self.render_outcome("stills", style, stills=stills, awaiting="video")
+
+        _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
+        # One clip per render, always. A clip costs many times a frame, and a whole-film
+        # pass is how a batch nobody chose gets bought: nine clips went out in a single run
+        # of this sequence. The clip drawn is the first the film is missing, so the sequence
+        # fills from the front, and every other missing clip is named below and drawn when
+        # it is asked for. A redo names one shot, so it is a single clip already.
+        wanted_clips = [
+            shot_description
             for shot_description in shot_descriptions
+            if (only_set is None or shot_description.idx in only_set)
+            and not os.path.exists(self.clip_path(shot_description.idx))
+            # A camera whose frames this run is not drawing has nothing to animate, and
+            # waiting on a frame that is never drawn would hang here instead of deferring.
+            and shot_description.idx not in self._deferred_frame_shots
         ]
+        video_tasks = []
+        if wanted_clips and self._claim_video(f"the clip of shot {wanted_clips[0].idx}"):
+            # The clip drawn is the first the film is missing, so the sequence fills from the
+            # front; a redo names one shot, so it is a single clip already.
+            video_tasks = [
+                self.generate_video_for_single_shot(shot_description=wanted_clips[0], progress=progress)
+            ]
+        deferred_clips = [shot_description.idx for shot_description in wanted_clips[len(video_tasks):]]
+        if deferred_clips:
+            _emit_render_progress(
+                progress,
+                "video_clips_deferred",
+                f"One video is drawn per render: {len(deferred_clips)} more clip(s) are waiting for their own turn",
+                {"deferred_clips": [str(idx) for idx in deferred_clips]},
+            )
         tasks.extend(video_tasks)
         await asyncio.gather(*tasks)
 
+        missing_clips = [
+            shot_description.idx
+            for shot_description in shot_descriptions
+            if not os.path.exists(self.clip_path(shot_description.idx))
+        ]
         final_video_path = os.path.join(self.working_dir, "final_video.mp4")
+        if missing_clips:
+            # A re-run renders only the clips that are missing, so working a shot at a time is
+            # a normal way to work — and the film cannot be built until every shot has one.
+            # Building it anyway would fail on a clip nobody asked for yet.
+            _emit_render_progress(
+                progress,
+                "concat_skipped",
+                f"{len(missing_clips)} shot(s) still have no clip, so the film was not built yet",
+                {"missing_clips": [str(idx) for idx in missing_clips]},
+            )
+            _emit_render_progress(
+                progress, "render_done", "Script2video render complete", {"final_video_path": None, "phase": "video"}
+            )
+            return self.render_outcome("video", style, final_video_path="")
         if os.path.exists(final_video_path):
             print(f"🚀 Skipped concatenating videos, already exists.")
             _emit_render_progress(progress, "final_video_exists", "Final video already exists", {"path": final_video_path})
@@ -308,7 +470,7 @@ class Script2VideoPipeline:
             print(f"🎬 Starting concatenating videos...")
             _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(shot_descriptions)})
             video_clips = [
-                VideoFileClip(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4"))
+                VideoFileClip(self.clip_path(shot_description.idx))
                 for shot_description in shot_descriptions
             ]
             final_video = concatenate_videoclips(video_clips)
@@ -316,8 +478,8 @@ class Script2VideoPipeline:
             print(f"☑️ Concatenated videos, saved to {final_video_path}.")
             _emit_render_progress(progress, "concat_done", "Final video concatenated", {"path": final_video_path})
 
-        _emit_render_progress(progress, "render_done", "Script2video render complete", {"final_video_path": final_video_path})
-        return final_video_path
+        _emit_render_progress(progress, "render_done", "Script2video render complete", {"final_video_path": final_video_path, "phase": "video"})
+        return self.render_outcome("video", style, final_video_path=final_video_path)
 
 
     async def generate_frames_for_single_camera(
@@ -328,10 +490,18 @@ class Script2VideoPipeline:
         character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
         priority_shot_idxs: List[int],
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        only_shots: Optional[List[int]] = None,
     ):
+        if not camera.active_shot_idxs:
+            # Every shot of this camera was taken out of the film. It has nothing to draw and
+            # nothing to play — and the shots that were in it are kept under .removed_shots/,
+            # so this is a hole in the plan rather than lost work.
+            return
+        wanted = {int(idx) for idx in only_shots} if only_shots else None
         # 1. generate the first_frame of the first shot of the camera
         first_shot_idx = camera.active_shot_idxs[0]
-        first_shot_ff_path = os.path.join(self.working_dir, "shots", f"{first_shot_idx}", "first_frame.png")
+        by_idx = self._descriptions_by_idx(shot_descriptions)
+        first_shot_ff_path = self.frame_path(first_shot_idx, "first_frame")
         _emit_render_progress(progress, "camera_frames_start", f"Generating frames for camera {camera.idx}", {"camera_idx": camera.idx, "active_shot_idxs": camera.active_shot_idxs})
 
         if os.path.exists(first_shot_ff_path):
@@ -344,37 +514,43 @@ class Script2VideoPipeline:
             _emit_render_progress(progress, "frame_start", f"Generating first frame for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame"})
             available_image_path_and_text_pairs = []
 
-            for character_idx in shot_descriptions[first_shot_idx].ff_vis_char_idxs:
-                identifier_in_scene = characters[character_idx].identifier_in_scene
-                registry_item = character_portraits_registry[identifier_in_scene]
+            for visible_character in self._visible_characters(by_idx[first_shot_idx], characters, "first_frame"):
+                registry_item = character_portraits_registry[visible_character.identifier_in_scene]
                 for view, item in registry_item.items():
-                    available_image_path_and_text_pairs.append((item["path"], item["description"]))
+                    available_image_path_and_text_pairs.append((item["path"], self._portrait_reference_text(visible_character, item)))
             
             # generate the first_frame based on the shot_description.ff_desc
             if camera.parent_shot_idx is not None:
                 # generate the first_frame based on the transition video
                 parent_shot_idx = camera.parent_shot_idx
                 await self.frame_events[parent_shot_idx]["first_frame"].wait()
-                parent_shot_ff_path = os.path.join(self.working_dir, "shots", f"{parent_shot_idx}", "first_frame.png")
-                transition_video_path = os.path.join(self.working_dir, "shots", f"{first_shot_idx}", f"transition_video_from_shot_{parent_shot_idx}.mp4")
+                parent_shot_ff_path = self.frame_path(parent_shot_idx, "first_frame")
+                transition_video_path = os.path.join(self.shot_video_dir(first_shot_idx), f"transition_video_from_shot_{parent_shot_idx}.mp4")
 
                 if os.path.exists(transition_video_path):
                     print(f"🚀 Skipped generating transition video for shot {first_shot_idx} from shot {parent_shot_idx}, already exists.")
                     _emit_render_progress(progress, "transition_video_exists", f"Transition video for shot {first_shot_idx} already exists", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx, "path": transition_video_path})
                 else:
+                    if not self._claim_video(f"the transition into shot {first_shot_idx}"):
+                        # This camera's frames come from that transition, so none of them are
+                        # drawn this run — and the clip phase must not wait on them.
+                        self._deferred_frame_shots.update(camera.active_shot_idxs)
+                        _emit_render_progress(progress, "transition_video_deferred", f"One video is drawn per render: the transition into shot {first_shot_idx} waits for its own turn", {"shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx, "camera_idx": camera.idx})
+                        return
                     print(f"🖼️ Starting transition video generation for shot {first_shot_idx} from shot {parent_shot_idx}...")
                     _emit_render_progress(progress, "transition_video_start", f"Generating transition video for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx})
                     transition_video_output = await self.camera_image_generator.generate_transition_video(
-                        first_shot_visual_desc=shot_descriptions[parent_shot_idx].visual_desc,
-                        second_shot_visual_desc=shot_descriptions[first_shot_idx].visual_desc,
+                        first_shot_visual_desc=by_idx[parent_shot_idx].visual_desc,
+                        second_shot_visual_desc=by_idx[first_shot_idx].visual_desc,
                         first_shot_ff_path=parent_shot_ff_path,
                         progress=_scoped_progress(progress, camera_idx=camera.idx, shot_idx=first_shot_idx, parent_shot_idx=parent_shot_idx, artifact="transition_video"),
                     )
+                    os.makedirs(os.path.dirname(transition_video_path), exist_ok=True)
                     transition_video_output.save(transition_video_path)
                     print(f"☑️ Generated transition video for shot {first_shot_idx} from shot {parent_shot_idx}, saved to {transition_video_path}.")
                     _emit_render_progress(progress, "transition_video_done", f"Transition video for shot {first_shot_idx} generated", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx, "path": transition_video_path})
 
-                new_camera_image_path = os.path.join(self.working_dir, "shots", f"{first_shot_idx}", f"new_camera_{camera.idx}.png")
+                new_camera_image_path = os.path.join(self.shot_video_dir(first_shot_idx), f"new_camera_{camera.idx}.png")
                 if os.path.exists(new_camera_image_path):
                     print(f"🚀 Skipped generating new camera image for shot {first_shot_idx}, already exists.")
                     _emit_render_progress(progress, "new_camera_image_exists", f"New camera image for shot {first_shot_idx} already exists", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "path": new_camera_image_path})
@@ -382,6 +558,7 @@ class Script2VideoPipeline:
                     print(f"🖼️ Starting new camera image generation for shot {first_shot_idx}...")
                     _emit_render_progress(progress, "new_camera_image_start", f"Extracting new camera image for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx})
                     new_camera_image = self.camera_image_generator.get_new_camera_image(transition_video_path)
+                    os.makedirs(os.path.dirname(new_camera_image_path), exist_ok=True)
                     new_camera_image.save(new_camera_image_path)
                     print(f"☑️ Generated new camera image for shot {first_shot_idx} (not completed), saved to {new_camera_image_path}.")
                     _emit_render_progress(progress, "new_camera_image_done", f"New camera image for shot {first_shot_idx} extracted", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "path": new_camera_image_path})
@@ -395,11 +572,16 @@ class Script2VideoPipeline:
 
 
             # 如果子镜头缺少信息，则需要选择参考图像生成
-            if camera.parent_shot_idx is None or camera.missing_info is not None:
-                ff_selector_output_path = os.path.join(self.working_dir, "shots", f"{first_shot_idx}", "first_frame_selector_output.json")
-                if os.path.exists(ff_selector_output_path):
-                    with open(ff_selector_output_path, 'r', encoding='utf-8') as f:
-                        ff_selector_output = json.load(f)
+            # A shot being redrawn goes through the same path as one the plan calls
+            # incomplete: its first frame is drawn from the camera still *and the character
+            # portraits*, with the review note applied. Copying the still instead — which is
+            # what a camera with nothing missing does — carries the video model's own
+            # invention of the characters straight into the frame, so a redraw of it can
+            # never fix a wrong-looking character.
+            if camera.parent_shot_idx is None or camera.missing_info is not None or self._is_redrawn(first_shot_idx):
+                ff_selector_output_path = self.selector_output_path(first_shot_idx, "first_frame")
+                ff_selector_output = self.load_selector_output(first_shot_idx, "first_frame")
+                if ff_selector_output is not None:
                     print(f"🚀 Loaded existing reference image selection and prompt for first_frame of shot {first_shot_idx} from {ff_selector_output_path}.")
                     _emit_render_progress(progress, "frame_prompt_exists", f"First frame prompt for shot {first_shot_idx} already exists", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame", "path": ff_selector_output_path})
                 else:
@@ -407,30 +589,60 @@ class Script2VideoPipeline:
                     _emit_render_progress(progress, "frame_prompt_start", f"Selecting references for first frame of shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame"})
                     ff_selector_output = await self.reference_image_selector.select_reference_images_and_generate_prompt(
                         available_image_path_and_text_pairs=available_image_path_and_text_pairs,
-                        frame_description=shot_descriptions[first_shot_idx].ff_desc
+                        frame_description=by_idx[first_shot_idx].ff_desc,
+                        max_reference_images=self.reference_image_limit(),
                     )
+                    os.makedirs(os.path.dirname(ff_selector_output_path), exist_ok=True)
                     with open(ff_selector_output_path, 'w', encoding='utf-8') as f:
                         json.dump(ff_selector_output, f, ensure_ascii=False, indent=4)
 
                     print(f"☑️ Selected reference images and generated prompt for first_frame of shot {first_shot_idx}, saved to {ff_selector_output_path}.")
                     _emit_render_progress(progress, "frame_prompt_done", f"Selected references for first frame of shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame", "path": ff_selector_output_path})
 
-                reference_image_path_and_text_pairs, prompt = ff_selector_output["reference_image_path_and_text_pairs"], ff_selector_output["text_prompt"]
+                # The same reference work the other frame path does. A camera's opening shot
+                # is a shot like any other, and skipping these here left it with a character's
+                # *back* portrait, nobody else's portrait, mentions of images that were not
+                # sent, and no record of the prompt — which is how the first frame of a shot
+                # could keep coming back wrong however many times it was redrawn.
+                reference_image_path_and_text_pairs, prompt = self._align_reference_mentions(
+                    available_image_path_and_text_pairs,
+                    ff_selector_output["reference_image_path_and_text_pairs"],
+                    ff_selector_output.get("selected_indices") or [],
+                    ff_selector_output["text_prompt"],
+                )
+                reference_image_path_and_text_pairs, prompt = self._ensure_character_portraits(
+                    self._visible_characters(by_idx[first_shot_idx], characters, "first_frame"),
+                    character_portraits_registry,
+                    reference_image_path_and_text_pairs,
+                    prompt,
+                )
+                prompt = self._review_note(first_shot_idx, prompt)
+                # Record what is sent, so the prompt behind a rendered frame can be read back
+                # rather than guessed at, exactly as the other frame path does.
+                with open(ff_selector_output_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        **ff_selector_output,
+                        "reference_image_path_and_text_pairs": reference_image_path_and_text_pairs,
+                        "sent_prompt": prompt,
+                    }, f, ensure_ascii=False, indent=4)
                 prefix_prompt = ""
                 for i, (image_path, text) in enumerate(reference_image_path_and_text_pairs):
                     prefix_prompt += f"Image {i}: {text}\n"
                 prompt = f"{prefix_prompt}\n{prompt}"
                 reference_image_paths = [item[0] for item in reference_image_path_and_text_pairs]
-                ff_image: ImageOutput = await self.image_generator.generate_single_image(
+                ff_image: ImageOutput = await self._generate_frame_image(
+                    shot_idx=first_shot_idx,
+                    frame_type="first_frame",
                     prompt=prompt,
                     reference_image_paths=reference_image_paths,
-                    size="1600x900",
                 )
+                os.makedirs(os.path.dirname(first_shot_ff_path), exist_ok=True)
                 ff_image.save(first_shot_ff_path)
                 self.frame_events[first_shot_idx]["first_frame"].set()
                 print(f"☑️ Generated first_frame for shot {first_shot_idx}, saved to {first_shot_ff_path}.")
                 _emit_render_progress(progress, "frame_done", f"Generated first frame for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame", "path": first_shot_ff_path})
             else:
+                os.makedirs(os.path.dirname(first_shot_ff_path), exist_ok=True)
                 shutil.copy(new_camera_image_path, first_shot_ff_path)
                 self.frame_events[first_shot_idx]["first_frame"].set()
                 print(f"☑️ Generated first_frame for shot {first_shot_idx}, saved to {first_shot_ff_path}.")
@@ -441,25 +653,34 @@ class Script2VideoPipeline:
         priority_tasks = []
         normal_tasks = []
 
-        if shot_descriptions[first_shot_idx].variation_type in ["medium", "large"]:
+        # Every shot gets an end keyframe where the model takes one, not only the
+        # medium/large variations. The clip is generated between the two frames, and
+        # given only a start frame the video model invents the rest of the shot —
+        # the room drifts mid-clip. The end frame is referenced from this shot's own
+        # start frame so it stays the same scene.
+        if self.frame_bracketing and (wanted is None or first_shot_idx in wanted):
             task = self.generate_frame_for_single_shot(
-                shot_idx=first_shot_idx, 
-                frame_type="last_frame", 
-                first_shot_ff_path_and_text_pair=(first_shot_ff_path, shot_descriptions[first_shot_idx].ff_desc),
-                frame_desc=shot_descriptions[first_shot_idx].lf_desc,
-                visible_characters=[characters[idx] for idx in shot_descriptions[first_shot_idx].lf_vis_char_idxs],
+                shot_idx=first_shot_idx,
+                frame_type="last_frame",
+                first_shot_ff_path_and_text_pair=(first_shot_ff_path, by_idx[first_shot_idx].ff_desc),
+                frame_desc=by_idx[first_shot_idx].lf_desc,
+                visible_characters=self._visible_characters(by_idx[first_shot_idx], characters, "last_frame"),
                 character_portraits_registry=character_portraits_registry,
                 progress=progress,
             )
             normal_tasks.append(task)
 
         for shot_idx in camera.active_shot_idxs[1:]:
+            # A shot the request did not name keeps the frames it has: drawing them would be
+            # work nobody asked for, and the card's redraw is about one shot.
+            if wanted is not None and shot_idx not in wanted:
+                continue
             first_frame_task = self.generate_frame_for_single_shot(
                     shot_idx=shot_idx, 
                     frame_type="first_frame", 
-                    first_shot_ff_path_and_text_pair=(first_shot_ff_path, shot_descriptions[first_shot_idx].ff_desc),
-                    frame_desc=shot_descriptions[shot_idx].ff_desc,
-                    visible_characters=[characters[idx] for idx in shot_descriptions[shot_idx].ff_vis_char_idxs],
+                    first_shot_ff_path_and_text_pair=(first_shot_ff_path, by_idx[first_shot_idx].ff_desc),
+                    frame_desc=by_idx[shot_idx].ff_desc,
+                    visible_characters=self._visible_characters(by_idx[shot_idx], characters, "first_frame"),
                     character_portraits_registry=character_portraits_registry,
                     progress=progress,
                 )
@@ -469,13 +690,13 @@ class Script2VideoPipeline:
                 normal_tasks.append(first_frame_task)
 
 
-            if shot_descriptions[shot_idx].variation_type in ["medium", "large"]:
+            if self.frame_bracketing:
                 last_frame_task = self.generate_frame_for_single_shot(
                     shot_idx=shot_idx, 
                     frame_type="last_frame", 
-                    first_shot_ff_path_and_text_pair=(first_shot_ff_path, shot_descriptions[first_shot_idx].ff_desc),
-                    frame_desc=shot_descriptions[shot_idx].lf_desc,
-                    visible_characters=[characters[idx] for idx in shot_descriptions[shot_idx].lf_vis_char_idxs],
+                    first_shot_ff_path_and_text_pair=(self.frame_path(shot_idx, "first_frame"), by_idx[shot_idx].ff_desc),
+                    frame_desc=by_idx[shot_idx].lf_desc,
+                    visible_characters=self._visible_characters(by_idx[shot_idx], characters, "last_frame"),
                     character_portraits_registry=character_portraits_registry,
                     progress=progress,
                 )
@@ -493,28 +714,30 @@ class Script2VideoPipeline:
         shot_description: ShotDescription,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
-        video_path = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4")
+        video_path = self.clip_path(shot_description.idx)
         if os.path.exists(video_path):
             print(f"🚀 Skipped generating video for shot {shot_description.idx}, already exists.")
             _emit_render_progress(progress, "video_clip_exists", f"Video clip for shot {shot_description.idx} already exists", {"shot_idx": shot_description.idx, "path": video_path})
         else:
             _emit_render_progress(progress, "video_clip_waiting_for_frames", f"Waiting for frames before video clip {shot_description.idx}", {"shot_idx": shot_description.idx})
+            # A bracketed clip cannot wander: the model is pinned to both ends.
+            # Given only a start frame it is free to invent the rest of the shot,
+            # which is what makes the room drift across a clip and the cut into the
+            # next shot read as a jump.
             await self.frame_events[shot_description.idx]["first_frame"].wait()
-            if shot_description.variation_type in ["medium", "large"]:
+            frame_paths = [self.frame_path(shot_description.idx, "first_frame")]
+            if self.frame_bracketing:
                 await self.frame_events[shot_description.idx]["last_frame"].wait()
-
-            frame_paths = []
-            frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "first_frame.png"))
-            if shot_description.variation_type in ["medium", "large"]:
-                frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "last_frame.png"))
+                frame_paths.append(self.frame_path(shot_description.idx, "last_frame"))
 
             print(f"🎬 Starting video generation for shot {shot_description.idx}...")
             _emit_render_progress(progress, "video_clip_start", f"Generating video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "frame_count": len(frame_paths)})
             video_output = await self.video_generator.generate_single_video(
-                prompt=shot_description.motion_desc + "\n" + shot_description.audio_desc,
+                prompt=self._review_note(shot_description.idx, shot_description.motion_desc + "\n" + shot_description.audio_desc),
                 reference_image_paths=frame_paths,
                 progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
             )
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
             video_output.save(video_path)
             print(f"☑️ Generated video for shot {shot_description.idx}, saved to {video_path}.")
             _emit_render_progress(progress, "video_clip_done", f"Generated video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "path": video_path})
@@ -530,13 +753,17 @@ class Script2VideoPipeline:
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ) -> ImageOutput:
 
-        frame_image_path = os.path.join(self.working_dir, "shots", f"{shot_idx}", f"{frame_type}.png")
+        frame_image_path = self.frame_path(shot_idx, frame_type)
 
         if os.path.exists(frame_image_path):
             print(f"🚀 Skipped generating {frame_type} for shot {shot_idx}, already exists.")
             _emit_render_progress(progress, "frame_exists", f"{frame_type} for shot {shot_idx} already exists", {"shot_idx": shot_idx, "frame_type": frame_type, "path": frame_image_path})
 
         else:
+            if frame_type == "last_frame":
+                # The end frame is referenced from this shot's start frame, so it
+                # has to exist before the reference list is built.
+                await self.frame_events[shot_idx]["first_frame"].wait()
             print(f"🖼️ Starting {frame_type} generation for shot {shot_idx}...")
             _emit_render_progress(progress, "frame_start", f"Generating {frame_type} for shot {shot_idx}", {"shot_idx": shot_idx, "frame_type": frame_type})
             available_image_path_and_text_pairs = []
@@ -544,14 +771,13 @@ class Script2VideoPipeline:
                 identifier_in_scene = visible_character.identifier_in_scene
                 registry_item = character_portraits_registry[identifier_in_scene]
                 for view, item in registry_item.items():
-                    available_image_path_and_text_pairs.append((item["path"], item["description"]))
+                    available_image_path_and_text_pairs.append((item["path"], self._portrait_reference_text(visible_character, item)))
 
             available_image_path_and_text_pairs.append(first_shot_ff_path_and_text_pair)
 
-            selector_output_path = os.path.join(self.working_dir, "shots", f"{shot_idx}", f"{frame_type}_selector_output.json")
-            if os.path.exists(selector_output_path):
-                with open(selector_output_path, 'r', encoding='utf-8') as f:
-                    selector_output = json.load(f)
+            selector_output_path = self.selector_output_path(shot_idx, frame_type)
+            selector_output = self.load_selector_output(shot_idx, frame_type)
+            if selector_output is not None:
                 print(f"🚀 Loaded existing reference image selection and prompt for {frame_type} frame of shot {shot_idx} from {selector_output_path}.")
                 _emit_render_progress(progress, "frame_prompt_exists", f"Prompt for {frame_type} of shot {shot_idx} already exists", {"shot_idx": shot_idx, "frame_type": frame_type, "path": selector_output_path})
             else:
@@ -559,25 +785,54 @@ class Script2VideoPipeline:
                 _emit_render_progress(progress, "frame_prompt_start", f"Selecting references for {frame_type} of shot {shot_idx}", {"shot_idx": shot_idx, "frame_type": frame_type})
                 selector_output = await self.reference_image_selector.select_reference_images_and_generate_prompt(
                     available_image_path_and_text_pairs=available_image_path_and_text_pairs,
-                    frame_description=frame_desc
+                    frame_description=frame_desc,
+                    max_reference_images=self.reference_image_limit(),
                 )
+                os.makedirs(os.path.dirname(selector_output_path), exist_ok=True)
                 with open(selector_output_path, 'w', encoding='utf-8') as f:
                     json.dump(selector_output, f, ensure_ascii=False, indent=4)
                 print(f"☑️ Selected reference images and generated prompt for {frame_type} frame of shot {shot_idx}, saved to {selector_output_path}.")
                 _emit_render_progress(progress, "frame_prompt_done", f"Selected references for {frame_type} of shot {shot_idx}", {"shot_idx": shot_idx, "frame_type": frame_type, "path": selector_output_path})
 
-            reference_image_path_and_text_pairs, prompt = selector_output["reference_image_path_and_text_pairs"], selector_output["text_prompt"]
+            if selector_output.get("sent_prompt"):
+                # A previous run already resolved this frame's final prompt; reusing it
+                # keeps a resumed render from renumbering or re-anchoring it again.
+                reference_image_path_and_text_pairs = selector_output["reference_image_path_and_text_pairs"]
+                prompt = selector_output["sent_prompt"]
+            else:
+                reference_image_path_and_text_pairs, prompt = self._align_reference_mentions(
+                    available_image_path_and_text_pairs,
+                    selector_output["reference_image_path_and_text_pairs"],
+                    selector_output.get("selected_indices") or [],
+                    selector_output["text_prompt"],
+                )
+                reference_image_path_and_text_pairs, prompt = self._add_scene_context(shot_idx, reference_image_path_and_text_pairs, prompt)
+                reference_image_path_and_text_pairs, prompt = self._ensure_character_portraits(
+                    visible_characters, character_portraits_registry, reference_image_path_and_text_pairs, prompt
+                )
+                prompt = self._review_note(shot_idx, prompt)
+                # Record what is sent, so the prompt behind a rendered frame can be
+                # read back later (the Artifacts view shows it) rather than guessed.
+                selector_output = {
+                    **selector_output,
+                    "reference_image_path_and_text_pairs": reference_image_path_and_text_pairs,
+                    "sent_prompt": prompt,
+                }
+                with open(selector_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(selector_output, f, ensure_ascii=False, indent=4)
             prefix_prompt = ""
             for i, (image_path, text) in enumerate(reference_image_path_and_text_pairs):
                 prefix_prompt += f"Image {i}: {text}\n"
             prompt = f"{prefix_prompt}\n{prompt}"
             reference_image_paths = [item[0] for item in reference_image_path_and_text_pairs]
 
-            frame_image: ImageOutput = await self.image_generator.generate_single_image(
+            frame_image: ImageOutput = await self._generate_frame_image(
+                shot_idx=shot_idx,
+                frame_type=frame_type,
                 prompt=prompt,
                 reference_image_paths=reference_image_paths,
-                size="1600x900",
             )
+            os.makedirs(os.path.dirname(frame_image_path), exist_ok=True)
             frame_image.save(frame_image_path)
             print(f"☑️ Generated {frame_type} frame for shot {shot_idx}, saved to {frame_image_path}.")
             _emit_render_progress(progress, "frame_done", f"Generated {frame_type} for shot {shot_idx}", {"shot_idx": shot_idx, "frame_type": frame_type, "path": frame_image_path})
@@ -586,6 +841,241 @@ class Script2VideoPipeline:
         self.frame_events[shot_idx][frame_type].set()
         return frame_image_path
 
+
+    def _portrait_reference_text(self, character: CharacterInScene, item: Dict[str, str]) -> str:
+        """How a portrait is described to the reference selector.
+
+        Frame descriptions describe characters by their features and never by name — the
+        shot descriptions are written that way, and the name is stripped from them — so a
+        portrait described only as "A front view portrait of DeepSeek" has nothing in common
+        with the frame that says "the younger, fitter man with short black hair and
+        rectangular glasses (wearing a t-shirt with a purple whale and carrying a laptop)".
+        The selector cannot tell they are the same person, so it leaves the portrait out and
+        the image model invents the character from the text. The features are what the two
+        descriptions share, so both are given.
+        """
+        features = "; ".join(part for part in (character.static_features, character.dynamic_features) if part)
+        return f"{item['description']} {features}".strip()
+
+    def _descriptions_by_idx(self, shot_descriptions: List[ShotDescription]) -> Dict[int, ShotDescription]:
+        """Shot descriptions keyed by the shot's own number.
+
+        A shot's number is its identity, not its place in the list. Removing a shot from the
+        film leaves the rest numbered as they were, so reading the list by position draws a
+        shot from another shot's description — and past the end it raises instead. Keyed by
+        number, both the frames and the clips of a shot find their own plan.
+        """
+        return {description.idx: description for description in shot_descriptions}
+
+    def _visible_characters(self, shot_description, characters: List[CharacterInScene], frame_type: str) -> List[CharacterInScene]:
+        """Who a frame may show: the plan's list for that frame, plus anyone the frame names.
+
+        The plan's chips (`ff_vis_char_idxs` / `lf_vis_char_idxs`) decide whose portraits the
+        selector is even offered, and they are often thin: a frame can describe a character
+        entering while chipping only the ones who were already there, and then the model draws
+        the newcomer from the description alone — a DeepSeek who is not DeepSeek, because his
+        portrait was never sent. So whoever the frame's own description names is offered too.
+
+        The *brief* is deliberately not read. It describes the whole shot, so by the end of a
+        shot it still names the characters who have left: a frame saying "Only Claude is in the
+        room" was being handed the Wife's portrait and a binding for her, which made the prompt
+        contradict itself and sent references nobody asked for.
+        """
+        listed = shot_description.ff_vis_char_idxs if frame_type == "first_frame" else shot_description.lf_vis_char_idxs
+        indices = [idx for idx in (listed or []) if 0 <= idx < len(characters)]
+        frame_desc = shot_description.ff_desc if frame_type == "first_frame" else shot_description.lf_desc
+        spoken = str(frame_desc or "").lower()
+        for character in characters:
+            if character.idx in indices:
+                continue
+            name = str(character.identifier_in_scene or "").strip().lower()
+            if name and re.search(rf"\b{re.escape(name)}\b", spoken):
+                indices.append(character.idx)
+        return [characters[idx] for idx in indices]
+
+    def _is_redrawn(self, shot_idx: int) -> bool:
+        """Whether this shot is being redrawn from a note rather than restored as it was."""
+        return bool((getattr(self, "revision_notes", None) or {}).get(str(shot_idx), "").strip())
+
+    def _review_note(self, shot_idx: int, prompt: str) -> str:
+        """Append the guidance typed against a rejected shot to what is redrawn.
+
+        The note is the user's own words about what was wrong, so it goes in verbatim:
+        a redraw that does not answer it is a redraw they have to pay for twice.
+        """
+        note = (getattr(self, "revision_notes", None) or {}).get(str(shot_idx), "").strip()
+        if not note:
+            return prompt
+        return (
+            f"{prompt}\n\n<REVIEW_CORRECTION>\n"
+            f"A human reviewed an earlier version of this shot and rejected it. What is wrong: {note}\n"
+            f"Redraw so that this problem is gone, keeping everything else this description asks for.\n"
+            f"</REVIEW_CORRECTION>"
+        )
+
+    def _align_reference_mentions(
+        self,
+        available_image_path_and_text_pairs: List[Tuple[str, str]],
+        reference_image_path_and_text_pairs: List[Tuple[str, str]],
+        selected_indices: List[int],
+        prompt: str,
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """Make the prompt's ``Image N`` mentions address the images actually sent.
+
+        The selector is told to number its mentions by position in its own
+        selection, but it routinely numbers them by position in the list it was
+        shown instead: in one real session seven of seventeen cached prompts told
+        the image model to use an image that was never sent, leaving the frame
+        to be invented. Mentions are renumbered to the sent positions, and an
+        image the prompt asks for that the selector did not return is appended
+        when the model's reference limit allows it.
+        """
+        if not selected_indices:
+            return reference_image_path_and_text_pairs, prompt
+        position_by_available = {index: position for position, index in enumerate(selected_indices)}
+        pairs = list(reference_image_path_and_text_pairs)
+        limit = self.reference_image_limit()
+        appended: Dict[int, int] = {}
+
+        def renumber(match):
+            index = int(match.group(1))
+            if index < len(reference_image_path_and_text_pairs):
+                # The selector numbers its mentions by position in its own selection, and
+                # that selection is sent first, so "Image 0" is the image it picked first.
+                # Reading it as an index into the list it was shown instead sent one real
+                # frame's room, couch and environment mentions to a character's portrait:
+                # the portraits are shown first and the setting of the shot last.
+                return match.group(0)
+            if index in position_by_available:
+                return f"Image {position_by_available[index]}"
+            if index not in appended:
+                if index >= len(available_image_path_and_text_pairs) or (limit is not None and len(pairs) >= limit):
+                    # Nothing to point the mention at: keep the reference list as it is.
+                    return match.group(0)
+                appended[index] = len(pairs)
+                pairs.append(available_image_path_and_text_pairs[index])
+            return f"Image {appended[index]}"
+
+        return pairs, re.sub(r"Image\s+(\d+)", renumber, prompt)
+
+    def _ensure_character_portraits(
+        self,
+        visible_characters: List[CharacterInScene],
+        character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
+        reference_image_path_and_text_pairs: List[Tuple[str, str]],
+        prompt: str,
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """Give the image model a face for every character the frame shows.
+
+        The reference selection comes back with whatever it judged useful, and for a
+        character that can be their *back* portrait — which carries the costume and no face —
+        or none of their portraits at all. Either way the frame is drawn from the description
+        alone and the character stops looking like themselves: a Claude whose face was
+        invented, a Wife whose grey dress came from nowhere. A front portrait is added (or a
+        back portrait replaced) when the model's reference limit allows.
+        """
+        limit = self.reference_image_limit()
+        pairs = list(reference_image_path_and_text_pairs)
+        backed: list[str] = []
+        for character in visible_characters:
+            registry_item = character_portraits_registry.get(character.identifier_in_scene) or {}
+            front, back = registry_item.get("front"), registry_item.get("back")
+            if not front or front["path"] in {path for path, _ in pairs}:
+                continue
+            posed = [item["path"] for view, item in registry_item.items() if view != "back"]
+            if any(path in {candidate for candidate, _ in pairs} for path in posed):
+                continue
+            replacement = (back or {}).get("path")
+            if replacement is not None and replacement in {path for path, _ in pairs}:
+                # A face matters more than the view: the description still sets the pose.
+                pairs = [(path, text) if path != replacement else (front["path"], self._portrait_reference_text(character, front)) for path, text in pairs]
+            elif limit is None or len(pairs) < limit:
+                pairs.append((front["path"], self._portrait_reference_text(character, front)))
+            else:
+                continue
+            backed.append(character.identifier_in_scene)
+        if backed:
+            # Naming the character is not enough on a frame with three of them and four
+            # references: the model needs to be told which image is whom, or it binds a
+            # heavyset Claude to the standing man and DeepSeek comes out as a second Claude.
+            positions = {path: index for index, (path, _) in enumerate(pairs)}
+            lines = []
+            for character in visible_characters:
+                if character.identifier_in_scene not in backed:
+                    continue
+                front = (character_portraits_registry.get(character.identifier_in_scene) or {}).get("front") or {}
+                if front.get("path") in positions:
+                    lines.append(
+                        f"Image {positions[front['path']]} is {character.identifier_in_scene}: keep that character's face, hair and clothing."
+                    )
+            if lines:
+                prompt = f"{prompt}\n\nWho is who in the references:\n" + "\n".join(lines)
+        return pairs, prompt
+
+    def _scene_continuity_pair(self, shot_idx: int) -> Optional[Tuple[str, str]]:
+        """Keyframe of the most recent earlier shot, to carry the setting forward.
+
+        Frames are rendered camera by camera, so an earlier shot's frame may not
+        exist yet; the search walks back until it finds one that does.
+        """
+        for earlier in range(shot_idx - 1, -1, -1):
+            path = self.frame_path(earlier, "first_frame")
+            if os.path.exists(path):
+                return (path, "The setting of the previous shot: the same room, furniture, lighting and background.")
+        return None
+
+    def _add_scene_context(
+        self,
+        shot_idx: int,
+        reference_image_path_and_text_pairs: List[Tuple[str, str]],
+        prompt: str,
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """Keep a close-up of a character from rendering as a studio portrait.
+
+        The selector picks character portraits when a shot asks for a close-up,
+        and the portraits are studio shots on a plain backdrop; with no scene
+        reference and a frame description that may not name a setting, the image
+        model reproduces the portrait's blank background and the shot lands in the
+        film as a white card. An earlier keyframe is therefore always included as
+        the setting, appended last so the prompt's existing ``Image N`` references
+        keep their positions.
+        """
+        if any("character_portraits" not in path for path, _ in reference_image_path_and_text_pairs):
+            return reference_image_path_and_text_pairs, prompt
+        scene_pair = self._scene_continuity_pair(shot_idx)
+        if scene_pair is None:
+            return reference_image_path_and_text_pairs, prompt + (
+                "\nThe portrait references show the character's appearance only: render the setting described above, not their plain studio background."
+            )
+        reference_image_path_and_text_pairs = [*reference_image_path_and_text_pairs, scene_pair]
+        scene_index = len(reference_image_path_and_text_pairs) - 1
+        return reference_image_path_and_text_pairs, prompt + (
+            f"\nImage {scene_index} shows the setting: render the room, furniture, lighting and background of that image."
+            " The other images are character portraits: take the character's appearance from them, never their plain studio background."
+        )
+
+    async def _generate_frame_image(
+        self,
+        *,
+        shot_idx: int,
+        frame_type: str,
+        prompt: str,
+        reference_image_paths: List[str],
+    ) -> ImageOutput:
+        """Generate one frame image, naming the shot if the provider rejects it.
+
+        Provider-side rejections (content filters, unsupported options) do not
+        appear in the shot's cached selector output, so without this the failing
+        frame is only implied by the last progress event.
+        """
+        try:
+            return await self.image_generator.generate_single_image(
+                prompt=prompt,
+                reference_image_paths=reference_image_paths,
+                size="1600x900",
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Image generation failed for the {frame_type} of shot {shot_idx}: {exc}") from exc
 
     async def construct_camera_tree(
         self,
@@ -645,7 +1135,7 @@ class Script2VideoPipeline:
         style: str,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
-        character_portraits_registry_path = os.path.join(self.working_dir, "character_portraits_registry.json")
+        character_portraits_registry_path = self.portraits_registry_path()
         if character_portraits_registry is None:
             if os.path.exists(character_portraits_registry_path):
                 with open(character_portraits_registry_path, 'r', encoding='utf-8') as f:
@@ -679,7 +1169,7 @@ class Script2VideoPipeline:
         style: str,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
-        character_dir = os.path.join(self.working_dir, "character_portraits", f"{character.idx}_{character.identifier_in_scene}")
+        character_dir = os.path.join(self.portraits_dir(), f"{character.idx}_{safe_path_component(character.identifier_in_scene)}")
         os.makedirs(character_dir, exist_ok=True)
         _emit_render_progress(progress, "character_portrait_start", f"Generating portraits for {character.identifier_in_scene}", {"character_idx": character.idx, "identifier": character.identifier_in_scene})
 
@@ -711,6 +1201,15 @@ class Script2VideoPipeline:
             back_portrait_output.save(back_portrait_path)
             _emit_render_progress(progress, "character_portrait_back_done", f"Generated back portrait for {character.identifier_in_scene}", {"character_idx": character.idx, "identifier": character.identifier_in_scene, "path": back_portrait_path})
 
+        # Record what each portrait was drawn from, beside the portraits themselves, so
+        # the Artifacts view can show the prompt rather than guess it.
+        recorded_prompts = {
+            view: self.character_portraits_generator.prompts.get((character.identifier_in_scene, view), "")
+            for view in ("front", "side", "back")
+        }
+        with open(os.path.join(character_dir, "prompts.json"), "w", encoding="utf-8") as f:
+            json.dump({view: prompt for view, prompt in recorded_prompts.items() if prompt}, f, ensure_ascii=False, indent=4)
+
         self.character_portrait_events[character.idx].set()
 
         print(f"☑️ Completed character portrait generation for {character.identifier_in_scene}.")
@@ -741,6 +1240,7 @@ class Script2VideoPipeline:
         characters: List[CharacterInScene],
         user_requirement: str,
         quiet: bool = False,
+        clip_seconds: Optional[int] = None,
     ):
         storyboard_path = os.path.join(self.working_dir, "storyboard.json")
         if os.path.exists(storyboard_path):
@@ -755,6 +1255,7 @@ class Script2VideoPipeline:
                 characters=characters,
                 user_requirement=user_requirement,
                 retry_timeout=150,
+                clip_seconds=clip_seconds if clip_seconds is not None else self.clip_seconds(),
             )
             storyboard = _normalize_model_list(storyboard, ShotBriefDescription, "storyboard")
             with open(storyboard_path, 'w', encoding='utf-8') as f:
@@ -809,14 +1310,12 @@ class Script2VideoPipeline:
 
         self.shot_desc_events[shot_brief_description.idx].set()
 
-        if shot_description.variation_type in ["medium", "large"]:
-            self.frame_events[shot_brief_description.idx] = {
-                "first_frame": asyncio.Event(),
-                "last_frame": asyncio.Event(),
-            }
-        else:
-            self.frame_events[shot_brief_description.idx] = {
-                "first_frame": asyncio.Event(),
-            }
+        # Both keyframes are tracked for every shot: the clip is bracketed by its
+        # start and end frame, and a clip given only a start frame lets the video
+        # model reinvent the room across its seconds (see generate_video_for_single_shot).
+        self.frame_events[shot_brief_description.idx] = {
+            "first_frame": asyncio.Event(),
+            "last_frame": asyncio.Event(),
+        }
 
         return shot_description

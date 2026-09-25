@@ -359,8 +359,12 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
         return ToolResult("sleep", True, f"Slept for {seconds:g}s")
 
     async def run_shell(args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
-        if os.environ.get("VIMAX_ENABLE_RUN_SHELL") != "1":
-            return ToolResult("run_shell", False, "run_shell is disabled by default. Set VIMAX_ENABLE_RUN_SHELL=1 to enable bounded shell commands.", {"error_type": "disabled"})
+        # Enabled by default. The bounded shell stays on unless it is explicitly
+        # opted out with VIMAX_ENABLE_RUN_SHELL=0 (or false/no/off). For backward
+        # compatibility VIMAX_ENABLE_RUN_SHELL=1 also leaves it enabled.
+        _shell_optout = os.environ.get("VIMAX_ENABLE_RUN_SHELL", "1").strip().lower()
+        if _shell_optout in {"0", "false", "no", "off"}:
+            return ToolResult("run_shell", False, "run_shell is disabled because VIMAX_ENABLE_RUN_SHELL=0.", {"error_type": "disabled"})
         command = str(args["command"]).strip()
         timeout_seconds = min(max(int(args.get("timeout_seconds", 30)), 1), 120)
         output_limit = min(max(int(args.get("output_limit", 20000)), 1000), 50000)
@@ -400,7 +404,7 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
         ToolSpec("todo_read", "Read short-term todo items from .vimax/todo.json. This is not a task or team system.", todo_read, schema={}, concurrency_safe=True),
         ToolSpec("todo_write", "Replace short-term todo items in .vimax/todo.json. Items require content and may use pending, in_progress, or completed status.", todo_write, schema={"items": ToolArgumentSchema(list, True)}),
         ToolSpec("sleep", "Wait for a bounded number of seconds.", sleep_tool, schema={"seconds": ToolArgumentSchema(int, False, 0)}, concurrency_safe=True),
-        ToolSpec("run_shell", "Run a bounded shell command in the workspace. Disabled unless VIMAX_ENABLE_RUN_SHELL=1; rejects dangerous commands, enforces timeout, and truncates output.", run_shell, schema={"command": ToolArgumentSchema(str, True), "timeout_seconds": ToolArgumentSchema(int, False, 30), "output_limit": ToolArgumentSchema(int, False, 20000)}),
+        ToolSpec("run_shell", "Run a bounded shell command in the workspace. Enabled by default; disable with VIMAX_ENABLE_RUN_SHELL=0. Rejects dangerous commands, enforces timeout, and truncates output.", run_shell, schema={"command": ToolArgumentSchema(str, True), "timeout_seconds": ToolArgumentSchema(int, False, 30), "output_limit": ToolArgumentSchema(int, False, 20000)}),
     ]
     for spec in adapter_specs or []:
         specs.append(spec)

@@ -10,9 +10,38 @@ const SECTION_FIELDS = {
   reranker: ['model', 'base_url'],
 };
 
+// Eight seconds is the shortest length that carries a spoken line without rushing it.
+const DEFAULT_CLIP_SECONDS = 8;
+
 export async function readAgentConfig(repoRoot) {
   const {payload} = await loadConfig(repoRoot);
   return publicConfig(payload);
+}
+
+/**
+ * The clip settings the film is rendered with: seconds each clip runs for, and the model
+ * that renders it.
+ *
+ * The configured values win over the environment, unlike the model settings: a clip length
+ * belongs to the film being made, while a duration exported into a shell or a supervisor's
+ * environment cannot be seen from the project at all. One left set to 5 that way cut every
+ * clip of a sequence whose dialogue needed eight seconds, and nothing on screen said why.
+ * Mirrors `agent_runtime.config.video_clip_seconds`.
+ */
+export async function readClipSettings(repoRoot, renderedWith = '') {
+  const {payload} = await loadConfig(repoRoot);
+  const section = payload.video && typeof payload.video === 'object' ? payload.video : {};
+  const seconds = usableSeconds(section.clip_seconds) ?? usableSeconds(process.env.VIMAX_OPENROUTER_VIDEO_DURATION) ?? DEFAULT_CLIP_SECONDS;
+  const configured = typeof section.model === 'string' ? section.model.trim() : '';
+  // The configured model is what the next clip is rendered with; the manifest's record is
+  // what the clips on disk were rendered with, and it is all there is when no config can be
+  // read. The configured value wins, because a model change re-renders the clips.
+  return {seconds, model: configured || String(renderedWith || '').trim()};
+}
+
+function usableSeconds(value) {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : null;
 }
 
 export async function saveAgentConfig(repoRoot, input) {

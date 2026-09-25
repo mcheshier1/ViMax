@@ -1,8 +1,10 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -35,12 +37,24 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(unknown.result.ok)
 
 
-    async def test_run_shell_is_disabled_by_default(self):
+    async def test_run_shell_is_enabled_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
             registry = build_builtin_registry(tmp, index)
             executor = ToolExecutor(registry, index)
-            record = await executor.execute(ToolCall(name="run_shell", arguments={"command": "pwd"}), TurnControl())
+            with patch.dict(os.environ, {}, clear=False):
+                record = await executor.execute(ToolCall(name="run_shell", arguments={"command": "pwd"}), TurnControl())
+            self.assertTrue(record.result.ok)
+            self.assertNotEqual(record.result.metadata.get("error_type"), "disabled")
+
+
+    async def test_run_shell_can_be_disabled_via_env_optout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            registry = build_builtin_registry(tmp, index)
+            executor = ToolExecutor(registry, index)
+            with patch.dict(os.environ, {"VIMAX_ENABLE_RUN_SHELL": "0"}, clear=False):
+                record = await executor.execute(ToolCall(name="run_shell", arguments={"command": "pwd"}), TurnControl())
             self.assertFalse(record.result.ok)
             self.assertEqual(record.result.metadata["error_type"], "disabled")
 

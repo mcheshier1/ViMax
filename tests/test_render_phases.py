@@ -1,0 +1,515 @@
+"""Render phase gates, single-model pinning, and model-scoped artifact layout."""
+
+import asyncio
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from PIL import Image
+
+from agent_runtime.session_index import SessionIndex
+from agent_runtime.vimax_adapters import (
+    RENDER_MANIFEST_FILENAME,
+    ViMaxAdapters,
+    _enforce_render_sequence,
+    _read_render_manifest,
+    _supersede_clips,
+)
+from interfaces import Camera, CharacterInScene, ImageOutput, ShotDescription, VideoOutput
+from pipelines.render_contract import normalize_phase
+from pipelines.script2video_pipeline import Script2VideoPipeline
+
+
+IMAGE_MODEL = "test/image-model"
+VIDEO_MODEL = "test/video-model"
+
+
+class _Generator:
+    """Records calls and returns a usable artifact, standing in for a provider."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.calls: list[dict] = []
+
+    async def generate_single_image(self, **kwargs) -> ImageOutput:
+        self.calls.append(kwargs)
+        return ImageOutput(fmt="pil", ext="png", data=Image.new("RGB", (16, 9), "blue"))
+
+    async def generate_single_video(self, **kwargs) -> VideoOutput:
+        self.calls.append(kwargs)
+        return VideoOutput(fmt="bytes", ext="mp4", data=b"video")
+
+
+def _character() -> CharacterInScene:
+    return CharacterInScene(
+        idx=0,
+        identifier_in_scene="Claude",
+        is_visible=True,
+        static_features="a heavyset man",
+        dynamic_features="an orange shirt",
+    )
+
+
+def _shot(idx: int, variation_type: str = "small") -> ShotDescription:
+    return ShotDescription(
+        idx=idx,
+        is_last=True,
+        cam_idx=0,
+        visual_desc=f"shot {idx}",
+        variation_type=variation_type,
+        variation_reason="r",
+        ff_desc=f"first frame {idx}",
+        ff_vis_char_idxs=[],
+        lf_desc=f"last frame {idx}",
+        lf_vis_char_idxs=[],
+        motion_desc="m",
+        audio_desc="a",
+    )
+
+
+def _pipeline(working_dir: str, *, shots=None) -> tuple[Script2VideoPipeline, _Generator, _Generator]:
+    """A pipeline with planning stubbed out, so tests exercise only the render phases."""
+    shots = shots or [_shot(0)]
+    image_generator = _Generator(IMAGE_MODEL)
+    video_generator = _Generator(VIDEO_MODEL)
+    pipeline = Script2VideoPipeline(
+        chat_model=MagicMock(),
+        image_generator=image_generator,
+        video_generator=video_generator,
+        working_dir=working_dir,
+    )
+    pipeline.design_storyboard = AsyncMock(return_value=[MagicMock(idx=shot.idx) for shot in shots])
+    pipeline.decompose_visual_descriptions = AsyncMock(return_value=shots)
+    pipeline.construct_camera_tree = AsyncMock(return_value=[Camera(idx=0, active_shot_idxs=[shot.idx for shot in shots])])
+    pipeline.reference_image_selector = MagicMock(
+        select_reference_images_and_generate_prompt=AsyncMock(
+            return_value={"reference_image_path_and_text_pairs": [], "text_prompt": "a prompt"}
+        )
+    )
+    # decompose_visual_descriptions owns this wiring in production; mirror it so the
+    # stubbed planning step leaves the same state behind. Both keyframes are tracked
+    # for every shot, even though an end frame is only generated for models that
+    # accept one.
+    for shot in shots:
+        pipeline.shot_desc_events[shot.idx] = asyncio.Event()
+        pipeline.frame_events[shot.idx] = {"first_frame": asyncio.Event(), "last_frame": asyncio.Event()}
+    return pipeline, image_generator, video_generator
+
+
+class PhaseNormalizationTests(unittest.TestCase):
+    def test_unknown_phase_is_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            normalize_phase("clips")
+        self.assertIn("stop_after must be one of", str(caught.exception))
+
+    def test_default_phase_is_portraits(self):
+        self.assertEqual(normalize_phase(""), "portraits")
+
+
+class ModelScopedLayoutTests(unittest.TestCase):
+    def test_artifacts_live_under_the_model_that_produced_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, _ = _pipeline(tmp)
+            self.assertEqual(pipeline.image_model_slug, "test_image-model")
+            self.assertEqual(pipeline.video_model_slug, "test_video-model")
+            self.assertEqual(os.path.relpath(pipeline.portraits_dir(), tmp), os.path.join("character_portraits", "test_image-model"))
+            self.assertEqual(os.path.relpath(pipeline.portraits_registry_path(), tmp), os.path.join("character_portraits", "test_image-model", "registry.json"))
+            self.assertEqual(os.path.relpath(pipeline.frame_path(3, "first_frame"), tmp), os.path.join("shots", "3", "test_image-model", "first_frame.png"))
+            self.assertEqual(os.path.relpath(pipeline.clip_path(3), tmp), os.path.join("shots", "3", "test_video-model", "video.mp4"))
+            # Prompts are inputs, not model output.
+            self.assertEqual(os.path.relpath(pipeline.selector_output_path(3, "first_frame"), tmp), os.path.join("shots", "3", "first_frame_selector_output.json"))
+
+
+class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_portraits_phase_stops_before_any_keyframe_or_clip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, image_generator, video_generator = _pipeline(tmp)
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="portraits",
+            )
+
+            self.assertEqual(outcome.phase, "portraits")
+            self.assertEqual(outcome.awaiting_confirmation, "stills")
+            self.assertEqual(outcome.style, "cinematic")
+            self.assertEqual(len(outcome.stills), 3)  # front, side, back
+            self.assertTrue(all(path.startswith(os.path.join(tmp, "character_portraits", "test_image-model")) for path in outcome.stills))
+            self.assertEqual(video_generator.calls, [])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "shots", "0", "test_image-model", "first_frame.png")))
+            # The portraits phase must not even load the storyboard.
+            pipeline.design_storyboard.assert_not_awaited()
+
+    async def test_stills_phase_stops_before_video_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, video_generator = _pipeline(tmp)
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="stills",
+            )
+
+            self.assertEqual(outcome.phase, "stills")
+            self.assertEqual(outcome.awaiting_confirmation, "video")
+            # Both keyframes of every shot are shown, because both bracket the clip.
+            expected = [
+                os.path.join(tmp, "shots", "0", "test_image-model", "first_frame.png"),
+                os.path.join(tmp, "shots", "0", "test_image-model", "last_frame.png"),
+            ]
+            self.assertEqual(outcome.stills, expected)
+            self.assertTrue(all(os.path.exists(path) for path in expected))
+            self.assertEqual(video_generator.calls, [], "video must not be generated before the user approves the stills")
+
+    async def test_stills_phase_reports_last_frames_for_interpolated_shots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, _ = _pipeline(tmp, shots=[_shot(0, variation_type="large")])
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="stills",
+            )
+
+            self.assertEqual(
+                [os.path.basename(path) for path in outcome.stills],
+                ["first_frame.png", "last_frame.png"],
+            )
+
+    async def test_video_phase_generates_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # An existing final video keeps the test off moviepy's real encoder.
+            open(os.path.join(tmp, "final_video.mp4"), "wb").close()
+            pipeline, _, video_generator = _pipeline(tmp)
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="video",
+            )
+
+            self.assertEqual(outcome.phase, "video")
+            self.assertEqual(outcome.awaiting_confirmation, "")
+            self.assertEqual(len(video_generator.calls), 1)
+            self.assertTrue(outcome.final_video_path.endswith("final_video.mp4"))
+
+
+    async def test_one_video_is_drawn_per_render_however_many_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # An existing final video keeps the test off moviepy's real encoder.
+            open(os.path.join(tmp, "final_video.mp4"), "wb").close()
+            pipeline, _, video_generator = _pipeline(tmp, shots=[_shot(0), _shot(1), _shot(2)])
+
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="video",
+            )
+
+            # Nine clips were bought in a single run of the live sequence, so the rule is a
+            # hard one: the first clip the film is missing is drawn and the rest wait.
+            self.assertEqual(len(video_generator.calls), 1)
+            self.assertTrue(os.path.exists(pipeline.clip_path(0)))
+            self.assertFalse(os.path.exists(pipeline.clip_path(1)))
+            self.assertFalse(os.path.exists(pipeline.clip_path(2)))
+            self.assertEqual(outcome.final_video_path, "")
+
+    async def test_a_stills_render_draws_at_most_one_transition_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, video_generator = _pipeline(tmp, shots=[_shot(0), _shot(1), _shot(2)])
+            pipeline.construct_camera_tree = AsyncMock(return_value=[
+                Camera(idx=0, active_shot_idxs=[0]),
+                Camera(idx=1, active_shot_idxs=[1], parent_shot_idx=0),
+                Camera(idx=2, active_shot_idxs=[2], parent_shot_idx=0),
+            ])
+            # The new camera image is taken from the transition video; pre-made here so the
+            # stub's bytes never reach moviepy's decoder.
+            for camera_idx, shot_idx in ((1, 1), (2, 2)):
+                os.makedirs(pipeline.shot_video_dir(shot_idx), exist_ok=True)
+                Image.new("RGB", (16, 9), "red").save(
+                    os.path.join(pipeline.shot_video_dir(shot_idx), f"new_camera_{camera_idx}.png")
+                )
+
+            await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="stills",
+            )
+
+            # Two cameras parented to shot 0 means two transitions are missing, and a stills
+            # render used to bill both of them without a word about it.
+            self.assertEqual(len(video_generator.calls), 1)
+
+
+class ClipLengthTests(unittest.TestCase):
+    """A clip of the wrong length is not the film's clip."""
+
+    def _root_with(self, tmp):
+        root = Path(tmp) / "script2video"
+        clip = root / "shots/2/test_video-model/video.mp4"
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        clip.write_bytes(b"old clip")
+        (root / "final_video.mp4").write_bytes(b"film")
+        return root, clip
+
+    def test_wrong_length_clips_and_the_film_move_aside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, clip = self._root_with(tmp)
+
+            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=5.04):
+                moved = _supersede_clips(root, 8)
+
+            self.assertEqual(len(moved), 2)
+            self.assertFalse(clip.exists())
+            self.assertFalse((root / "final_video.mp4").exists())
+            # Kept, under the length they were rendered at, where no slot reads them.
+            self.assertTrue((root / ".superseded_clips/5s/shots/2/test_video-model/video.mp4").exists())
+
+    def test_a_clip_at_the_configured_length_stays(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, clip = self._root_with(tmp)
+
+            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=8.04):
+                moved = _supersede_clips(root, 8)
+
+            self.assertEqual(moved, ["final_video.mp4"])
+            self.assertTrue(clip.exists())
+
+    def test_the_sequence_records_the_length_and_sheds_the_old_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, clip = self._root_with(tmp)
+            manifest = Path(tmp) / RENDER_MANIFEST_FILENAME
+            manifest.write_text(json.dumps({
+                "image_model": IMAGE_MODEL,
+                "video_model": VIDEO_MODEL,
+                "style": "cinematic",
+                "render_mode": "script2video",
+            }), encoding="utf-8")
+            generator = _Generator(VIDEO_MODEL)
+            generator.clip_seconds = 8
+
+            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=5.04):
+                refusal = _enforce_render_sequence(
+                    Path(tmp),
+                    image_generator=_Generator(IMAGE_MODEL),
+                    video_generator=generator,
+                    style="cinematic",
+                    allow_model_change=False,
+                    render_mode="script2video",
+                )
+
+            self.assertIsNone(refusal)
+            self.assertFalse(clip.exists())
+            self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["clip_seconds"], 8)
+
+
+class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):
+    """A clip is bracketed by both keyframes only where the model accepts an end frame."""
+
+    async def test_no_end_keyframe_is_generated_for_a_model_that_rejects_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # An existing final video keeps the test off moviepy's real encoder.
+            open(os.path.join(tmp, "final_video.mp4"), "wb").close()
+            pipeline, _, video_generator = _pipeline(tmp)
+
+            async def supports_last_frame():
+                return False
+
+            video_generator.supports_last_frame = supports_last_frame
+            await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="video",
+            )
+
+            self.assertFalse(os.path.exists(os.path.join(tmp, "shots", "0", IMAGE_MODEL, "last_frame.png")))
+            self.assertEqual([os.path.basename(path) for path in video_generator.calls[0]["reference_image_paths"]], ["first_frame.png"])
+
+    async def test_both_keyframes_reach_the_video_model_when_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "final_video.mp4"), "wb").close()
+            pipeline, _, video_generator = _pipeline(tmp)
+            await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="video",
+            )
+
+            self.assertEqual(
+                [os.path.basename(path) for path in video_generator.calls[0]["reference_image_paths"]],
+                ["first_frame.png", "last_frame.png"],
+            )
+
+
+class SingleImageModelTests(unittest.TestCase):
+    def test_first_render_records_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = __import__("pathlib").Path(tmp)
+            result = _enforce_render_sequence(
+                working_dir,
+                image_generator=_Generator(IMAGE_MODEL),
+                video_generator=_Generator(VIDEO_MODEL),
+                style="cinematic",
+                allow_model_change=False,
+            )
+            self.assertIsNone(result)
+            self.assertEqual(_read_render_manifest(working_dir)["image_model"], IMAGE_MODEL)
+            self.assertEqual(_read_render_manifest(working_dir)["video_model"], VIDEO_MODEL)
+            self.assertEqual(_read_render_manifest(working_dir)["style"], "cinematic")
+
+    def test_changing_the_model_mid_sequence_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = __import__("pathlib").Path(tmp)
+            _enforce_render_sequence(working_dir, image_generator=_Generator(IMAGE_MODEL), video_generator=_Generator(VIDEO_MODEL), style="cinematic", allow_model_change=False)
+
+            result = _enforce_render_sequence(
+                working_dir,
+                image_generator=_Generator("other/model"),
+                video_generator=_Generator(VIDEO_MODEL),
+                style="cinematic",
+                allow_model_change=False,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["error_type"], "image_model_changed")
+            self.assertFalse(result["retryable"])
+            self.assertIn(IMAGE_MODEL, result["error"])
+            self.assertIn("other/model", result["error"])
+            # The recorded model is untouched, so the sequence stays consistent.
+            self.assertEqual(_read_render_manifest(working_dir)["image_model"], IMAGE_MODEL)
+
+    def test_explicit_approval_allows_the_model_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = __import__("pathlib").Path(tmp)
+            _enforce_render_sequence(working_dir, image_generator=_Generator(IMAGE_MODEL), video_generator=_Generator(VIDEO_MODEL), style="cinematic", allow_model_change=False)
+
+            result = _enforce_render_sequence(
+                working_dir,
+                image_generator=_Generator("other/model"),
+                video_generator=_Generator(VIDEO_MODEL),
+                style="cinematic",
+                allow_model_change=True,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(_read_render_manifest(working_dir)["image_model"], "other/model")
+
+    def test_changing_the_project_style_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = __import__("pathlib").Path(tmp)
+            _enforce_render_sequence(working_dir, image_generator=_Generator(IMAGE_MODEL), video_generator=_Generator(VIDEO_MODEL), style="photorealistic cinematic live action", allow_model_change=False)
+
+            # Artifacts rendered under the old style cannot be reused, so the render
+            # must not silently proceed with a new one.
+            result = _enforce_render_sequence(
+                working_dir,
+                image_generator=_Generator(IMAGE_MODEL),
+                video_generator=_Generator(VIDEO_MODEL),
+                style="stylized 3D animated short film",
+                allow_model_change=False,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["error_type"], "style_changed")
+            self.assertFalse(result["retryable"])
+            self.assertIn("project page", result["error"])
+            self.assertIn("photorealistic cinematic live action", result["error"])
+            self.assertEqual(_read_render_manifest(working_dir)["style"], "photorealistic cinematic live action")
+
+    def test_repeated_renders_with_the_same_style_are_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = __import__("pathlib").Path(tmp)
+            for _ in range(2):
+                result = _enforce_render_sequence(
+                    working_dir,
+                    image_generator=_Generator(IMAGE_MODEL),
+                    video_generator=_Generator(VIDEO_MODEL),
+                    style="cinematic",
+                    allow_model_change=False,
+                )
+                self.assertIsNone(result)
+
+
+class _PhaseOutcomePipeline:
+    """Stands in for a pipeline, returning a gated outcome."""
+
+    def __init__(self, **kwargs) -> None:
+        self.working_dir = kwargs.get("working_dir", "")
+
+    async def __call__(self, **kwargs):
+        from pipelines.render_contract import RenderOutcome
+
+        return RenderOutcome(
+            phase="stills",
+            style="cinematic",
+            image_model=IMAGE_MODEL,
+            video_model=VIDEO_MODEL,
+            stills=[os.path.join(str(self.working_dir), "shots", "0", "test_image-model", "first_frame.png")],
+            awaiting_confirmation="video",
+        )
+
+
+class RenderToolGateTests(unittest.IsolatedAsyncioTestCase):
+    def _adapter(self, tmp: str) -> tuple[ViMaxAdapters, dict]:
+        index = SessionIndex(tmp)
+        record = index.create(idea="a comedic short")
+        root = __import__("pathlib").Path(tmp) / record["working_dir"]
+        (root / "script2video" / "shots" / "0").mkdir(parents=True, exist_ok=True)
+        (root / "script2video" / "script.txt").write_text("script", encoding="utf-8")
+        (root / "script2video" / "characters.json").write_text("[]", encoding="utf-8")
+        (root / "script2video" / "storyboard.json").write_text("[]", encoding="utf-8")
+        (root / "script2video" / "camera_tree.json").write_text("[]", encoding="utf-8")
+        (root / "script2video" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+        return ViMaxAdapters(__import__("pathlib").Path(tmp), index), record
+
+    async def test_gated_phase_asks_for_confirmation_instead_of_completing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, _ = self._adapter(tmp)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=_Generator(IMAGE_MODEL)), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=_Generator(VIDEO_MODEL)), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", _PhaseOutcomePipeline):
+                result = await adapter.vimax_render_video({"stop_after": "stills"})
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.metadata["phase"], "stills")
+            self.assertEqual(result.metadata["awaiting_confirmation"], "video")
+            self.assertFalse(result.metadata["render_completed"])
+            self.assertIn("stop_after=\"video\"", result.content)
+            self.assertIn("cinematic", result.content)
+
+    async def test_model_change_is_refused_by_the_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, record = self._adapter(tmp)
+            working_dir = __import__("pathlib").Path(tmp) / record["working_dir"]
+            (working_dir / RENDER_MANIFEST_FILENAME).write_text(json.dumps({"image_model": "meta/muse-image"}), encoding="utf-8")
+
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=_Generator(IMAGE_MODEL)), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=_Generator(VIDEO_MODEL)), \
+                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", _PhaseOutcomePipeline):
+                result = await adapter.vimax_render_video({"stop_after": "stills"})
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "image_model_changed")
+            self.assertIn("meta/muse-image", result.content)
+
+
+if __name__ == "__main__":
+    unittest.main()

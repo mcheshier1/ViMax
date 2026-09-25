@@ -86,10 +86,12 @@ class TestEventDictsAreInstanceState(unittest.TestCase):
 class TestResumeIncludesNewCameraReference(unittest.IsolatedAsyncioTestCase):
     async def test_existing_new_camera_image_is_still_offered_to_selector(self):
         with tempfile.TemporaryDirectory() as tmp:
+            image_generator = MagicMock(model="test/image-model")
+            video_generator = MagicMock(model="test/video-model")
             pipeline = Script2VideoPipeline(
                 chat_model=MagicMock(),
-                image_generator=MagicMock(),
-                video_generator=MagicMock(),
+                image_generator=image_generator,
+                video_generator=video_generator,
                 working_dir=tmp,
             )
             shots = [_shot(0, cam_idx=0), _shot(1, cam_idx=1)]
@@ -101,21 +103,21 @@ class TestResumeIncludesNewCameraReference(unittest.IsolatedAsyncioTestCase):
             parent_done = asyncio.Event()
             parent_done.set()
             pipeline.frame_events = {
-                0: {"first_frame": parent_done},
-                1: {"first_frame": asyncio.Event()},
+                0: {"first_frame": parent_done, "last_frame": asyncio.Event()},
+                1: {"first_frame": asyncio.Event(), "last_frame": asyncio.Event()},
             }
 
-            # Resume state: transition video and new-camera image already on disk.
-            shot_dir = os.path.join(tmp, "shots", "1")
-            os.makedirs(shot_dir, exist_ok=True)
-            new_camera_path = os.path.join(shot_dir, "new_camera_1.png")
-            open(os.path.join(shot_dir, "transition_video_from_shot_0.mp4"), "wb").close()
+            # Resume state: transition video and new-camera image already on disk,
+            # under the video model that produced them.
+            new_camera_path = os.path.join(pipeline.shot_video_dir(1), "new_camera_1.png")
+            os.makedirs(os.path.dirname(new_camera_path), exist_ok=True)
+            open(os.path.join(pipeline.shot_video_dir(1), "transition_video_from_shot_0.mp4"), "wb").close()
             open(new_camera_path, "wb").close()
 
             selector = AsyncMock(return_value={"reference_image_path_and_text_pairs": [], "text_prompt": "p"})
             pipeline.reference_image_selector = MagicMock(select_reference_images_and_generate_prompt=selector)
             fake_image = MagicMock()
-            pipeline.image_generator.generate_single_image = AsyncMock(return_value=fake_image)
+            image_generator.generate_single_image = AsyncMock(return_value=fake_image)
 
             await pipeline.generate_frames_for_single_camera(
                 camera=camera,
@@ -125,9 +127,11 @@ class TestResumeIncludesNewCameraReference(unittest.IsolatedAsyncioTestCase):
                 priority_shot_idxs=[],
             )
 
-            selector.assert_awaited_once()
-            offered = selector.await_args.kwargs["available_image_path_and_text_pairs"]
-            offered_paths = [pair[0] for pair in offered]
+            offered_paths = [
+                pair[0]
+                for call in selector.await_args_list
+                for pair in call.kwargs["available_image_path_and_text_pairs"]
+            ]
             self.assertIn(new_camera_path, offered_paths,
                           "resumed runs must offer the new-camera reference image to the selector")
 

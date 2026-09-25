@@ -1,6 +1,6 @@
 import {useEffect, useMemo, useState} from 'react';
 import {ChevronDown, ChevronUp, FileJson, Film, Files, Image as ImageIcon, Maximize2, Video, X} from 'lucide-react';
-import {getJsonArtifact} from './api';
+import {getJsonArtifact, readAcceptance} from './api';
 import {
   activeRenderCheckpoint,
   deriveStoryboardReadiness,
@@ -14,13 +14,23 @@ import {
   isArtifactPathField,
   isStoryboardArtifact,
   relatedVisualArtifacts,
+  sortVisuals,
   structuredRecordTitle,
+  visualArtifactTitle,
+  visualFamilyCounts,
+  visualPromptSource,
+  visualPromptText,
+  visualRole,
+  visibleVisuals,
   type ReadinessStatus,
   type StoryboardPreview,
+  type VisualFamily,
 } from './artifactPresentation';
+import {needsReview} from './timeline';
+import {TimelineView} from './TimelineView';
 import type {Artifact, JsonValue, SessionSummary} from './types';
 
-export function ArtifactsView({session, artifacts}: {session?: SessionSummary; artifacts: Artifact[]}) {
+export function ArtifactsView({session, artifacts, onAskAgent}: {session?: SessionSummary; artifacts: Artifact[]; onAskAgent: (text: string) => Promise<void>}) {
   const jsonArtifacts = useMemo(
     () => artifacts.filter(isJsonArtifact).sort((left, right) => left.path.localeCompare(right.path, undefined, {numeric: true})),
     [artifacts],
@@ -30,22 +40,34 @@ export function ArtifactsView({session, artifacts}: {session?: SessionSummary; a
   const [document, setDocument] = useState<JsonValue>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [view, setView] = useState<'all' | 'documents' | 'visuals'>('all');
+  const [view, setView] = useState<'all' | 'documents' | 'visuals' | 'timeline'>('all');
+  const [choseTab, setChoseTab] = useState(false);
   const [previewArtifact, setPreviewArtifact] = useState<Artifact>();
   const mediaArtifacts = useMemo(
-    () => artifacts
-      .filter((artifact) => artifact.kind === 'image' || artifact.kind === 'video')
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    () => sortVisuals(artifacts.filter((artifact) => artifact.kind === 'image' || artifact.kind === 'video')),
     [artifacts],
   );
   const relatedMedia = useMemo(
-    () => selected ? relatedVisualArtifacts(selected, mediaArtifacts) : [],
+    () => selected ? sortVisuals(relatedVisualArtifacts(selected, mediaArtifacts)) : [],
     [selected, mediaArtifacts],
   );
 
   useEffect(() => {
     setSelectedPath((current) => jsonArtifacts.some((artifact) => artifact.path === current) ? current : jsonArtifacts[0]?.path || '');
   }, [jsonArtifacts]);
+
+  // A render that has produced something nobody has accepted opens on the Timeline: that
+  // is the tab with the decision waiting in it. Choosing a tab by hand ends the override.
+  useEffect(() => {
+    if (!session || choseTab) return;
+    let cancelled = false;
+    void readAcceptance(session.sessionId)
+      .then((payload) => {
+        if (!cancelled && payload && needsReview(payload.stages)) setView('timeline');
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [session?.sessionId, choseTab]);
 
   useEffect(() => {
     let cancelled = false;
@@ -67,15 +89,15 @@ export function ArtifactsView({session, artifacts}: {session?: SessionSummary; a
         <span className="artifact-file-count">{jsonArtifacts.length} documents · {mediaArtifacts.length} visuals</span>
       </header>
       <div className="artifact-view-switcher" role="tablist" aria-label="Artifact type">
-        {(['all', 'documents', 'visuals'] as const).map((option) => (
+        {(['all', 'documents', 'visuals', 'timeline'] as const).map((option) => (
           <button
             key={option}
             role="tab"
             aria-selected={view === option}
             className={view === option ? 'is-selected' : ''}
-            onClick={() => setView(option)}
+            onClick={() => { setChoseTab(true); setView(option); }}
           >
-            {option === 'all' ? 'All' : option === 'documents' ? 'Documents' : 'Visuals'}
+            {option === 'all' ? 'All' : option === 'documents' ? 'Documents' : option === 'visuals' ? 'Visuals' : 'Timeline'}
           </button>
         ))}
       </div>
@@ -132,29 +154,63 @@ export function ArtifactsView({session, artifacts}: {session?: SessionSummary; a
           {view === 'visuals' && (
             <VisualArtifacts artifacts={mediaArtifacts} onPreview={setPreviewArtifact} />
           )}
+          {view === 'timeline' && (
+            <TimelineView session={session} artifacts={artifacts} onAskAgent={onAskAgent} />
+          )}
         </>
       )}
-      {previewArtifact && <MediaPreviewDialog artifact={previewArtifact} onClose={() => setPreviewArtifact(undefined)} />}
+      {previewArtifact && (
+        <MediaPreviewDialog
+          artifact={previewArtifact}
+          promptDocument={artifacts.find((candidate) => candidate.path === visualPromptSource(previewArtifact.path)?.documentPath)}
+          onClose={() => setPreviewArtifact(undefined)}
+        />
+      )}
     </section>
   );
 }
 
 function VisualArtifacts({artifacts, onPreview}: {artifacts: Artifact[]; onPreview: (artifact: Artifact) => void}) {
+  const [family, setFamily] = useState<VisualFamily | 'all'>('all');
+  const families = useMemo(() => visualFamilyCounts(artifacts), [artifacts]);
+  const everything = useMemo(() => visibleVisuals(artifacts, 'all'), [artifacts]);
+  const shown = useMemo(() => (family === 'all' ? everything : visibleVisuals(artifacts, family)), [artifacts, family, everything]);
+  const activeHint = families.find((entry) => entry.family === family)?.hint;
   return (
     <section className="artifact-visuals">
-      {artifacts.length > 0 ? (
+      {families.length > 1 && (
+        <div className="artifact-view-switcher artifact-family-filter" role="tablist" aria-label="Visual families">
+          <button role="tab" aria-selected={family === 'all'} className={family === 'all' ? 'is-selected' : ''} onClick={() => setFamily('all')}>
+            Everything<span className="artifact-family-count">{everything.length}</span>
+          </button>
+          {families.map((entry) => (
+            <button
+              key={entry.family}
+              role="tab"
+              aria-selected={family === entry.family}
+              className={family === entry.family ? 'is-selected' : ''}
+              onClick={() => setFamily(entry.family)}
+              title={entry.hint}
+            >
+              {entry.label}<span className="artifact-family-count">{entry.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {activeHint && <p className="artifact-family-hint">{activeHint}</p>}
+      {shown.length > 0 ? (
         <div className="render-grid">
-          {artifacts.map((artifact) => (
+          {shown.map((artifact) => (
             <article key={artifact.path} className="render-item">
-              <button className="render-media" onClick={() => onPreview(artifact)} aria-label={`Preview ${artifact.name}`}>
+              <button className="render-media" onClick={() => onPreview(artifact)} aria-label={`Preview ${visualArtifactTitle(artifact.path)}`}>
                 {artifact.kind === 'image'
-                  ? <img src={mediaUrl(artifact)} alt={artifact.name} />
+                  ? <img src={mediaUrl(artifact)} alt={visualArtifactTitle(artifact.path)} />
                   : <video src={mediaUrl(artifact)} muted playsInline preload="metadata" />}
                 <i>{artifact.kind === 'video' ? <Video size={15} /> : <ImageIcon size={15} />}</i>
               </button>
               <span className="render-copy">
-                <strong>{visualArtifactLabel(artifact)}</strong>
-                <small>{formatBytes(artifact.size)}</small>
+                <strong>{visualArtifactTitle(artifact.path)}</strong>
+                <small>{formatBytes(artifact.size)}<VisualModel path={artifact.path} /></small>
               </span>
             </article>
           ))}
@@ -180,14 +236,14 @@ function RelatedVisuals({artifacts, onPreview}: {artifacts: Artifact[]; onPrevie
       {artifacts.length > 0 ? (
         <div className="related-visual-grid">
           {artifacts.map((artifact) => (
-            <button key={artifact.path} onClick={() => onPreview(artifact)} aria-label={`Preview ${visualArtifactLabel(artifact)}`}>
+            <button key={artifact.path} onClick={() => onPreview(artifact)} aria-label={`Preview ${visualArtifactTitle(artifact.path)}`}>
               <span>
                 {artifact.kind === 'image'
-                  ? <img src={mediaUrl(artifact)} alt={visualArtifactLabel(artifact)} />
+                  ? <img src={mediaUrl(artifact)} alt={visualArtifactTitle(artifact.path)} />
                   : <video src={mediaUrl(artifact)} muted playsInline preload="metadata" />}
                 <i><Maximize2 size={14} /></i>
               </span>
-              <strong>{visualArtifactLabel(artifact)}</strong>
+              <strong>{visualArtifactTitle(artifact.path)}</strong>
               <small>{formatBytes(artifact.size)}</small>
             </button>
           ))}
@@ -202,7 +258,17 @@ function RelatedVisuals({artifacts, onPreview}: {artifacts: Artifact[]; onPrevie
   );
 }
 
-function MediaPreviewDialog({artifact, onClose}: {artifact: Artifact; onClose: () => void}) {
+function VisualModel({path}: {path: string}) {
+  const model = visualRole(path)?.model;
+  if (!model) return null;
+  return <em className="visual-model" title={`Produced by ${model}`}>{model}</em>;
+}
+
+export function MediaPreviewDialog({artifact, promptDocument, onClose}: {artifact: Artifact; promptDocument?: Artifact; onClose: () => void}) {
+  const [prompt, setPrompt] = useState('');
+  const [promptError, setPromptError] = useState('');
+  const source = visualPromptSource(artifact.path);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
@@ -211,18 +277,40 @@ function MediaPreviewDialog({artifact, onClose}: {artifact: Artifact; onClose: (
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setPrompt('');
+    setPromptError('');
+    if (!promptDocument || !source) return () => { cancelled = true; };
+    void getJsonArtifact(promptDocument)
+      .then((document) => !cancelled && setPrompt(visualPromptText(document, source.field, artifact.path)))
+      .catch((reason) => !cancelled && setPromptError(reason instanceof Error ? reason.message : String(reason)));
+    return () => { cancelled = true; };
+  }, [promptDocument?.path, promptDocument?.updatedAt, source?.documentPath, source?.field, artifact.path]);
+
   return (
     <div className="media-preview-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="media-preview-dialog" role="dialog" aria-modal="true" aria-label={`Preview ${visualArtifactLabel(artifact)}`}>
+      <section className="media-preview-dialog" role="dialog" aria-modal="true" aria-label={`Preview ${visualArtifactTitle(artifact.path)}`}>
         <header>
-          <div><strong>{visualArtifactLabel(artifact)}</strong><span>{formatBytes(artifact.size)}</span></div>
+          <div>
+            <strong>{visualArtifactTitle(artifact.path)}</strong>
+            <span>{formatBytes(artifact.size)}<VisualModel path={artifact.path} /></span>
+          </div>
           <button className="icon-button" onClick={onClose} aria-label="Close preview"><X size={18} /></button>
         </header>
         <div className="media-preview-stage">
           {artifact.kind === 'image'
-            ? <img src={mediaUrl(artifact)} alt={visualArtifactLabel(artifact)} />
+            ? <img src={mediaUrl(artifact)} alt={visualArtifactTitle(artifact.path)} />
             : <video src={mediaUrl(artifact)} controls autoPlay playsInline preload="metadata" />}
         </div>
+        <section className="media-preview-prompt">
+          <header><span>Prompt</span><small>{source?.documentPath || 'Not recorded for this artifact'}</small></header>
+          {promptError
+            ? <p className="is-error">{promptError}</p>
+            : prompt
+              ? <pre>{prompt}</pre>
+              : <p>{source ? 'Loading prompt…' : 'This artifact was generated from a prompt the render does not keep.'}</p>}
+        </section>
       </section>
     </div>
   );
@@ -461,19 +549,4 @@ function formatBytes(bytes: number) {
 function mediaUrl(artifact: Artifact): string {
   const separator = artifact.url.includes('?') ? '&' : '?';
   return `${artifact.url}${separator}updated=${encodeURIComponent(artifact.updatedAt)}`;
-}
-
-function visualArtifactLabel(artifact: Artifact): string {
-  const scene = artifact.path.match(/(?:^|\/)scene_(\d+)(?:\/|$)/i)?.[1];
-  const shot = artifact.path.match(/(?:^|\/)shots\/(\d+)(?:\/|$)/i)?.[1];
-  const portrait = artifact.path.match(/(?:^|\/)character_portraits\/([^/]+)\/([^/]+)$/i);
-  const base = artifact.name
-    .replace(/\.[^.]+$/, '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\b\w/g, (character) => character.toUpperCase());
-  if (portrait) return `${portrait[1]} · ${base}`;
-  const context = [];
-  if (scene !== undefined) context.push(`Scene ${Number(scene) + 1}`);
-  if (shot !== undefined) context.push(`Shot ${Number(shot) + 1}`);
-  return context.length > 0 ? `${context.join(' · ')} · ${base}` : base;
 }
