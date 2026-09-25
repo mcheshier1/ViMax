@@ -14,15 +14,17 @@ class FakeSessionIndex:
         self.activated = ""
         self.created = 0
         self.project_name = ""
+        self.style = ""
 
     def set_active(self, session_id):
         if self.fail_session:
             raise KeyError(session_id)
         self.activated = session_id
 
-    def create(self, project_name=""):
+    def create(self, project_name="", style=""):
         self.created += 1
         self.project_name = project_name
+        self.style = style
         self.activated = f"new-{self.created}"
         return {"session_id": self.activated}
 
@@ -143,6 +145,29 @@ class MainAgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(session_index.project_name, "Ocean campaign")
         self.assertEqual(runtime.inputs, ["hello"])
+
+    async def test_new_session_style_is_applied_up_front(self):
+        runtime = FakeRuntime()
+        session_index = FakeSessionIndex()
+        code, stdout, stderr, runtime = await self.run_cli(
+            ["--new-session", "--new-session-style", "photorealistic cinematic live action", "--jsonl", "--once", "hello"],
+            runtime=runtime,
+            session_index=session_index,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(session_index.style, "photorealistic cinematic live action")
+        self.assertEqual(runtime.inputs, ["hello"])
+
+    async def test_new_session_style_requires_new_session(self):
+        runtime = FakeRuntime()
+        code, stdout, stderr, runtime = await self.run_cli(
+            ["--new-session-style", "noir", "--once", "hello"],
+            runtime=runtime,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--new-session-style requires --new-session", stderr)
+        self.assertEqual(runtime.inputs, [])
 
     async def test_new_session_and_session_are_mutually_exclusive(self):
         runtime = FakeRuntime()
