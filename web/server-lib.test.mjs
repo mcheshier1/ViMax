@@ -79,6 +79,18 @@ describe('web bridge state', () => {
     expect(() => resolveArtifactPath(root, 'session-1', '../../secrets')).toThrow(/escapes/);
   });
 
+  it('keeps render scratch out of the browsable artifacts', async () => {
+    const root = await fixture();
+    const shot = path.join(root, '.working_dir', 'session-1', 'script2video', 'shots', '0', 'qwen_qwen-image-3');
+    await mkdir(path.join(shot, 'cache'), {recursive: true});
+    await writeFile(path.join(shot, 'first_frame.png'), 'image');
+    await writeFile(path.join(shot, 'cache', 'transition-Scene-001.mp4'), 'scratch');
+
+    const artifacts = await listSessionArtifacts(root, 'session-1');
+
+    expect(artifacts.map((artifact) => artifact.name)).toEqual(['first_frame.png']);
+  });
+
   it('stores uploads inside the session without overwriting matching names', async () => {
     const root = await fixture();
     const first = await storeWorkspaceUpload(root, 'session-1', 'script.txt', Buffer.from('first'));

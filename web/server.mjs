@@ -5,15 +5,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
-import {
-  artifactContentType,
-  deleteSession,
-  listSessionArtifacts,
-  readSessionHistory,
-  readSessionState,
-  resolveArtifactPath,
-  storeWorkspaceUpload,
-} from './server-lib.mjs';
+import {artifactContentType, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, resolveArtifactPath, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -38,6 +30,48 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/api/sessions' && request.method === 'GET') {
       return sendJson(response, 200, await readSessionState(repoRoot));
+    }
+    if (url.pathname === '/api/session' && request.method === 'GET') {
+      const session = await readProjectMetadata(repoRoot, url.searchParams.get('session') || '');
+      if (!session) return sendJson(response, 404, {error: 'Project not found'});
+      return sendJson(response, 200, session);
+    }
+    if (url.pathname === '/api/session' && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      const project = await updateProjectMetadata(repoRoot, {
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : '',
+        projectName: body.projectName,
+        idea: body.idea,
+        userRequirement: body.userRequirement,
+        style: body.style,
+        invalidate: body.invalidate,
+      });
+      if (!project) return sendJson(response, 404, {error: 'Project not found'});
+      const onActiveSession = project.session.sessionId === activeSessionId;
+      // `invalidated` doubles as the candidate list on the unconfirmed call, so
+      // the request flag decides whether artifacts were really deleted.
+      let regenerationStarted = false;
+      if (body.invalidate === true && project.invalidated.length) {
+        // Deleting the artifacts is only half of a confirmed style change: the
+        // render is what rebuilds them, and it skips whatever still exists. So
+        // the agent is respawned on this project (which also makes it active,
+        // since the user just confirmed the rebuild) and told to run it, rather
+        // than leaving the project silently empty until someone asks again.
+        await startAgent({sessionId: project.session.sessionId});
+        if (agentProcess?.stdin.writable) {
+          agentProcess.stdin.write(`${rerenderPrompt(project.session.style)}\n`);
+          regenerationStarted = true;
+        }
+      } else if (project.changed.length && onActiveSession) {
+        // The agent caches the session record, so a metadata edit that lands on
+        // the running session must respawn it (mirrors PUT /api/config).
+        stopAgent('config');
+      }
+      broadcast({type: 'sessions_changed', ...(await readSessionState(repoRoot))});
+      return sendJson(response, 200, {...project, regenerationStarted});
     }
     if (url.pathname === '/api/config' && request.method === 'GET') {
       return sendJson(response, 200, await readAgentConfig(repoRoot));
@@ -65,6 +99,101 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/api/artifacts' && request.method === 'GET') {
       return sendJson(response, 200, {artifacts: await listSessionArtifacts(repoRoot, url.searchParams.get('session') || '')});
     }
+    if (url.pathname === '/api/continuity' && request.method === 'GET') {
+      try {
+        const payload = await readContinuityReview(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+
+    if (url.pathname === '/api/shot-plans' && request.method === 'GET') {
+      try {
+        const payload = await readShotPlans(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/removed-shots' && request.method === 'GET') {
+      const payload = await readRemovedShots(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/shot-plan' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      try {
+        const payload = await createShot(repoRoot, body);
+        return payload ? sendJson(response, 201, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/shot-plan' && request.method === 'PATCH') {
+      const body = await readJsonBody(request);
+      try {
+        const payload = await restoreShot(repoRoot, body);
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/shot-move' && request.method === 'POST') {
+      try {
+        const payload = await moveShot(repoRoot, await readJsonBody(request));
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+
+    if (url.pathname === '/api/shot-plan' && request.method === 'GET') {
+      try {
+        const payload = await readShotPlan(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '', url.searchParams.get('slot') || '');
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/shot-plan' && request.method === 'DELETE') {
+      const body = await readJsonBody(request);
+      try {
+        const payload = await removeShot(repoRoot, body);
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/shot-plan' && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      try {
+        const payload = await updateShotPlan(repoRoot, body);
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message});
+      }
+    }
+    if (url.pathname === '/api/acceptance' && request.method === 'GET') {
+      const acceptance = await readRenderAcceptance(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+      if (!acceptance) return sendJson(response, 404, {error: 'Project not found'});
+      return sendJson(response, 200, acceptance);
+    }
+    if (url.pathname === '/api/acceptance' && request.method === 'PUT') {
+      const body = await readJsonBody(request);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      const acceptance = await updateRenderAcceptance(repoRoot, {
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : '',
+        root: typeof body.root === 'string' ? body.root : '',
+        stage: body.stage,
+        shot: body.shot,
+        accepted: body.accepted,
+        reason: body.reason,
+      });
+      if (!acceptance) return sendJson(response, 404, {error: 'Project not found'});
+      return sendJson(response, 200, acceptance);
+    }
     if (url.pathname === '/api/artifact' && request.method === 'GET') {
       return streamArtifact(response, url.searchParams.get('session') || '', url.searchParams.get('path') || '');
     }
@@ -87,10 +216,12 @@ const server = createServer(async (request, response) => {
       const body = await readJsonBody(request);
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
       const projectName = typeof body.projectName === 'string' ? body.projectName.trim() : '';
+      const style = typeof body.style === 'string' ? body.style.trim() : '';
+      const userRequirement = typeof body.userRequirement === 'string' ? body.userRequirement.trim() : '';
       if (projectName.length > 64) {
         return sendJson(response, 400, {error: 'Project name must be 64 characters or fewer'});
       }
-      await startAgent({newSession: body.newSession === true, sessionId, projectName});
+      await startAgent({newSession: body.newSession === true, sessionId, projectName, style, userRequirement});
       return sendJson(response, 200, {ok: true});
     }
     if (url.pathname === '/api/messages' && request.method === 'POST') {
@@ -139,33 +270,35 @@ server.listen(port, host, () => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-async function startAgent({newSession, sessionId, projectName = ''}) {
+async function startAgent({newSession, sessionId, projectName = '', style = '', userRequirement = ''}) {
   if (newSession && sessionId) throw new Error('Choose either a new or existing session');
   stopAgent('switch');
   const {command, args} = agentCommand();
   const sessionArgs = newSession
-    ? ['--new-session', ...(projectName ? ['--new-session-name', projectName] : [])]
+    ? ['--new-session', ...(projectName ? ['--new-session-name', projectName] : []), ...(style ? ['--new-session-style', style] : [])]
     : sessionId
       ? ['--session', sessionId]
       : [];
   activeSessionId = sessionId;
   // Inject ViMax agent defaults unless the user already overrode them in the
   // environment. Keeps the agent's request within the model context window:
-  // VIMAX_CONTEXT_WINDOW_TOKENS raises the auto-compaction trigger to ~1.1M
-  // (deepseek-v4-flash-0731 has a 1.31M window), VIMAX_MAX_TOOL_RESULT_CHARS
-  // caps the tool-output copy replayed to the LLM, and VIMAX_ENABLE_RUN_SHELL
-  // keeps the bounded shell tool available in the web runtime.
+  // VIMAX_CONTEXT_WINDOW_TOKENS raises the auto-compaction trigger to ~810k
+  // (deepseek-v4-flash-0731 has a 1.31M window) and VIMAX_MAX_TOOL_RESULT_CHARS
+  // caps the tool-output copy replayed to the LLM.
   const agentEnv = {...process.env};
   const setDefault = (name, value) => { if (!agentEnv[name]) agentEnv[name] = value; };
   setDefault('VIMAX_CONTEXT_WINDOW_TOKENS', '900000');
   setDefault('VIMAX_MAX_TOOL_RESULT_CHARS', '20000');
-  setDefault('VIMAX_ENABLE_RUN_SHELL', '1');
   const child = spawn(command, [...args, 'main_agent.py', '--jsonl', '--stdin-repl', ...sessionArgs], {
     cwd: repoRoot,
     env: agentEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   agentProcess = child;
+  // A brand-new project can carry its user requirement up front: the CLI has no
+  // flag for it, so it becomes the agent's first turn (the session record picks
+  // it up when narrative planning runs).
+  if (newSession && userRequirement) child.stdin.write(`${userRequirement}\n`);
   let childStdoutBuffer = '';
   broadcast({type: 'bridge_status', status: 'starting', message: newSession ? 'Creating workspace' : 'Opening workspace'});
   child.stdout.setEncoding('utf8');

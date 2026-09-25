@@ -14,10 +14,12 @@ import {
   Image as ImageIcon,
   Menu,
   Moon,
+  Palette,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRight,
   Plus,
+  RefreshCw,
   Save,
   Search,
   Settings,
@@ -30,16 +32,23 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import {deleteSession, getAgentConfig, getArtifacts, getHistory, getSessions, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, uploadWorkspaceFile} from './api';
+import {deleteSession, getAgentConfig, getArtifacts, getHistory, getSessions, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
 import {ArtifactsView, StoryboardPanel} from './ArtifactViews';
 import {applyAgentEvent, appendLocalUser, composeAgentPrompt, createChatState, humanize} from './events';
+import {describeArtifacts, describeInvalidation, describeStyleMismatch, diffProjectFields, toProjectFields, type InvalidationConfirmation, type ProjectFields} from './projectMetadata';
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
-import type {AgentConfig, AgentEvent, Artifact, ChatState, ConfigSection, Message, SessionSummary, WorkspaceUpload} from './types';
+import type {AgentConfig, AgentEvent, Artifact, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
 
 const CONTEXT_TARGET = 160_000;
 
-type WorkspaceView = 'workspace' | 'artifacts' | 'settings';
+type WorkspaceView = 'workspace' | 'project' | 'artifacts' | 'settings';
+
+const VIEW_HEADINGS: Record<Exclude<WorkspaceView, 'workspace'>, {title: string; subtitle?: string}> = {
+  project: {title: 'Project', subtitle: 'session metadata and style'},
+  artifacts: {title: 'Artifacts'},
+  settings: {title: 'Settings', subtitle: 'configs/agent.local.yaml'},
+};
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -59,6 +68,8 @@ export default function App() {
   const [loadError, setLoadError] = useState('');
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectStyle, setNewProjectStyle] = useState('');
+  const [newProjectRequirement, setNewProjectRequirement] = useState('');
   const [newProjectError, setNewProjectError] = useState('');
   const [creatingProject, setCreatingProject] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<SessionSummary>();
@@ -199,6 +210,8 @@ export default function App() {
 
   function openNewProjectDialog() {
     setNewProjectName('');
+    setNewProjectStyle('');
+    setNewProjectRequirement('');
     setNewProjectError('');
     setNewProjectOpen(true);
   }
@@ -211,7 +224,12 @@ export default function App() {
     setLoadError('');
     setMobileSidebarOpen(false);
     try {
-      await startAgent({newSession: true, projectName});
+      await startAgent({
+        newSession: true,
+        projectName,
+        style: newProjectStyle.trim(),
+        userRequirement: newProjectRequirement.trim(),
+      });
       setAgentReady(true);
       await new Promise((resolve) => window.setTimeout(resolve, 450));
       const state = await refreshSessions();
@@ -221,6 +239,8 @@ export default function App() {
       setWorkspaceView('workspace');
       setNewProjectOpen(false);
       setNewProjectName('');
+      setNewProjectStyle('');
+      setNewProjectRequirement('');
       textareaRef.current?.focus();
     } catch (error) {
       setNewProjectError(error instanceof Error ? error.message : String(error));
@@ -229,19 +249,28 @@ export default function App() {
     }
   }
 
+  /**
+   * Send one instruction to the agent, starting it if it is not running. The timeline's
+   * "render the next phase" buttons go through here, so a request from the UI behaves
+   * exactly like one typed into the chat.
+   */
+  async function askAgent(text: string, attachments: string[] = []) {
+    if (!text.trim()) return;
+    setChat((current) => appendLocalUser(current, text));
+    if (!agentReady) {
+      await startAgent(selectedSessionId ? {sessionId: selectedSessionId} : {newSession: true});
+      setAgentReady(true);
+    }
+    await sendMessage(composeAgentPrompt(text, attachments));
+  }
+
   async function submit() {
     const text = draft.trim();
     if (!text || chat.busy || uploadingFiles) return;
     setLoadError('');
     setDraft('');
-    setChat((current) => appendLocalUser(current, text));
     try {
-      if (!agentReady) {
-        await startAgent(selectedSessionId ? {sessionId: selectedSessionId} : {newSession: true});
-        setAgentReady(true);
-      }
-      const outbound = composeAgentPrompt(text, workspaceUploads.map((file) => file.path));
-      await sendMessage(outbound);
+      await askAgent(text, workspaceUploads.map((file) => file.path));
       setWorkspaceUploads([]);
     } catch (error) {
       const event: AgentEvent = {type: 'error', message: error instanceof Error ? error.message : String(error)};
@@ -327,6 +356,10 @@ export default function App() {
           setWorkspaceView('workspace');
           setMobileSidebarOpen(false);
         }}
+        onProject={() => {
+          setWorkspaceView('project');
+          setMobileSidebarOpen(false);
+        }}
         onArtifacts={() => {
           setWorkspaceView('artifacts');
           setMobileSidebarOpen(false);
@@ -370,8 +403,8 @@ export default function App() {
                 </button>
               )}
               <div className="workspace-title-copy">
-                <strong>{workspaceView === 'settings' ? 'Settings' : 'Artifacts'}</strong>
-                {workspaceView === 'settings' && <span>configs/agent.local.yaml</span>}
+                <strong>{VIEW_HEADINGS[workspaceView].title}</strong>
+                {VIEW_HEADINGS[workspaceView].subtitle && <span>{VIEW_HEADINGS[workspaceView].subtitle}</span>}
               </div>
             </div>
             <ThemeToggle theme={theme} onToggle={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} />
@@ -389,8 +422,16 @@ export default function App() {
               </div>
             )}
           </div>
+        ) : workspaceView === 'project' ? (
+          <ProjectView
+            sessionId={selectedSessionId}
+            onChanged={() => {
+              void refreshSessions();
+              void refreshArtifacts(selectedSessionId);
+            }}
+          />
         ) : workspaceView === 'artifacts' ? (
-          <ArtifactsView session={selectedSession} artifacts={artifacts} />
+          <ArtifactsView session={selectedSession} artifacts={artifacts} onAskAgent={(text) => askAgent(text)} />
         ) : (
           <SettingsView />
         )}
@@ -492,12 +533,16 @@ export default function App() {
       <NewProjectDialog
         open={newProjectOpen}
         name={newProjectName}
+        style={newProjectStyle}
+        requirement={newProjectRequirement}
         error={newProjectError}
         creating={creatingProject}
         onNameChange={(value) => {
           setNewProjectName(value);
           setNewProjectError('');
         }}
+        onStyleChange={setNewProjectStyle}
+        onRequirementChange={setNewProjectRequirement}
         onCancel={() => {
           if (creatingProject) return;
           setNewProjectOpen(false);
@@ -509,7 +554,7 @@ export default function App() {
   );
 }
 
-function Sidebar({open, mobileOpen, sessions, selectedSessionId, activeView, onToggle, onMobileClose, onNew, onSelect, onWorkspace, onArtifacts, onSettings, onDelete}: {
+function Sidebar({open, mobileOpen, sessions, selectedSessionId, activeView, onToggle, onMobileClose, onNew, onSelect, onWorkspace, onProject, onArtifacts, onSettings, onDelete}: {
   open: boolean;
   mobileOpen: boolean;
   sessions: SessionSummary[];
@@ -520,6 +565,7 @@ function Sidebar({open, mobileOpen, sessions, selectedSessionId, activeView, onT
   onNew: () => void;
   onSelect: (sessionId: string) => void;
   onWorkspace: () => void;
+  onProject: () => void;
   onArtifacts: () => void;
   onSettings: () => void;
   onDelete: (session: SessionSummary) => void;
@@ -538,6 +584,7 @@ function Sidebar({open, mobileOpen, sessions, selectedSessionId, activeView, onT
         <nav className="primary-nav" aria-label="Primary navigation">
           <button onClick={onNew}><FolderPlus size={17} /><span>New project</span></button>
           <button className={activeView === 'workspace' ? 'is-active' : ''} onClick={onWorkspace}><Folder size={17} /><span>Workspace</span></button>
+          <button className={activeView === 'project' ? 'is-active' : ''} onClick={onProject}><Palette size={17} /><span>Project</span></button>
           <button className={activeView === 'artifacts' ? 'is-active' : ''} onClick={onArtifacts}><Files size={17} /><span>Artifacts</span></button>
           <button className={activeView === 'settings' ? 'is-active' : ''} onClick={onSettings}><Settings size={17} /><span>Settings</span></button>
         </nav>
@@ -774,6 +821,228 @@ function ConfigSectionEditor({definition, value, onChange}: {
   );
 }
 
+function ProjectView({sessionId, onChanged}: {sessionId: string; onChanged: () => void}) {
+  const [project, setProject] = useState<ProjectMetadata>();
+  const [form, setForm] = useState<ProjectFields>();
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState('');
+  const [confirmation, setConfirmation] = useState<{request: ProjectUpdateRequest; prompt: InvalidationConfirmation}>();
+
+  useEffect(() => {
+    setConfirmation(undefined);
+    setStatus('');
+    if (!sessionId) {
+      setProject(undefined);
+      setForm(undefined);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    void readProject(sessionId)
+      .then((payload) => {
+        if (cancelled) return;
+        setProject(payload);
+        setForm(toProjectFields(payload));
+      })
+      .catch((error) => !cancelled && setStatus(error instanceof Error ? error.message : String(error)))
+      .finally(() => !cancelled && setLoading(false));
+    return () => { cancelled = true; };
+  }, [sessionId]);
+
+  function applyResponse(response: ProjectUpdateResponse) {
+    setProject(response.session);
+    setForm(toProjectFields(response.session));
+    onChanged();
+  }
+
+  async function save() {
+    if (!project || !form || saving) return;
+    const request = diffProjectFields(project.sessionId, toProjectFields(project), form);
+    if (!request) {
+      setStatus('No changes to save');
+      return;
+    }
+    setSaving(true);
+    setStatus('');
+    try {
+      const response = await updateProject(request);
+      applyResponse(response);
+      const prompt = describeInvalidation(response);
+      if (prompt) {
+        // The fields are already saved; the confirmation only gates the deletion.
+        setConfirmation({request: {...request, invalidate: true}, prompt});
+        setStatus('Saved · regeneration not confirmed yet');
+      } else {
+        setStatus('Saved');
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmInvalidation() {
+    if (!confirmation || saving) return;
+    setSaving(true);
+    setStatus('');
+    try {
+      const response = await updateProject(confirmation.request);
+      applyResponse(response);
+      setConfirmation(undefined);
+      const count = `${response.invalidated.length} artifact path${response.invalidated.length === 1 ? '' : 's'} removed`;
+      setStatus(response.regenerationStarted ? `Saved · ${count}; the agent is rebuilding them` : `Saved · ${count} for regeneration`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!sessionId) return <div className="settings-loading">Create or select a project to see its metadata</div>;
+  if (loading) return <div className="settings-loading">Loading project…</div>;
+  if (!project || !form) return <div className="settings-loading is-error">{status || 'Project unavailable'}</div>;
+
+  const manifest = project.manifest;
+  const styleMismatch = describeStyleMismatch(project.style, manifest?.style);
+  const readiness = describeArtifacts(project.artifacts);
+  const renderedCount = readiness.filter((checkpoint) => checkpoint.state === 'ready').length;
+  const dirty = Boolean(diffProjectFields(project.sessionId, toProjectFields(project), form));
+
+  return (
+    <section className="settings-view project-view">
+      <header>
+        <div><span>Project metadata</span><h1>{project.projectName || 'Untitled project'}</h1></div>
+        <div className="settings-save-group">
+          {dirty && <span className="project-dirty">Unsaved changes</span>}
+          {status && <span className={status.startsWith('Saved') ? 'is-saved' : ''}>{status}</span>}
+          <button className="settings-save" onClick={() => void save()} disabled={saving || !dirty}>
+            <Save size={15} />{saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </header>
+      {styleMismatch && <p className="project-notice" role="status">{styleMismatch}</p>}
+      <div className="settings-sections">
+        <section className="config-section">
+          <header><h2>Editable</h2><p>The style is interpolated into the character portrait prompt and inherited by every later frame.</p></header>
+          <div className="config-fields">
+            <label>
+              <span>Project name</span>
+              <input value={form.projectName} onChange={(event) => setForm({...form, projectName: event.target.value})} placeholder="Untitled video" maxLength={64} disabled={saving} />
+            </label>
+            <label>
+              <span>Style</span>
+              <input value={form.style} onChange={(event) => setForm({...form, style: event.target.value})} placeholder="photorealistic cinematic live action" disabled={saving} />
+            </label>
+            <label className="config-field-wide">
+              <span>Idea</span>
+              <input value={form.idea} onChange={(event) => setForm({...form, idea: event.target.value})} placeholder="What the video should be about" disabled={saving} />
+            </label>
+            <label className="config-field-wide">
+              <span>User requirement <i>Optional</i></span>
+              <input value={form.userRequirement} onChange={(event) => setForm({...form, userRequirement: event.target.value})} placeholder="Constraints the agent must follow" disabled={saving} />
+            </label>
+          </div>
+        </section>
+        <section className="config-section">
+          <header><h2>Session</h2><p>Identity and progress of the agent session behind this project.</p></header>
+          <div className="structured-fields">
+            <ReadOnlyField label="Session id" value={project.sessionId} />
+            <ReadOnlyField label="Working dir" value={project.workingDir} />
+            <ReadOnlyField label="Stage" value={stageLabel(project.stage)} />
+            <ReadOnlyField label="Summary" value={project.summary} long />
+          </div>
+        </section>
+        <section className="config-section">
+          <header><h2>Render</h2><p>Models and style pinned by the last render, plus what is still valid.</p></header>
+          <div className="project-render">
+            <div className="structured-fields">
+              <ReadOnlyField label="Pinned image model" value={manifest?.image_model || 'Not pinned yet'} />
+              <ReadOnlyField label="Pinned video model" value={manifest?.video_model || 'Not pinned yet'} />
+              <ReadOnlyField label="Style in render manifest" value={manifest?.style || 'No render yet'} long />
+            </div>
+            <div className="project-readiness">
+              <span className="project-readiness-title">
+                On disk now
+                <i>{renderedCount}/{readiness.length} rendered</i>
+              </span>
+              <div className="render-checkpoints">
+                {readiness.map((checkpoint) => (
+                  <div className="render-checkpoint" key={checkpoint.label}>
+                    <i className={`status-light is-${checkpoint.state === 'ready' ? 'ready' : checkpoint.state === 'partial' ? 'partial' : 'missing'}`} />
+                    <span>{checkpoint.label}</span>
+                    <small>{checkpoint.detail}</small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+      <StyleInvalidationDialog
+        open={Boolean(confirmation)}
+        prompt={confirmation?.prompt}
+        saving={saving}
+        onCancel={() => {
+          if (saving) return;
+          setConfirmation(undefined);
+          setStatus('Saved · existing artifacts kept');
+        }}
+        onConfirm={() => void confirmInvalidation()}
+      />
+    </section>
+  );
+}
+
+function ReadOnlyField({label, value, long = false}: {label: string; value: string; long?: boolean}) {
+  return (
+    <div className={`structured-field ${long ? 'is-long' : ''}`}>
+      <span>{label}</span>
+      <p>{value || '—'}</p>
+    </div>
+  );
+}
+
+function StyleInvalidationDialog({open, prompt, saving, onCancel, onConfirm}: {
+  open: boolean;
+  prompt?: InvalidationConfirmation;
+  saving: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saving) onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onCancel, open, saving]);
+
+  if (!open || !prompt) return null;
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
+      <section className="project-dialog invalidation-dialog" role="dialog" aria-modal="true" aria-labelledby="invalidation-title">
+        <span className="dialog-icon"><RefreshCw size={18} /></span>
+        <div className="dialog-copy">
+          <h2 id="invalidation-title">{prompt.heading}</h2>
+          <p>{prompt.paths.length === 1 ? '1 artifact path is deleted and rebuilt on the next render:' : `${prompt.paths.length} artifact paths are deleted and rebuilt on the next render:`}</p>
+          <ul className="invalidation-paths">
+            {prompt.paths.map((artifactPath) => <li key={artifactPath}><code>{artifactPath}</code></li>)}
+          </ul>
+          <p>{prompt.detail}</p>
+        </div>
+        <div className="dialog-actions">
+          <button onClick={onCancel} disabled={saving} autoFocus>Keep artifacts</button>
+          <button className="danger" onClick={onConfirm} disabled={saving}>{saving ? 'Regenerating…' : 'Regenerate'}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function DeleteProjectDialog({session, deleting, onCancel, onConfirm}: {
   session?: SessionSummary;
   deleting: boolean;
@@ -807,12 +1076,16 @@ function DeleteProjectDialog({session, deleting, onCancel, onConfirm}: {
   );
 }
 
-function NewProjectDialog({open, name, error, creating, onNameChange, onCancel, onConfirm}: {
+function NewProjectDialog({open, name, style, requirement, error, creating, onNameChange, onStyleChange, onRequirementChange, onCancel, onConfirm}: {
   open: boolean;
   name: string;
+  style: string;
+  requirement: string;
   error: string;
   creating: boolean;
   onNameChange: (value: string) => void;
+  onStyleChange: (value: string) => void;
+  onRequirementChange: (value: string) => void;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -835,7 +1108,7 @@ function NewProjectDialog({open, name, error, creating, onNameChange, onCancel, 
         <span className="dialog-icon is-create"><FolderPlus size={18} /></span>
         <div className="dialog-copy">
           <h2 id="new-project-title">Create a new project</h2>
-          <p>Name the workspace before creating it.</p>
+          <p>Name the workspace and choose the style its renders must follow.</p>
         </div>
         <label className="project-name-field">
           <span>Project name</span>
@@ -848,6 +1121,25 @@ function NewProjectDialog({open, name, error, creating, onNameChange, onCancel, 
             disabled={creating}
           />
           {error && <small role="alert">{error}</small>}
+        </label>
+        <label className="project-name-field">
+          <span>Style</span>
+          <input
+            value={style}
+            onChange={(event) => onStyleChange(event.target.value)}
+            placeholder="photorealistic cinematic live action"
+            disabled={creating}
+          />
+          <small className="field-hint">Applied to the character portraits and inherited by every frame. Leave blank to let the agent ask you for one.</small>
+        </label>
+        <label className="project-name-field">
+          <span>User requirement <i className="field-tag">Optional</i></span>
+          <input
+            value={requirement}
+            onChange={(event) => onRequirementChange(event.target.value)}
+            placeholder="e.g. for children, at most three scenes"
+            disabled={creating}
+          />
         </label>
         <div className="dialog-actions">
           <button type="button" onClick={onCancel} disabled={creating}>Cancel</button>
