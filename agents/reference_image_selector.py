@@ -10,6 +10,10 @@ from utils.image import image_path_to_b64
 
 from utils.retry import after_func
 
+# What the selector prompt was written for; used when the image model's own
+# reference limit is not known.
+DEFAULT_MAX_REFERENCE_IMAGES = 8
+
 system_prompt_template_select_reference_images_only_text = \
 """
 [Role]
@@ -41,7 +45,7 @@ Image 4: [Camera 2] Shot from Bob's over-the-shoulder perspective. Bob is on the
 
 
 [Output]
-You need to select up to 8 of the most relevant reference images based on the user's description and put the corresponding indices in the ref_image_indices field of the output. At the same time, you should generate a text prompt that describes the image to be created, specifying which elements in the generated image should reference which image description (and which elements within it).
+You need to select up to {max_reference_images} of the most relevant reference images based on the user's description and put the corresponding indices in the ref_image_indices field of the output. At the same time, you should generate a text prompt for the image to be created, specifying which elements in it should reference which image description (and which elements within it). The description the user gave is the instruction, not a summary of it: reproduce it in the prompt as it stands. Every constraint in it — who is in the frame, what they hold, what they are doing, their expression and the framing — must survive word for word. Add the reference bindings to it; never reword, shorten or add to what was written.
 
 {format_instructions}
 
@@ -54,7 +58,7 @@ You need to select up to 8 of the most relevant reference images based on the us
 - Choose reference image descriptions that are as concise as possible and avoid including duplicate information. For example, if Image 3 depicts the facial features of Bob from the front, and Image 1 also depicts Bob's facial features from the front-view portrait, then Image 1 is redundant and should not be selected.
 - When a new character appears in the frame description, prioritize selecting their portrait image description (if available) to ensure accurate depiction of their appearance. Pay attention to whether the character is facing the camera from the front, side, or back. Choose the most suitable view as the reference image for the character.
 - For character portraits, you can only select at most one image from multiple views (front, side, back). Choose the most appropriate one based on the frame description. For example, when depicting a character from the side, choose the side view of the character.
-- Select at most **8** optimal reference image descriptions.
+- Select at most **{max_reference_images}** optimal reference image descriptions.
 """
 
 
@@ -92,7 +96,7 @@ Image 4: [Camera 2] Shot from Bob's over-the-shoulder perspective. Bob is on the
 </SEQ_IMAGES>
 
 [Output]
-You need to select the most relevant reference images based on the user's description and put the corresponding indices in the `ref_image_indices` field of the output. At the same time, you should generate a text prompt that describes the image to be created, specifying which elements in the generated image should reference which image (and which elements within it).
+You need to select the most relevant reference images based on the user's description and put the corresponding indices in the `ref_image_indices` field of the output. At the same time, you should generate a text prompt for the image to be created, specifying which elements in it should reference which image (and which elements within it). The description the user gave is the instruction, not a summary of it: reproduce it in the prompt as it stands. Every constraint in it — who is in the frame, what they hold, what they are doing, their expression and the framing — must survive word for word. Add the reference bindings to it; never reword, shorten or add to what was written.
 
 {format_instructions}
 
@@ -104,7 +108,7 @@ You need to select the most relevant reference images based on the user's descri
 - The images from prior frames are arranged in chronological order. Give higher priority to more recent images (those closer to the end of the sequence).
 - Choose reference image descriptions that are as concise as possible and avoid including duplicate information. For example, if Image 3 depicts the facial features of Bob from the front, and Image 1 also depicts Bob's facial features from the front-view portrait, then Image 1 is redundant and should not be selected.
 - For character portraits, you can only select at most one image from multiple views (front, side, back). Choose the most appropriate one based on the frame description. For example, when depicting a character from the side, choose the side view of the character.
-- Select at most **8** optimal reference image descriptions.
+- Select at most **{max_reference_images}** optimal reference image descriptions.
 - The text guiding image editing should be as concise as possible.
 """
 
@@ -127,7 +131,10 @@ class RefImageIndicesAndTextPrompt(BaseModel):
         ]
     )
     text_prompt: str = Field(
-        description="Text description to guide the image generation. You need to describe the image to be generated, specifying which elements in the generated image should reference which image (and which elements within it). For example, 'Create an image following the given description: \nThe man is standing in the landscape. The man should reference Image 0. The landscape should reference Image 1.' Here, the index of the reference image should refer to its position in the ref_image_indices list, not the sequence number in the provided image list. Refer to the reference image must be in the format of Image N. Do not use any other word except Image.",
+        description="Text description to guide the image generation. You need to describe the image to be generated, specifying which elements in the generated image should reference which image (and which elements within it). For example, 'Create an image following the given description: \nThe man is standing in the landscape. The man should reference Image 0. The landscape should reference Image 1.' Here, the index of the reference image should refer to its position in the ref_image_indices list, not the sequence number in the provided image list. Refer to the reference image must be in the format of Image N. Do not use any other word except Image."
+        " The description you were given is the instruction, not a summary of it: reproduce it in the prompt as it stands."
+        " Every constraint in it — who is in the frame, what they hold, what they are doing, their expression and the framing —"
+        " must survive word for word. Add the reference bindings to it; never reword, shorten or add to what was written.",
         examples=[
             "Create an image based on the following guidance: \n Make modifications based on Image 1: Bob's body turns to face the camera, while all other elements remain unchanged. Bob's appearance should refer to Image 0.",
             "Create an image following the given description: \nThe man is standing in the landscape. The man should reference Image 0. The landscape should reference Image 1."
@@ -153,8 +160,20 @@ class ReferenceImageSelector:
         self,
         available_image_path_and_text_pairs: List[Tuple[str, str]],
         frame_description: str,
+        max_reference_images: int | None = None,
     ):
+        # Reference images the image model accepts. The selector was written for 8,
+        # and a model that takes fewer refuses the frame unless the selection is
+        # capped. The cap has to reach the model here rather than being trimmed
+        # afterwards, because the generated prompt addresses its references by
+        # their position in the returned list; the caller therefore passes the
+        # limit it reads from the image generator at call time.
+        limit = max_reference_images or DEFAULT_MAX_REFERENCE_IMAGES
         filtered_image_path_and_text_pairs = available_image_path_and_text_pairs
+        # Positions of the kept pairs within the caller's list, so the prompt's
+        # `Image N` mentions can be renumbered even after the text-only pre-filter
+        # has narrowed the list.
+        kept_available_indices = list(range(len(available_image_path_and_text_pairs)))
 
         # 1. filter images using text-only model
         if len(available_image_path_and_text_pairs) >= 8:
@@ -171,7 +190,7 @@ class ReferenceImageSelector:
             parser = PydanticOutputParser(pydantic_object=RefImageIndicesAndTextPrompt)
 
             messages = [
-                SystemMessage(content=system_prompt_template_select_reference_images_only_text.format(format_instructions=parser.get_format_instructions())),
+                SystemMessage(content=system_prompt_template_select_reference_images_only_text.format(format_instructions=parser.get_format_instructions(), max_reference_images=limit)),
                 HumanMessage(content=human_content)
             ]
 
@@ -180,6 +199,7 @@ class ReferenceImageSelector:
             try:
                 ref = await chain.ainvoke(messages)
                 filtered_image_path_and_text_pairs = select_pairs_by_indices(available_image_path_and_text_pairs, ref.ref_image_indices)
+                kept_available_indices = list(ref.ref_image_indices)
                 logging.info(f"Filtered image idx:{ref.ref_image_indices}")
                 
             except Exception as e:
@@ -205,7 +225,7 @@ class ReferenceImageSelector:
         parser = PydanticOutputParser(pydantic_object=RefImageIndicesAndTextPrompt)
 
         messages = [
-            SystemMessage(content=system_prompt_template_select_reference_images_multimodal.format(format_instructions=parser.get_format_instructions())),
+            SystemMessage(content=system_prompt_template_select_reference_images_multimodal.format(format_instructions=parser.get_format_instructions(), max_reference_images=limit)),
             HumanMessage(content=human_content)
         ]
 
@@ -213,10 +233,24 @@ class ReferenceImageSelector:
 
         try:
             response = await chain.ainvoke(messages)
-            reference_image_path_and_text_pairs = select_pairs_by_indices(filtered_image_path_and_text_pairs, response.ref_image_indices)
+            indices = response.ref_image_indices[:limit]
+            if len(indices) != len(response.ref_image_indices):
+                # Dropping the tail keeps every remaining reference at the index the
+                # prompt was written with, so only the truncated mentions are lost.
+                logging.warning(
+                    "Reference selector returned %d images for a model that accepts %d; using the first %d",
+                    len(response.ref_image_indices),
+                    limit,
+                    len(indices),
+                )
+            reference_image_path_and_text_pairs = select_pairs_by_indices(filtered_image_path_and_text_pairs, indices)
             return {
                 "reference_image_path_and_text_pairs": reference_image_path_and_text_pairs,
                 "text_prompt": response.text_prompt,
+                # `ref_image_indices` address the list the model was shown; these
+                # address the caller's list, which is what the prompt's mentions
+                # are rewritten against.
+                "selected_indices": [kept_available_indices[index] for index in indices],
             }
 
         except Exception as e:

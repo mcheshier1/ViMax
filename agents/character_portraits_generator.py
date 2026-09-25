@@ -36,7 +36,22 @@ class CharacterPortraitsGenerator:
         image_generator,
     ):
         self.image_generator = image_generator
+        # The prompt behind each portrait, keyed by (character, view). Portraits are
+        # generated on a plain white backdrop with no other prompt artifact, so without
+        # this there is nothing to inspect when one of them comes out wrong.
+        self.prompts: Dict[tuple, str] = {}
 
+    async def _generate(self, description: str, **kwargs) -> ImageOutput:
+        """Generate one portrait, naming the character and view on failure.
+
+        Provider-side rejections do not appear anywhere in the call arguments, so
+        without this the failing portrait is only implied by the last progress
+        event emitted by the calling pipeline.
+        """
+        try:
+            return await self.image_generator.generate_single_image(**kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"Image generation failed for {description}: {exc}") from exc
 
     async def generate_front_portrait(
         self,
@@ -49,11 +64,12 @@ class CharacterPortraitsGenerator:
             features=features,
             style=style,
         )
-        image_output = await self.image_generator.generate_single_image(
+        self.prompts[(character.identifier_in_scene, "front")] = prompt
+        return await self._generate(
+            f"the front portrait of {character.identifier_in_scene}",
             prompt=prompt,
             # size="512x512",
         )
-        return image_output
 
     async def generate_side_portrait(
         self,
@@ -63,12 +79,13 @@ class CharacterPortraitsGenerator:
         prompt = prompt_template_side.format(
             identifier=character.identifier_in_scene,
         )
-        image_output = await self.image_generator.generate_single_image(
+        self.prompts[(character.identifier_in_scene, "side")] = prompt
+        return await self._generate(
+            f"the side portrait of {character.identifier_in_scene}",
             prompt=prompt,
             reference_image_paths=[front_image_path],
             # size="1024x1024",
         )
-        return image_output
 
 
     async def generate_back_portrait(
@@ -79,9 +96,10 @@ class CharacterPortraitsGenerator:
         prompt = prompt_template_back.format(
             identifier=character.identifier_in_scene,
         )
-        image_output = await self.image_generator.generate_single_image(
+        self.prompts[(character.identifier_in_scene, "back")] = prompt
+        return await self._generate(
+            f"the back portrait of {character.identifier_in_scene}",
             prompt=prompt,
             reference_image_paths=[front_image_path],
             # size="512x512",
         )
-        return image_output

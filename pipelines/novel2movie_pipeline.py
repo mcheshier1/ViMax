@@ -464,6 +464,7 @@ class Novel2MoviePipeline:
                     character_portraits_registry=character_portraits_registry,
                     quiet=quiet,
                     progress=progress,
+                    stop_after="video",
                 )
                 scene_video_dirs.append(scene_video_dir)
                 _emit_text_plan_progress(progress, "novel_scene_render_done", "Rendered novel scene video", {"event_idx": event.index, "scene_idx": scene.idx, "path": scene_video_dir})
@@ -976,21 +977,24 @@ class Novel2MoviePipeline:
                 style = "realistic movie style"
                 character_registry = {}
                 for character in scene.characters:
-                    character_registry[character.identifier_in_scene] = [
-                        {
+                    character_registry[character.identifier_in_scene] = {
+                        "front": {
                             "path": os.path.join(
                                 working_dir_character_portrait,
                                 f"event_{event.index}",
                                 f"scene_{scene.idx}",
-                                f"character_{character.idx}_{character.identifier_in_scene}.png",
+                                f"character_{character.idx}_{safe_path_component(character.identifier_in_scene)}.png",
                             ),
-                            "description": f"A portrait of {character.identifier_in_scene}",
+                            "description": f"A front view portrait of {character.identifier_in_scene}.",
                         }
-                    ]
+                    }
                 await self.script2video_pipeline(
                     script=script,
+                    user_requirement="",
                     style=style,
-                    character_registry=character_registry
+                    characters=scene.characters,
+                    character_portraits_registry=character_registry,
+                    stop_after="video",
                 )
                 print(f"✅ Generated video for event {event.index}, scene {scene.idx}, saved to {scene_video_dir}")
         print("📋 Step 7: Generate the video for each scene".center(80, "-"))

@@ -14,6 +14,8 @@ DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_IMAGE_BASE_URL = "https://yunwu.ai"
 DEFAULT_VIDEO_MODEL = "veo3.1-fast"
 DEFAULT_VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
+# Eight seconds is the shortest length that carries a spoken line without rushing it.
+DEFAULT_VIDEO_CLIP_SECONDS = 8
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_MODEL_PROVIDER = "openai"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -105,6 +107,27 @@ def reranker_api_key(workspace_root: str | Path = ".") -> str:
 
 def video_model(workspace_root: str | Path = ".") -> str:
     return config_value("video", "model", ["VIMAX_VIDEO_MODEL"], DEFAULT_VIDEO_MODEL, workspace_root)
+
+
+def video_clip_seconds(workspace_root: str | Path = ".") -> int:
+    """Seconds each clip renders as, which is what the dialogue has to fit in.
+
+    The configured value wins over the environment here, unlike the model settings: a clip
+    length belongs to the film being made, while a duration exported into a shell or a
+    supervisor's environment cannot be seen from the project at all. One left set to 5 by a
+    process that started this workspace cut every clip of a sequence whose dialogue needed
+    eight seconds, and nothing on any screen said why.
+    """
+    section_payload = load_agent_config(workspace_root).get("video", {})
+    raw: Any = section_payload.get("clip_seconds") if isinstance(section_payload, dict) else None
+    if raw in (None, ""):
+        raw = os.environ.get("VIMAX_OPENROUTER_VIDEO_DURATION", "")
+    if raw in (None, ""):
+        return DEFAULT_VIDEO_CLIP_SECONDS
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        return DEFAULT_VIDEO_CLIP_SECONDS
 
 
 def video_base_url(workspace_root: str | Path = ".") -> str:

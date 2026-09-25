@@ -4,7 +4,7 @@ import logging
 from agents import Screenwriter, CharacterExtractor, CharacterPortraitsGenerator
 from pipelines.script2video_pipeline import Script2VideoPipeline
 from interfaces import CharacterInScene
-from typing import List, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 import asyncio
 import json
 import yaml
@@ -14,13 +14,15 @@ from utils.provider_presets import resolve_chat_model_config
 from utils.text import safe_path_component
 from utils.video import concatenate_video_files
 
+from .render_contract import DEFAULT_RENDER_PHASE, ModelScopedArtifacts, RenderOutcome, normalize_phase
+
 
 def _pipeline_print(quiet: bool, message: str) -> None:
     if not quiet:
         print(message)
 
 
-class Idea2VideoPipeline:
+class Idea2VideoPipeline(ModelScopedArtifacts):
     def __init__(
         self,
         chat_model: str,
@@ -84,8 +86,7 @@ class Idea2VideoPipeline:
         character_portraits_registry: Optional[Dict[str, Dict[str, Dict[str, str]]]],
         style: str,
     ):
-        character_portraits_registry_path = os.path.join(
-            self.working_dir, "character_portraits_registry.json")
+        character_portraits_registry_path = self.portraits_registry_path()
         if character_portraits_registry is None:
             if os.path.exists(character_portraits_registry_path):
                 with open(character_portraits_registry_path, 'r', encoding='utf-8') as f:
@@ -163,7 +164,7 @@ class Idea2VideoPipeline:
         style: str,
     ):
         character_dir = os.path.join(
-            self.working_dir, "character_portraits", f"{character.idx}_{safe_path_component(character.identifier_in_scene)}")
+            self.portraits_dir(), f"{character.idx}_{safe_path_component(character.identifier_in_scene)}")
         os.makedirs(character_dir, exist_ok=True)
 
         front_portrait_path = os.path.join(character_dir, "front.png")
@@ -203,6 +204,13 @@ class Idea2VideoPipeline:
         print(
             f"☑️ Completed character portrait generation for {character.identifier_in_scene}.")
 
+        recorded_prompts = {
+            view: self.character_portraits_generator.prompts.get((character.identifier_in_scene, view), "")
+            for view in ("front", "side", "back")
+        }
+        with open(os.path.join(character_dir, "prompts.json"), "w", encoding="utf-8") as f:
+            json.dump({view: prompt for view, prompt in recorded_prompts.items() if prompt}, f, ensure_ascii=False, indent=4)
+
         return {
             character.identifier_in_scene: {
                 "front": {
@@ -226,7 +234,12 @@ class Idea2VideoPipeline:
         user_requirement: str,
         style: str,
         quiet: bool = False,
-    ):
+        stop_after: str = DEFAULT_RENDER_PHASE,
+        revision_notes: Dict[str, str] | None = None,
+        progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+    ) -> RenderOutcome:
+        stop_after = normalize_phase(stop_after)
+        self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
 
         story = await self.develop_story(idea=idea, user_requirement=user_requirement, quiet=quiet)
 
@@ -238,9 +251,17 @@ class Idea2VideoPipeline:
             style=style,
         )
 
+        # Style review happens on the portraits, before the rest of the sequence is
+        # rendered from them.
+        if stop_after == "portraits":
+            stills = self.portrait_stills(character_portraits_registry)
+            _pipeline_print(quiet, f"🖼️ Character portraits ready for style review ({len(stills)} images).")
+            return self.render_outcome("portraits", style, stills=stills, awaiting="stills")
+
         scene_scripts = await self.write_script_based_on_story(story=story, user_requirement=user_requirement, quiet=quiet)
 
         all_video_paths = []
+        stills: List[str] = []
 
         for idx, scene_script in enumerate(scene_scripts):
             scene_working_dir = os.path.join(self.working_dir, f"scene_{idx}")
@@ -251,15 +272,31 @@ class Idea2VideoPipeline:
                 video_generator=self.video_generator,
                 working_dir=scene_working_dir,
             )
-            final_video_path = await script2video_pipeline(
+            outcome = await script2video_pipeline(
                 script=scene_script,
                 user_requirement=user_requirement,
                 style=style,
                 characters=characters,
                 character_portraits_registry=character_portraits_registry,
                 quiet=quiet,
+                stop_after=stop_after,
+                progress=progress,
+                # Redo notes are keyed scene-qualified where the review is; each scene's
+                # pipeline looks its own shots up by number.
+                revision_notes={
+                    slot.split("/", 1)[1]: note
+                    for slot, note in (self.revision_notes or {}).items()
+                    if slot.startswith(f"scene_{idx}/")
+                },
             )
-            all_video_paths.append(final_video_path)
+            stills.extend(outcome.stills)
+            if stop_after == "stills":
+                continue
+            all_video_paths.append(outcome.final_video_path)
+
+        if stop_after == "stills":
+            _pipeline_print(quiet, f"🖼️ Keyframes ready for review across {len(scene_scripts)} scene(s) ({len(stills)} images).")
+            return self.render_outcome("stills", style, stills=stills, awaiting="video")
 
         final_video_path = os.path.join(self.working_dir, "final_video.mp4")
         if os.path.exists(final_video_path):
@@ -268,4 +305,4 @@ class Idea2VideoPipeline:
             _pipeline_print(quiet, f"🎬 Starting concatenating videos...")
             concatenate_video_files(all_video_paths, final_video_path)
             _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
-        return final_video_path
+        return self.render_outcome("video", style, final_video_path=final_video_path)
