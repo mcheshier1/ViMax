@@ -149,7 +149,7 @@ class ContextCompactor:
     def _fallback_summary(self, compactible: list[dict[str, Any]], preserved: list[dict[str, Any]], previous_summary: str, reason: str) -> str:
         user_lines = [self._message_preview(message, limit=180) for message in compactible if message.get("role") == "user"]
         assistant_lines = [self._message_preview(message, limit=180) for message in compactible if message.get("role") == "assistant"]
-        file_hits = _dedupe(re.findall(r"(?:[\w.\-]+/)+[\w.\-]+\.(?:py|ts|tsx|js|json|md|yaml|yml|txt|mp4|png)", "\n".join(str(message.get("content", "")) for message in compactible)))
+        file_hits = _dedupe(_file_path_hits(compactible))
         error_lines = [self._message_preview(message, limit=180) for message in compactible if _looks_like_error(str(message.get("content", "")))]
         remaining = [self._message_preview(message, limit=180) for message in preserved[-4:]]
         return "\n".join([
@@ -240,6 +240,29 @@ def _dedupe(items: list[str]) -> list[str]:
 def _looks_like_error(text: str) -> bool:
     lowered = text.lower()
     return any(token in lowered for token in ("error", "failed", "failure", "timeout", "not found", "blocked", "permission"))
+
+
+FILE_PATH_PATTERN = re.compile(r"(?:[\w.\-]+/)+[\w.\-]+\.(?:py|ts|tsx|js|json|md|yaml|yml|txt|mp4|png)")
+_PATH_TOKEN_SPLIT = re.compile(r"""[\s"'(),;{}<>\[\]]+""")
+_PATH_TOKEN_LEADING = "'\"([{<"
+_PATH_TOKEN_TRAILING = ".,;:)]}'\"`>"
+
+
+def _file_path_hits(messages: list[dict[str, Any]]) -> list[str]:
+    """Collect file paths mentioned in message content.
+
+    Splitting into tokens before matching keeps the scan linear. Matching the raw
+    content with a repeated-group pattern is quadratic on long word runs — every
+    offset restarts a failing match — which stalls the fallback summary for
+    minutes exactly when history is large and the LLM summary is unavailable.
+    """
+    hits: list[str] = []
+    for message in messages:
+        for token in _PATH_TOKEN_SPLIT.split(str(message.get("content", ""))):
+            candidate = token.lstrip(_PATH_TOKEN_LEADING).rstrip(_PATH_TOKEN_TRAILING)
+            if candidate and FILE_PATH_PATTERN.fullmatch(candidate):
+                hits.append(candidate)
+    return hits
 
 
 def _decision_lines(messages: list[dict[str, Any]]) -> list[str]:

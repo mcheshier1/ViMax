@@ -37,6 +37,24 @@ class CapturingLLM:
         return self.replies.pop(0)
 
 
+class CompactionAwareLLM(CapturingLLM):
+    """CapturingLLM that answers the compactor's summarization prompts itself.
+
+    Only sampling calls are captured in ``calls``, so tests can assert on the
+    requests the loop actually sends to the model.
+    """
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.summary_calls = 0
+
+    async def complete(self, messages, tools):
+        if any("compressing conversation history" in str(message.get("content", "")) for message in messages):
+            self.summary_calls += 1
+            return AssistantMessage(text="## Reference Context Only\nhandoff summary")
+        return await super().complete(messages, tools)
+
+
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_tool_call_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,27 +223,65 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(event["type"] == "tool_result" and event["tool_result"]["content"] == big for event in events))
 
 
-    async def test_compaction_refires_mid_tool_loop(self):
+    async def test_history_is_compacted_at_most_once_per_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
 
             def hello(args):
-                return ToolResult("hello", True, "hello result")
+                return ToolResult("hello", True, "Z" * 40000)
 
             registry = ToolRegistry([ToolSpec("hello", "Say hello", hello, schema={})])
-            # Low threshold so the accumulated history blows past it inside the loop.
-            compactor = ContextCompactor(None, token_threshold=1200, buffer_tokens=0, preserve_last_n=2, summary_max_chars=2000)
-            replies = [AssistantMessage(tool_calls=[ToolCall(name="hello", arguments={})]) for _ in range(3)]
+            replies = [AssistantMessage(tool_calls=[ToolCall(name="hello", arguments={})]) for _ in range(6)]
             replies.append(AssistantMessage(text="final"))
-            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), FakeLLM(replies), compactor)
+            llm = CompactionAwareLLM(replies)
+            compactor = ContextCompactor(llm, token_threshold=8000, buffer_tokens=0, preserve_last_n=0, summary_max_chars=2000)
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm, compactor)
             loop.history = [
-                {"role": "user", "content": "old " + "a" * 2000},
-                {"role": "assistant", "content": "old ans " + "b" * 2000},
-                {"role": "user", "content": "mid " + "c" * 2000},
-                {"role": "assistant", "content": "mid ans " + "d" * 2000},
+                {"role": "user", "content": "old " + "a" * 40000},
+                {"role": "assistant", "content": "old ans " + "b" * 40000},
+                {"role": "user", "content": "mid " + "c" * 40000},
+                {"role": "assistant", "content": "mid ans " + "d" * 40000},
             ]
             events = [event async for event in loop.stream_events("generate")]
-            compact_phases = [event.get("phase") for event in events if event["type"] == "status" and event.get("phase") == "compact"]
-            self.assertGreaterEqual(len(compact_phases), 2)  # fired more than just the turn-start check
+
+            # History is frozen for the duration of a turn, so re-summarizing it on
+            # later samples would cost an LLM call per round without shrinking the
+            # request. Exactly one compaction is meaningful.
+            self.assertEqual([event["phase"] for event in events if event["type"] == "status" and event.get("phase") == "compact"], ["compact"])
+            self.assertEqual(llm.summary_calls, 1)
             self.assertEqual(loop.history[0]["role"], "system")  # compaction replaced history head
             self.assertEqual(loop.history[-1]["content"], "final")
+            target = compactor.compact_target_tokens()
+            self.assertTrue(all(compactor.estimate_messages_tokens(call) < target for call in llm.calls))
+
+
+    async def test_in_turn_tool_pressure_trims_oldest_rounds_without_recompacting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            rounds = 6
+            counter = {"round": 0}
+
+            def hello(args):
+                counter["round"] += 1
+                return ToolResult("hello", True, f"round-{counter['round']} " + "Z" * 40000)
+
+            registry = ToolRegistry([ToolSpec("hello", "Say hello", hello, schema={})])
+            replies = [AssistantMessage(tool_calls=[ToolCall(name="hello", arguments={})]) for _ in range(rounds)]
+            replies.append(AssistantMessage(text="final"))
+            llm = CompactionAwareLLM(replies)
+            compactor = ContextCompactor(llm, token_threshold=12000, buffer_tokens=0, preserve_last_n=2)
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm, compactor)
+            # History stays small: all the pressure comes from the in-turn transcript.
+            loop.history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+            events = [event async for event in loop.stream_events("generate")]
+
+            trim_phases = [event["phase"] for event in events if event["type"] == "status" and event.get("phase") == "trim"]
+            self.assertGreaterEqual(len(trim_phases), 1)
+            self.assertEqual(llm.summary_calls, 0)  # history was never the source of pressure
+            target = compactor.compact_target_tokens()
+            self.assertTrue(all(compactor.estimate_messages_tokens(call) < target for call in llm.calls))
+            final_transcript = json.dumps(llm.calls[-1])
+            self.assertIn(f"round-{rounds} ", final_transcript)  # newest round kept
+            self.assertNotIn("round-1 ", final_transcript)  # oldest round dropped
+            # the authoritative record still holds every tool result
+            self.assertEqual(len([event for event in events if event["type"] == "tool_result"]), rounds)

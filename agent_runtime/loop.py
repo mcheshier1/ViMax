@@ -38,6 +38,27 @@ def _clip_tool_content(text: str, limit: int) -> str:
     return text[: max(0, limit - 60)].rstrip() + f"\n... [truncated for LLM context; full result stored separately]"
 
 
+def _in_turn_round_starts(in_turn: list[dict[str, Any]]) -> list[int]:
+    """Indices of the assistant messages that open each in-turn tool round."""
+    return [index for index, message in enumerate(in_turn) if message.get("role") == "assistant" and message.get("tool_calls")]
+
+
+def _drop_oldest_tool_round(in_turn: list[dict[str, Any]]) -> bool:
+    """Drop the oldest complete tool round from the live in-turn transcript.
+
+    A round is the assistant message that requested tools plus every tool result
+    (and tool-provided image block) answering it, so removing a whole round never
+    leaves a tool result without its assistant tool call. The newest round is
+    always kept: it is the context the next sample is about to act on. Full
+    results stay available in the session record and the event stream.
+    """
+    starts = _in_turn_round_starts(in_turn)
+    if len(starts) < 2:
+        return False
+    del in_turn[: starts[-1]]
+    return True
+
+
 class AgentLoop:
     def __init__(self, session_index: SessionIndex, prompt_builder: PromptBuilder, tool_registry: ToolRegistry, tool_executor: ToolExecutor, llm: Any, context_compactor: ContextCompactor | None = None) -> None:
         self.session_index = session_index
@@ -67,21 +88,35 @@ class AgentLoop:
         tool_schemas = self.tool_registry.list_function_tools()
         parts = self.prompt_builder.build_parts(user_input)
         system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
-        if self.context_compactor.should_preflight_compact(
-            [*self.history, {"role": "user", "content": user_input}],
-            system_tokens=_prompt_tokens(parts),
-            tools_tokens=_tool_schema_tokens(tool_schemas),
-        ):
-            yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
-            await self.compact_history(reason="token-pressure")
-            parts = self.prompt_builder.build_parts(user_input)
-            system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
-        yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": self.prompt_builder.trace(parts)}
         # Messages accumulated *inside this turn* (assistant tool-calls + tool
         # results + any tool-provided image blocks). Kept separate from
         # self.history so history can be compacted mid-turn without losing the
         # live in-turn messages. Rebuilt into the request on every sample.
         in_turn: list[dict[str, Any]] = []
+        history_compacted = False
+
+        def over_budget(extra: list[dict[str, Any]] | None = None) -> bool:
+            """True when the next request would exceed the compaction target.
+
+            ``extra`` is appended after the user input, i.e. the live in-turn
+            messages when guarding a mid-loop sample.
+            """
+            messages = [*self.history, {"role": "user", "content": user_input}]
+            if extra:
+                messages.extend(extra)
+            return self.context_compactor.should_preflight_compact(
+                messages,
+                system_tokens=_prompt_tokens(parts),
+                tools_tokens=_tool_schema_tokens(tool_schemas),
+            )
+
+        if over_budget():
+            yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
+            await self.compact_history(reason="token-pressure")
+            history_compacted = True
+            parts = self.prompt_builder.build_parts(user_input)
+            system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+        yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": self.prompt_builder.trace(parts)}
         assistant_turns: list[dict[str, Any]] = []
         tool_rounds: list[dict[str, Any]] = []
         transitions: list[dict[str, str]] = []
@@ -92,18 +127,20 @@ class AgentLoop:
         _max_result_chars = _max_tool_result_chars()
 
         while True:
-            # Re-check compaction before every sample — not just at turn start.
-            # History can grow past the model window while tools run, so guard the
-            # request again here.
-            if self.context_compactor.should_preflight_compact(
-                [*self.history, {"role": "user", "content": user_input}, *in_turn],
-                system_tokens=_prompt_tokens(parts),
-                tools_tokens=_tool_schema_tokens(tool_schemas),
-            ):
-                yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
-                await self.compact_history(reason="token-pressure")
-                parts = self.prompt_builder.build_parts(user_input)
-                system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+            # Guard the request again here: tool output can push the live turn past
+            # the model window while the loop runs. History is frozen for the
+            # duration of a turn, so re-summarizing it on every sample cannot
+            # shrink the request; once history is compacted, the residual pressure
+            # is the in-turn tool transcript, which is trimmed round by round.
+            if over_budget(in_turn):
+                if not history_compacted and over_budget():
+                    yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
+                    await self.compact_history(reason="token-pressure")
+                    history_compacted = True
+                    parts = self.prompt_builder.build_parts(user_input)
+                    system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+                while over_budget(in_turn) and _drop_oldest_tool_round(in_turn):
+                    yield {"type": "status", "turn_id": control.turn_id, "phase": "trim", "message": "Dropped the oldest in-turn tool round to stay inside the model context window"}
             runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}, *in_turn]
             yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
             try:

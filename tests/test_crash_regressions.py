@@ -1,5 +1,6 @@
 """Regression tests for small crash bugs in helper stringification paths."""
 
+import time
 import unittest
 
 from agent_runtime.context_compactor import ContextCompactor
@@ -16,6 +17,22 @@ class TestContextCompactorToolCallPreview(unittest.TestCase):
         summary = compactor._fallback_summary(messages, [], "", "test")
         self.assertIn("[tool calls]", summary)
         self.assertIn("list_files", summary)
+
+    def test_fallback_summary_extracts_paths_from_mixed_content_quickly(self):
+        compactor = ContextCompactor(None, token_threshold=200, buffer_tokens=0, preserve_last_n=2, summary_max_chars=2000)
+        messages = [
+            {"role": "user", "content": "z" * 40000},
+            {"role": "assistant", "content": '{"artifact": ".working_dir/idea2video/script.json"}'},
+            {"role": "user", "content": "re-render [frames](shots/3/frame.png) next."},
+        ]
+        started = time.perf_counter()
+        summary = compactor._fallback_summary(messages, [], "", "test")
+        elapsed = time.perf_counter() - started
+        self.assertIn(".working_dir/idea2video/script.json", summary)
+        self.assertIn("shots/3/frame.png", summary)
+        # Scanning runs of word characters must not restart a failing match at
+        # every offset; the quadratic version needed ~30s for this input.
+        self.assertLess(elapsed, 5.0)
 
 
 class TestShotBriefDescriptionStr(unittest.TestCase):
