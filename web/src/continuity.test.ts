@@ -125,6 +125,16 @@ describe('script coverage review', () => {
     expect(suggestionAnchor(1, [first, second], [])).toBe('4');
   });
 
+  it('chains a repeated anchor past intervening suggestions for another gap', () => {
+    const suggestions = [
+      {...suggestion, id: 's1', after_shot: 4},
+      {...suggestion, id: 's2', after_shot: 8},
+      {...suggestion, id: 's3', after_shot: 4},
+    ];
+
+    expect(suggestionAnchor(2, suggestions, ['21', '22'])).toBe('21');
+  });
+
   it('only offers to add a suggestion that has a description and a place to go', () => {
     expect(suggestionAddable(suggestion, ['0', '4'])).toBe(true);
     expect(suggestionAddable({...suggestion, visual_desc: '  '}, ['0', '4'])).toBe(false);

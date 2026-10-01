@@ -11,6 +11,8 @@ from PIL import Image
 from agent_runtime.models import ToolCall, TurnControl
 from agent_runtime.session_index import SessionIndex
 from agent_runtime.tool_executor import ToolExecutor
+from agent_runtime.vimax_adapters import build_vimax_adapter_specs
+from agent_runtime.tools import ToolRegistry
 from agent_runtime.tools import build_builtin_registry
 
 
@@ -36,6 +38,22 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             unknown = await executor.execute(ToolCall(name="does_not_exist", arguments={}), TurnControl())
             self.assertFalse(unknown.result.ok)
 
+
+    async def test_render_tool_accepts_timeline_redraw_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            index.create()
+            registry = ToolRegistry(build_vimax_adapter_specs(tmp, index))
+            arguments, error = registry.validate_arguments("vimax_render_video", {
+                "render_mode": "script2video",
+                "redo_shots": ["2"],
+                "stop_after": "video",
+                "allow_unreviewed_redo": True,
+            })
+
+        self.assertIsNone(error)
+        self.assertEqual(arguments["redo_shots"], ["2"])
+        self.assertTrue(arguments["allow_unreviewed_redo"])
 
     async def test_run_shell_is_enabled_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:

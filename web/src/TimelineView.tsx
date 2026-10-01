@@ -1,712 +1,426 @@
-import {useCallback, useEffect, useMemo, useState} from 'react';
-import {AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileJson, Film, Image as ImageIcon, Lock, Play, Plus, RefreshCw, ThumbsDown, Trash2, Undo2, Unlock, Video, ZoomIn} from 'lucide-react';
-import {createShot, getArtifacts, getJsonArtifact, getTextArtifact, moveShot, readAcceptance, readContinuity, readHealth, readRemovedShots, readShotPlans, removeShot, restoreShot, updateAcceptance} from './api';
-import {visualPromptSource} from './artifactPresentation';
-import {MediaPreviewDialog} from './ArtifactViews';
-import {ShotPlanPanel} from './ShotPlanPanel';
+import {useEffect, useMemo, useRef, useState} from 'react';
+import {AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileJson, Film, Image as ImageIcon, Lock, Plus, RefreshCw, Trash2, Undo2, Unlock, ZoomIn} from 'lucide-react';
+import {activeRedraw, askedRenderFinished, failedRedraw, filmPosition, moveTarget, planInconsistencies, redoRequestText, renderActivity, renderStatusLine, slotName, slotsInFilmOrder, STATE_LABELS} from './timeline';
+import {ShotPlanPanel, filmDraftToken, hasFilmDrafts, hasSessionFilmDrafts} from './ShotPlanPanel';
+import type {ShotPlanHandle} from './ShotPlanPanel';
 import {addSuggestionRequest, coverageCounts, coverageNeedsAttention, gapBeats, reviewRequestText, reviewStatusLine, runtimeLine, suggestionAddable, suggestionAnchor, suggestionFraming, suggestionPosition, warnChecks} from './continuity';
 import type {ContinuityPayload, ContinuitySuggestion} from './continuity';
-import {activeRedraw, askedRenderFinished, blockingSlots, canRedo, clipCostLine, failedRedraw, filmPosition, missingKeyframes as keyframesMissing, missingSlots, moveTarget, planInconsistencies, redoOneText, redoRequestText, rejections, renderActivity, renderClipText, renderRequestText, renderStatusLine, rowNeedsAttention, slotName, slotsInFilmOrder, stageCounts, stageTitle, STAGE_LABELS, STATE_LABELS, slotTitle} from './timeline';
-import type {Redraw, RenderActivity, RenderFailure} from './timeline';
-import type {AcceptanceSlot, AcceptanceStage, Artifact, JsonValue, RemovedShot, RenderAcceptance, SessionSummary, ShotPlan} from './types';
+import {createShot, getAgentConfig, moveShot, removeShot, restoreShot, saveAgentConfig, updateAcceptance} from './api';
+import type {AcceptanceSlot, AcceptanceStageName, Artifact, ConfigSection, SessionSummary, ShotPlan} from './types';
+import type {FilmSelection, FilmSessionState} from './filmSession';
+import {artifactUrl, thumbnailUrl} from './media';
+import {VIDEO_PROVIDER_PRESETS, videoProviderPreset} from './videoPresets';
+import './film-workbench.css';
 
-/**
- * The review surface for a render, laid out as a reel: one shot per row, its frames on the
- * left, everything about it on the right. Accepting writes a lock the render respects, so a
- * phase cannot spend money on material nobody has looked at.
- */
-export function TimelineView({session, artifacts, onAskAgent}: {
+type Filter = 'all' | 'review' | 'changes' | 'missing';
+type PreviewMode = 'first' | 'last' | 'clip';
+type FilmUi = {selection: string; filter: Filter; preview: PreviewMode; scroll: number};
+type ReelShot = {slot: string; frames?: AcceptanceSlot; clip?: AcceptanceSlot; plan?: ShotPlan};
+type Generation = {phase: 'stills' | 'video'; scope: 'selected' | 'missing' | 'changes'; slots: string[]; revision: string; drafts: string};
+const filters: {key: Filter; label: string}[] = [{key: 'all', label: 'All'}, {key: 'review', label: 'Needs review'}, {key: 'changes', label: 'Needs changes'}, {key: 'missing', label: 'Missing'}];
+
+type TimelineViewProps = {
   session?: SessionSummary;
   artifacts: Artifact[];
-  onAskAgent: (text: string) => Promise<void>;
-}) {
+  film: FilmSessionState;
+  active?: boolean;
+  onAskAgent: (text: string, restartAgent?: boolean) => Promise<void>;
+  onSelectionChange?: (selection: FilmSelection | null) => void;
+};
+
+export function TimelineView(props: TimelineViewProps) {
+  return <FilmWorkbench key={props.session?.sessionId || 'empty'} {...props} />;
+}
+
+function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onSelectionChange}: TimelineViewProps) {
   const sessionId = session?.sessionId || '';
-  const [payload, setPayload] = useState<RenderAcceptance>();
-  const [plans, setPlans] = useState<Map<string, ShotPlan>>(new Map());
-  const [removed, setRemoved] = useState<RemovedShot[]>([]);
-  const [continuity, setContinuity] = useState<ContinuityPayload>();
+  const uiKey = `vimax:film-ui:${sessionId}`;
+  const [ui, setUi] = useState<FilmUi>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(uiKey) || 'null') as FilmUi | null;
+      if (saved) return {selection: typeof saved.selection === 'string' ? saved.selection : '', filter: filters.some((item) => item.key === saved.filter) ? saved.filter : 'all', preview: ['first', 'last', 'clip'].includes(saved.preview) ? saved.preview : 'first', scroll: Number(saved.scroll) || 0};
+    } catch { /* Session remains usable if storage is unavailable. */ }
+    return {selection: '', filter: 'all', preview: 'first', scroll: 0};
+  });
+  const uiRef = useRef(ui);
+  const reelRef = useRef<HTMLDivElement>(null);
+  const inspector = useRef<ShotPlanHandle>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const mounted = useRef(true);
+  const action = useRef(false);
   const [busy, setBusy] = useState('');
-  const [preview, setPreview] = useState<Artifact>();
-  const [rejecting, setRejecting] = useState<{stage: AcceptanceStage; slot: AcceptanceSlot} | null>(null);
-  const [reason, setReason] = useState('');
   const [error, setError] = useState('');
-  const [asked, setAsked] = useState('');
-  const [renderStatus, setRenderStatus] = useState<JsonValue>();
-  const [agentRunning, setAgentRunning] = useState<boolean>();
-  const [redraw, setRedraw] = useState<Redraw | null>(null);
-  const [failure, setFailure] = useState<RenderFailure | null>(null);
-  const [watchNonce, setWatchNonce] = useState(0);
-  // The slot a click just asked for. The agent takes a while to reach the render, and the
-  // card has to say something for all of it, not only once the render starts.
-  const [askedSlot, setAskedSlot] = useState<{stage: string; slot: string; at: number} | null>(null);
-  const [lastProgressAt, setLastProgressAt] = useState('');
-
-  const refresh = useCallback(async () => {
-    if (!sessionId) return;
-    try {
-      const loaded = await readAcceptance(sessionId);
-      setPayload(loaded);
-      setError('');
-      const root = loaded?.root || '';
-      const [planList, removedList, continuityPayload] = await Promise.all([
-        readShotPlans(sessionId, root).catch(() => undefined),
-        readRemovedShots(sessionId, root).catch(() => undefined),
-        readContinuity(sessionId, root).catch(() => undefined),
-      ]);
-      setPlans(new Map((planList?.plans || []).map((plan) => [plan.slot, plan])));
-      setRemoved(removedList?.removed || []);
-      setContinuity(continuityPayload);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }, [sessionId]);
-
-  useEffect(() => {
-    setPayload(undefined);
-    setAsked('');
-    void refresh();
-  }, [refresh]);
-
+  const [notice, setNotice] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [generation, setGeneration] = useState<Generation | null>(null);
+  const generationRef = useRef(generation);
+  generationRef.current = generation;
+  const liveProgress = useRef(film.progress);
+  liveProgress.current = film.progress;
+  const [asked, setAsked] = useState<{slots: string[]; stage: string; at: number} | null>(null);
+  const [attemptAt, setAttemptAt] = useState<number | null>(null);
+  const [videoSettings, setVideoSettings] = useState<ConfigSection>();
+  const savedVideoSettings = useRef<ConfigSection>();
+  const settingsRead = useRef(0);
+  const [imageModel, setImageModel] = useState('');
+  const [reviewModel, setReviewModel] = useState('');
+  const [settingsError, setSettingsError] = useState('');
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [newBrief, setNewBrief] = useState('');
+  const payload = film.data?.acceptance;
+  const root = payload?.root || '';
+  const plans = useMemo(() => new Map((film.data?.plans || []).map((plan) => [plan.slot, plan])), [film.data?.plans]);
   const byPath = useMemo(() => new Map(artifacts.map((artifact) => [artifact.path, artifact])), [artifacts]);
-  const statusArtifact = artifacts.find((artifact) => artifact.path.endsWith('render_status.json'));
-  const payloadRoot = payload?.root || '';
-  // The film's slots in playing order, which is the order the rows are shown in.
-  const filmOrder = continuity?.shots ?? [];
-  const statusLine = renderStatusLine(renderStatus, {agentRunning, lastProgressAt});
-  const activity = renderActivity(renderStatus, {agentRunning, lastProgressAt});
+  const frameStage = payload?.stages.find((stage) => stage.stage === 'keyframes');
+  const clipStage = payload?.stages.find((stage) => stage.stage === 'clips');
+  const frameMap = useMemo(() => new Map((frameStage?.slots || []).map((slot) => [String(slot.shot), slot])), [frameStage]);
+  const clipMap = useMemo(() => new Map((clipStage?.slots || []).map((slot) => [String(slot.shot), slot])), [clipStage]);
+  const order = useMemo(() => {
+    const active = new Map<string, AcceptanceSlot>();
+    for (const slot of [...(frameStage?.slots || []), ...(clipStage?.slots || [])]) if (slot.shot != null) active.set(String(slot.shot), slot);
+    return slotsInFilmOrder([...active.values()], film.data?.continuity.shots || []).map((slot) => String(slot.shot));
+  }, [frameStage, clipStage, film.data?.continuity.shots]);
+  const rows = useMemo<ReelShot[]>(() => order.map((slot) => ({slot, frames: frameMap.get(slot), clip: clipMap.get(slot), plan: plans.get(slot)})), [order, frameMap, clipMap, plans]);
+  const matches = (row: ReelShot, filter: Filter) => {
+    if (filter === 'all') return true;
+    if (filter === 'missing') return (row.frames?.artifacts.length || 0) < 2 || !row.clip?.artifacts.length;
+    if (filter === 'changes') return [row.frames, row.clip].some((slot) => slot?.state === 'rejected' || slot?.state === 'stale')
+      || Boolean(row.plan && planInconsistencies(row.plan).length);
+    return row.frames?.state === 'rendered' && row.frames.artifacts.length >= 2
+      || row.clip?.state === 'rendered' && row.clip.artifacts.length > 0;
+  };
+  const filtered = rows.filter((row) => matches(row, ui.filter));
+  const selected = rows.find((row) => row.slot === ui.selection);
+  const sessionStage = payload?.stages.find((stage) => `@${stage.stage}` === ui.selection && stage.scope === 'session');
+  const reviewStage: AcceptanceStageName = sessionStage?.stage || (ui.preview === 'clip' ? 'clips' : 'keyframes');
+  const reviewSlot = sessionStage?.slots[0] || (ui.preview === 'clip' ? selected?.clip : selected?.frames);
+  const previewPaths = sessionStage ? sessionStage.slots.flatMap((slot) => slot.artifacts) : ui.preview === 'clip' ? selected?.clip?.artifacts || [] : selected?.frames?.artifacts || [];
+  const [sessionMedia, setSessionMedia] = useState(0);
+  const selectedPath = sessionStage
+    ? previewPaths[Math.min(sessionMedia, Math.max(0, previewPaths.length - 1))]
+    : ui.preview === 'clip' ? previewPaths[0]
+      : previewPaths.find((path) => path.endsWith(ui.preview === 'last' ? '/last_frame.png' : '/first_frame.png'));
+  const selectedArtifact = byPath.get(selectedPath || '');
+  const progress = film.progress;
+  const trail = useMemo(() => parseRenderTrail(progress?.trail || '').filter((row) => attemptAt === null || renderWrittenAfter(row, attemptAt)), [progress?.trail, attemptAt]);
+  const redraw = useMemo(() => activeRedraw(trail), [trail]);
+  const failure = useMemo(() => failedRedraw(trail), [trail]);
+  const agentRunning = progress?.activeSessionId === sessionId ? progress.agentRunning : false;
+  const currentStatus = attemptAt === null || renderWrittenAfter(progress?.status, attemptAt) ? progress?.status : undefined;
+  const activity = renderActivity(currentStatus, {agentRunning, lastProgressAt: progress?.lastProgressAt});
+  const statusLine = renderStatusLine(currentStatus, {agentRunning, lastProgressAt: progress?.lastProgressAt});
   const rendering = activity === 'running';
+  const waiting = Boolean(asked);
+  const frozen = Boolean(busy) || rendering || waiting;
+  const incomplete = reviewStage === 'keyframes' && (reviewSlot?.artifacts.length || 0) < 2;
+  const locked = reviewSlot?.state === 'accepted';
+  const selectedIdentity = `${sessionId}:${root}:${selected?.slot || ''}`;
 
-  // A render started by this page is only visible if the page keeps looking for it, so this
-  // never stops: a render begins while the page is open, and a page open on an idle session
-  // has to notice that. The cadence slows when nothing is running, and an ask restarts it.
+  function remember(patch: Partial<FilmUi>) {
+    const next = {...uiRef.current, ...patch};
+    uiRef.current = next;
+    setUi(next);
+    try { localStorage.setItem(uiKey, JSON.stringify(next)); } catch { /* Only the optional view preference is lost. */ }
+  }
+  function leaveDraft(): boolean {
+    return !inspector.current?.dirty() || window.confirm('Keep this unsaved draft and switch views? It stays with this shot and project. Choose Cancel to keep editing; use Discard draft to remove it.');
+  }
+  function select(slot: string) {
+    if (slot === ui.selection || !leaveDraft()) return;
+    setDirty(false);
+    setSessionMedia(0);
+    remember({selection: slot});
+  }
   useEffect(() => {
-    if (!statusArtifact) return;
-    const startedAt = Date.now();
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const read = () => {
-      void Promise.all([
-        getJsonArtifact(statusArtifact),
-        readHealth().catch(() => undefined),
-        getArtifacts(sessionId).catch(() => undefined),
-        getTextArtifact(sessionId, 'render_events.jsonl').catch(() => ''),
-      ])
-        .then(([document, health, listing, trail]) => {
-          if (cancelled) return;
-          const progress = latestRenderedAt(listing?.artifacts, payloadRoot);
-          setRenderStatus(document);
-          setAgentRunning(health?.agentRunning);
-          setLastProgressAt(progress);
-          const state = renderActivity(document, {agentRunning: health?.agentRunning, lastProgressAt: progress});
-          const rows = parseRenderTrail(trail);
-          // The marker follows the trail, not the activity: a redraw that is slow, stalled or
-          // dead is still the most important thing on that card, and the badge says which.
-          const running = activeRedraw(rows);
-          setRedraw(running);
-          setFailure(failedRedraw(rows));
-          // The render has taken over this slot, so the click's own waiting state ends —
-          // and so does a render that has already finished, which a whole-phase pass never
-          // shows up as an active redraw for the slot.
-          setAskedSlot((current) => {
-            if (!current) return current;
-            if (running?.stage === current.stage && running.slots.includes(current.slot)) return null;
-            return askedRenderFinished(rows, current.at) ? null : current;
-          });
-          if (state === 'running') {
-            // Frames land one at a time, so the cards are pulled in again as they do.
-            void refresh();
-            timer = setTimeout(read, 4000);
-          } else if (askedSlot) {
-            // Waiting on the render a click just asked for: look often enough that it
-            // shows up as it starts rather than a slow tick later.
-            timer = setTimeout(read, 3000);
-          } else {
-            if (Date.now() - startedAt > 12000) void refresh();
-            timer = setTimeout(read, 12000);
-          }
-        })
-        .catch(() => setTimeout(read, 12000));
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  async function loadSettings() {
+    const request = ++settingsRead.current;
+    setSettingsLoading(true);
+    setSettingsError('');
+    try {
+      const config = await getAgentConfig();
+      if (!mounted.current || request !== settingsRead.current) return;
+      savedVideoSettings.current = config.sections.video;
+      setVideoSettings(config.sections.video);
+      setImageModel(config.sections.image.model);
+      setReviewModel(config.sections.llm.model);
+    } catch (reason) {
+      if (mounted.current && request === settingsRead.current) setSettingsError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (mounted.current && request === settingsRead.current) setSettingsLoading(false);
+    }
+  }
+  useEffect(() => {
+    if (sessionId) void loadSettings();
+    else setSettingsLoading(false);
+  }, [sessionId]);
+  useEffect(() => {
+    if (!active) {
+      videoRef.current?.pause();
+      setExpanded(false);
+    }
+  }, [active]);
+  useEffect(() => {
+    if (!payload || selected || sessionStage || !rows.length) return;
+    remember({selection: rows[0].slot});
+  }, [payload, selected, sessionStage, rows]);
+  useEffect(() => {
+    onSelectionChange?.(selected ? {root, slot: selected.slot, label: slotName('keyframes', selected.slot)} : null);
+  }, [selected?.slot, root, onSelectionChange]);
+  useEffect(() => {
+    if (reelRef.current) reelRef.current.scrollTop = uiRef.current.scroll;
+  }, [Boolean(payload)]);
+  useEffect(() => {
+    if (asked && (askedRenderFinished(trail, asked.at) || (redraw?.stage === asked.stage && asked.slots.some((slot) => redraw.slots.includes(slot))))) setAsked(null);
+  }, [trail, redraw, asked]);
+  useEffect(() => {
+    const guard = (event: BeforeUnloadEvent) => {
+      if (!hasSessionFilmDrafts(sessionId)) return;
+      event.preventDefault(); event.returnValue = '';
     };
-    read();
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [statusArtifact?.path, statusArtifact?.updatedAt, refresh, sessionId, payloadRoot, watchNonce, askedSlot]);
-
-  async function setAccepted(stage: AcceptanceStage, slot: AcceptanceSlot | undefined, accepted: boolean) {
-    if (!sessionId) return;
-    const key = `${stage.stage}:${slot?.shot ?? 'all'}`;
-    setBusy(key);
-    setError('');
-    try {
-      setPayload(await updateAcceptance({sessionId, root: payload?.root || '', stage: stage.stage, shot: slot?.shot ?? undefined, accepted}));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function acceptAll(stage: AcceptanceStage, accepted: boolean) {
-    for (const slot of stage.slots) {
-      if (slot.state === 'planned' || slot.state === (accepted ? 'accepted' : 'rendered')) continue;
-      await setAccepted(stage, slot, accepted);
-    }
-  }
-
-  async function reject() {
-    if (!rejecting || !sessionId) return;
-    const {stage, slot} = rejecting;
-    const key = `${stage.stage}:${slot.shot ?? 'all'}`;
-    setBusy(key);
-    setError('');
-    try {
-      setPayload(await updateAcceptance({sessionId, root: payload?.root || '', stage: stage.stage, shot: slot.shot ?? undefined, accepted: false, reason}));
-      setRejecting(null);
-      setReason('');
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy('');
-    }
-  }
-
-  async function ask(text: string, key = 'ask', done = 'Asked the agent — it is working on it now.', slot?: {stage: string; slot: string}) {
-    setBusy(key);
-    setAsked('');
-    setAskedSlot(slot ? {...slot, at: Date.now()} : null);
-    try {
-      await onAskAgent(text);
-      setAsked(done);
-      // Watch for the render this may have just started from the first moment, not the
-      // next tick of a slow cadence.
-      setWatchNonce((current) => current + 1);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy('');
-    }
-  }
-
-  /** Take a shot out of the film, or put one back, and pull the reel in again either way. */
-  async function mutate(action: () => Promise<unknown>, key: string) {
-    setBusy(key);
-    setError('');
-    try {
-      await action();
-      await refresh();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy('');
-    }
-  }
-
-  if (!sessionId) return <div className="artifacts-empty"><Film size={24} /><strong>Select a project</strong><span>The render timeline appears here</span></div>;
-  if (!payload) return <div className="artifact-document-state">{error ? <span className="is-error">{error}</span> : 'Loading timeline…'}</div>;
-
-  const totals = payload.totals;
-  const keyframes = payload.stages.find((stage) => stage.stage === 'keyframes');
-  const clipsStage = payload.stages.find((stage) => stage.stage === 'clips');
-  const waiters = keyframes ? blockingSlots(keyframes) : [];
-  const keyframeSlots = keyframes?.slots ?? [];
-  const keyframesAccepted = keyframeSlots.length > 0 && waiters.length === 0;
-  const remainingClips = missingSlots(clipsStage);
-  // Shots added since the last run have nothing on disk, so they have nothing to accept:
-  // they need drawing first, and a phase re-run draws exactly them.
-  const missingKeyframes = keyframesMissing(keyframes);
-  const rejected = rejections(payload.stages);
-  const editingNote = rejecting?.slot.state === 'rejected';
-  const clipsReady = keyframesAccepted && remainingClips > 0;
-  // "The end" is where the film actually ends, not the highest-numbered shot: a shot appended
-  // to the film goes after whatever plays last.
-  const lastShot = filmOrder.slice(-1)[0] ?? (keyframeSlots.length ? keyframeSlots[keyframeSlots.length - 1].shot : null);
-
-  return (
-    <section className="timeline-view">
-      <header className="reel-summary">
-        <div className="reel-summary-state">
-          <strong>{totals.acceptedKeyframes}/{totals.keyframes} keyframes accepted</strong>
-          <span>{keyframeSlots.length} shots · {totals.clipSeconds}s clips · {clipCostLine(remainingClips, totals.clipSeconds, totals.clipCostUsd)}</span>
-          {statusLine && (
-            <p className={`timeline-render-status${rendering ? ' is-active' : ''}`} role="status">
-              {rendering ? <RefreshCw size={12} className="is-spinning" /> : <Film size={12} />} {statusLine}
-            </p>
-          )}
-        </div>
-        <div className="reel-summary-actions">
-          {rejected.length > 0 && (
-            <button className="timeline-action" onClick={() => void ask(redoRequestText(rejected, payload.root))} disabled={Boolean(busy)}>
-              <RefreshCw size={14} /> Redo {rejected.length} rejected shot{rejected.length === 1 ? '' : 's'}
-            </button>
-          )}
-          {clipsReady ? (
-            <button className="timeline-action is-primary" onClick={() => void ask(renderRequestText('video', payload.root))} disabled={Boolean(busy)}>
-              <Play size={14} /> Render clips · {clipCostLine(remainingClips, totals.clipSeconds, totals.clipCostUsd)}
-            </button>
-          ) : missingKeyframes > 0 ? (
-            <button className="timeline-action is-primary" onClick={() => void ask(renderRequestText('stills', payload.root))} disabled={Boolean(busy)}>
-              <ImageIcon size={14} /> Render {missingKeyframes} missing keyframe{missingKeyframes === 1 ? '' : 's'}
-            </button>
-          ) : keyframesAccepted && remainingClips === 0 ? (
-            <span className="timeline-blocked"><Check size={13} /> Every clip is rendered — review them below</span>
-          ) : (
-            <span className="timeline-blocked">
-              <Lock size={13} /> {waiters.length === 1 ? '1 shot' : `${waiters.length} shots`} still to accept before clips
-            </span>
-          )}
-          <button className="timeline-action" onClick={() => void refresh()} disabled={Boolean(busy)}>
-            <RefreshCw size={14} /> Refresh
-          </button>
-        </div>
-      </header>
-
-      {error && <p className="timeline-error" role="alert">{error}</p>}
-      {failure && (
-        <p className="timeline-failure" role="alert">
-          <AlertTriangle size={13} />
-          <span>
-            <strong>
-              {failure.slots.length
-                ? `The last render failed while redrawing ${failure.slots.map((slot) => slotName(failure.stage, slot)).join(', ')}.`
-                : 'The last render failed.'}
-            </strong>{' '}
-            {failure.reason}
-          </span>
-        </p>
-      )}
-      {asked && <p className="timeline-notice" role="status">{asked}</p>}
-
-      <CoverageSection
-        payload={continuity}
-        plans={plans}
-        busy={busy}
-        onReview={() => void ask(
-          reviewRequestText(payload.root),
-          'review',
-          'Asked the agent to review the timeline against the script. The gaps and suggested shots appear here when the review is written.',
-        )}
-        onAdd={(suggestion) => void mutate(
-          () => createShot(addSuggestionRequest(sessionId, payload.root, suggestion, [...plans.values()])),
-          `add-suggestion:${suggestion.id}`,
-        )}
-        onAddAll={(suggestions) => void mutate(async () => {
-          // One at a time, each following the shot the previous one created: suggestions that
-          // fill a single gap all name the same anchor, so adding them in parallel would land
-          // them in the reverse of the order the review proposed.
-          const created: string[] = [];
-          for (const [index, suggestion] of suggestions.entries()) {
-            const made = await createShot(addSuggestionRequest(
-              sessionId,
-              payload.root,
-              suggestion,
-              [...plans.values()],
-              suggestionAnchor(index, suggestions, created),
-            ));
-            created.push(made.created.slot);
-          }
-        }, 'add-all')}
-      />
-
-      {payload.stages.map((stage, index) => {
-        const counts = stageCounts(stage);
-        const waitersHere = stage.slots.filter((slot) => slot.state !== 'accepted');
-        const note = editingNote && rejecting?.stage.stage === stage.stage ? rejecting.slot : null;
-        return (
-          <section className="reel-section" key={stage.stage}>
-            <header className="reel-section-head">
-              <h2>{stageTitle(stage, index)}</h2>
-              <span className="reel-section-hint">{STAGE_LABELS[stage.stage]?.hint}</span>
-              <span className="reel-section-count">{counts.accepted}/{counts.total} accepted</span>
-              <div className="reel-section-actions">
-                {waitersHere.length > 1 && (
-                  <button className="timeline-action" onClick={() => void acceptAll(stage, true)} disabled={Boolean(busy)}>
-                    <Check size={13} /> Accept all waiting
-                  </button>
-                )}
-                {counts.accepted > 0 && (
-                  <button className="timeline-action is-quiet" onClick={() => void acceptAll(stage, false)} disabled={Boolean(busy)}>
-                    <Unlock size={13} /> Unlock all
-                  </button>
-                )}
-                {stage.stage === 'portraits' && stage.slots[0]?.state === 'accepted' && (
-                  <button className="timeline-action is-primary" onClick={() => void ask(renderRequestText('stills', payload.root))} disabled={Boolean(busy)}>
-                    <Play size={13} /> Render keyframes
-                  </button>
-                )}
-                {stage.stage === 'keyframes' && missingKeyframes > 0 && (
-                  <button className="timeline-action is-primary" onClick={() => void ask(renderRequestText('stills', payload.root))} disabled={Boolean(busy)}>
-                    <ImageIcon size={13} /> Render {missingKeyframes} missing keyframe{missingKeyframes === 1 ? '' : 's'}
-                  </button>
-                )}
-                {stage.stage === 'keyframes' && keyframesAccepted && remainingClips > 0 && (
-                  <button className="timeline-action is-primary" onClick={() => void ask(renderRequestText('video', payload.root))} disabled={Boolean(busy)}>
-                    <Play size={13} /> Render clips · {clipCostLine(remainingClips, totals.clipSeconds, totals.clipCostUsd)}
-                  </button>
-                )}
-                {note && (
-                  <span className="reel-section-note">rejecting {slotTitle(stage.stage, note)}</span>
-                )}
-              </div>
-            </header>
-            {stage.slots.length === 0 ? (
-              <p className="timeline-empty">Nothing here yet.</p>
-            ) : (
-              slotsInFilmOrder(stage.slots, filmOrder).map((slot) => (
-                <ReelRow
-                  key={`${stage.stage}:${slot.shot ?? 'all'}`}
-                  stage={stage}
-                  slot={slot}
-                  plan={slot.shot === null || slot.shot === undefined ? undefined : plans.get(String(slot.shot))}
-                  byPath={byPath}
-                  busy={busy}
-                  rendering={rendering}
-                  sessionId={sessionId}
-                  root={payload.root}
-                  redrawState={redraw && redraw.stage === stage.stage && redraw.slots.includes(String(slot.shot)) ? activity : null}
-                  waiting={Boolean(askedSlot && askedSlot.stage === stage.stage && askedSlot.slot === String(slot.shot))}
-                  onToggle={(accepted) => void setAccepted(stage, slot, accepted)}
-                  onExamine={setPreview}
-                  onReject={() => { setRejecting({stage, slot}); setReason(slot.reason || ''); }}
-                  onRedo={(note) => void ask(
-                    redoOneText(payload.root, stage.stage, slot, note),
-                    `redo:${stage.stage}:${slot.shot ?? 'all'}`,
-                    `Asked the agent to redraw ${slotTitle(stage.stage, slot)}. It reports back here when the new frames are on disk.`,
-                    {stage: stage.stage, slot: String(slot.shot)},
-                  )}
-                  onRemove={() => void mutate(() => removeShot({sessionId, root: payload.root, slot: String(slot.shot)}), `remove:${slot.shot}`)}
-                  onDuplicate={(brief) => void mutate(() => createShot({sessionId, root: payload.root, after: String(slot.shot), brief}), `add:${slot.shot}`)}
-                  onPlanChanged={() => void refresh()}
-                  filmOrder={filmOrder}
-                  onMove={(direction) => void mutate(
-                    () => moveShot({sessionId, root: payload.root, slot: String(slot.shot), direction}),
-                    `move:${slot.shot}`,
-                  )}
-                  onRenderClip={stage.stage === 'clips' && slot.shot != null && slot.artifacts.length === 0 && keyframesAccepted ? () => void ask(
-                    renderClipText(payload.root, String(slot.shot)),
-                    `clip:${slot.shot}`,
-                    `Asked the agent to render the clip for ${slotTitle(stage.stage, slot)}. It appears here when it is on disk.`,
-                  ) : undefined}
-                  oneClipCost={clipCostLine(1, totals.clipSeconds, totals.clipCostUsd)}
-                />
-              ))
-            )}
-            {stage.stage === 'keyframes' && lastShot !== null && lastShot !== undefined && (
-              <AddShotRow
-                busy={busy}
-                disabled={rendering}
-                onCreate={(brief) => void mutate(() => createShot({sessionId, root: payload.root, after: String(lastShot), brief}), 'add:end')}
-              />
-            )}
-          </section>
-        );
-      })}
-
-      {removed.length > 0 && (
-        <section className="reel-section">
-          <header className="reel-section-head">
-            <h2>Removed shots</h2>
-            <span className="reel-section-hint">out of the film, kept on disk, restorable</span>
-            <span className="reel-section-count">{removed.length}</span>
-          </header>
-          {removed.map((entry) => (
-            <article className="reel-row is-removed" key={entry.slot}>
-              <div className="reel-strip">
-                <div className="reel-strip-missing">removed</div>
-                <p className="reel-strip-meta"><span>{entry.files} file{entry.files === 1 ? '' : 's'}</span><span>slot {entry.slot}</span></p>
-              </div>
-              <div className="reel-body">
-                <header className="reel-row-head">
-                  <h3>{slotName('keyframes', entry.slot)}</h3>
-                  <span className="timeline-state">removed</span>
-                  <span className="reel-row-hint">
-                    {entry.hasBrief ? 'its brief and frames are kept' : 'its frames are kept'}
-                  </span>
-                  <div className="reel-controls">
-                    <button
-                      className="timeline-action"
-                      disabled={Boolean(busy)}
-                      onClick={() => void mutate(() => restoreShot({sessionId, root: payload.root, slot: entry.slot}), `restore:${entry.slot}`)}
-                    >
-                      <Undo2 size={13} /> Restore
-                    </button>
-                  </div>
-                </header>
-              </div>
-            </article>
-          ))}
-        </section>
-      )}
-
-      {rejecting && (
-        <div className="media-preview-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setRejecting(null)}>
-          <section className="timeline-reject-dialog" role="dialog" aria-modal="true" aria-label={`Reject ${slotTitle(rejecting.stage.stage, rejecting.slot)}`}>
-            <header>
-              <div>
-                <strong>What is wrong with {slotTitle(rejecting.stage.stage, rejecting.slot)}?</strong>
-                <span>
-                  {editingNote
-                    ? 'Your note is loaded below — change it, and it is what the redraw answers.'
-                    : 'Written down against the shot, and quoted when it is regenerated.'}
-                </span>
-              </div>
-            </header>
-            <textarea
-              autoFocus
-              value={reason}
-              onChange={(event) => setReason(event.target.value)}
-              placeholder="e.g. her dress is blue here but pink in every other shot; the backdrop is a plain studio white; he is facing the wrong way"
-              rows={4}
-            />
-            <footer>
-              <button className="timeline-action" onClick={() => setRejecting(null)}>Cancel</button>
-              <button className="timeline-action is-danger" onClick={() => void reject()} disabled={Boolean(busy) || !reason.trim()}>
-                <ThumbsDown size={14} /> {editingNote ? 'Save note' : 'Reject with this note'}
-              </button>
-            </footer>
-          </section>
-        </div>
-      )}
-      {preview && (
-        <MediaPreviewDialog
-          artifact={preview}
-          promptDocument={byPath.get(visualPromptSource(preview.path)?.documentPath || '')}
-          onClose={() => setPreview(undefined)}
-        />
-      )}
-    </section>
-  );
-}
-
-/** One shot: its frames on the left, everything about it on the right. */
-function ReelRow({stage, slot, plan, byPath, busy, rendering, sessionId, root, redrawState, waiting, onToggle, onExamine, onReject, onRedo, onRemove, onDuplicate, onPlanChanged, filmOrder, onMove, onRenderClip, oneClipCost}: {
-  stage: AcceptanceStage;
-  slot: AcceptanceSlot;
-  plan?: ShotPlan;
-  byPath: Map<string, Artifact>;
-  /** The film's slots in playing order, which is what the position and the moves are about. */
-  filmOrder: string[];
-  onMove: (direction: 'earlier' | 'later') => void;
-  /** Set only when this shot's clip can be rendered on its own, which needs its frames accepted. */
-  onRenderClip?: () => void;
-  /** What one clip costs, for the button's tooltip. */
-  oneClipCost: string;
-  busy: string;
-  rendering: boolean;
-  sessionId: string;
-  root: string;
-  redrawState: RenderActivity | null;
-  waiting: boolean;
-  onToggle: (accepted: boolean) => void;
-  onExamine: (artifact: Artifact) => void;
-  onReject: () => void;
-  onRedo: (note?: string) => void;
-  onRemove: () => void;
-  onDuplicate: (brief: string) => void;
-  onPlanChanged: () => void;
-}) {
-  const key = `${stage.stage}:${slot.shot ?? 'all'}`;
-  const locked = slot.state === 'accepted';
-  const redoing = busy === `redo:${key}`;
-  const shotScoped = slot.shot !== null && slot.shot !== undefined;
-  // A keyframe is two files. A render that died mid-shot leaves one, and there is nothing
-  // complete to review, so it cannot be accepted until a run finishes it.
-  const framesIncomplete = stage.stage === 'keyframes' && shotScoped && slot.artifacts.length > 0 && slot.artifacts.length < 2;
-  // The plan's *warning* belongs to the keyframes lane: the clips lane would repeat a complaint
-  // about frames it does not hold. The plan itself is editable from any lane — a clip's frames
-  // are still the prompt a redraw will be asked for.
-  const shownPlan = stage.stage === 'keyframes' ? plan : undefined;
-  const flagged = shownPlan ? planInconsistencies(shownPlan) : [];
-  const noted = Boolean(slot.reason || slot.note);
-  const [open, setOpen] = useState(rowNeedsAttention(slot.state, {noted, flagged: flagged.length > 0}));
-  const [removing, setRemoving] = useState(false);
+    window.addEventListener('beforeunload', guard);
+    return () => window.removeEventListener('beforeunload', guard);
+  }, [sessionId]);
   useEffect(() => {
-    if (noted || flagged.length) setOpen(true);
-  }, [noted, flagged.length]);
+    if (!expanded) return;
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setExpanded(false); };
+    window.addEventListener('keydown', escape);
+    return () => window.removeEventListener('keydown', escape);
+  }, [expanded]);
+  useEffect(() => {
+    if (!generation && !expanded) return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const dialog = document.querySelector<HTMLElement>(generation ? '.film-generation' : '.film-preview.is-expanded');
+    if (!dialog) return;
+    const focusable = () => [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled), [tabindex="0"]')];
+    focusable()[0]?.focus();
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return;
+      const controls = focusable();
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (!first || !last) { event.preventDefault(); return; }
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', trap);
+    return () => { document.removeEventListener('keydown', trap); previousFocus?.focus(); };
+  }, [Boolean(generation), expanded]);
 
-  return (
-    <article className={`reel-row is-${slot.state}${open ? ' is-open' : ''}`}>
-      <div className="reel-strip">
-        {slot.artifacts.length > 0 ? (
-          <div className="reel-strip-frames">
-            {slot.artifacts.map((path) => {
-              const known = byPath.get(path);
-              const isVideo = path.endsWith('.mp4');
-              const label = path.split('/').pop() || path;
-              return (
-                <figure key={path} title={path}>
-                  {!known ? (
-                    <span className="timeline-thumb-missing" />
-                  ) : (
-                    <button className="timeline-thumb" onClick={() => onExamine(known)} aria-label={`Examine ${label}`}>
-                      {isVideo
-                        ? <video src={url(known)} muted playsInline preload="metadata" />
-                        : <img src={url(known)} alt={label} loading="lazy" />}
-                      <i><ZoomIn size={14} /></i>
-                    </button>
-                  )}
-                  <figcaption>{isVideo ? <Video size={11} /> : <ImageIcon size={11} />}{label}</figcaption>
-                </figure>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="reel-strip-missing">{slot.state === 'planned' ? 'nothing yet' : 'no files'}</div>
-        )}
-        <p className="reel-strip-meta">
-          <span>{framesIncomplete ? `${slot.artifacts.length} of 2 frames` : `${slot.artifacts.length} file${slot.artifacts.length === 1 ? '' : 's'}`}</span>
-          {shotScoped && <span>slot {slot.shot}</span>}
-        </p>
+  async function mutate(key: string, operation: () => Promise<unknown>): Promise<boolean> {
+    if (action.current || !sessionId || !payload) return false;
+    action.current = true; setBusy(key); setError('');
+    try {
+      await operation();
+      if (!mounted.current) return false;
+      await film.refresh();
+      return mounted.current;
+    } catch (reason) {
+      if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    } finally {
+      action.current = false;
+      if (mounted.current) setBusy('');
+    }
+  }
+  async function accept(accepted: boolean, next = false) {
+    if (!reviewSlot || (accepted && incomplete) || dirty) return;
+    let nextSlot = '';
+    const succeeded = await mutate('accept', async () => {
+      const updated = await updateAcceptance({sessionId, root, stage: reviewStage, shot: reviewSlot.shot ?? undefined, accepted});
+      if (next && selected) {
+        const stage = updated.stages.find((stage) => stage.stage === reviewStage);
+        const index = order.indexOf(selected.slot);
+        nextSlot = [...order.slice(index + 1), ...order.slice(0, index)].find((slot) => {
+          const candidate = stage?.slots.find((item) => String(item.shot) === slot);
+          return candidate && candidate.state === 'rendered' && candidate.artifacts.length >= (reviewStage === 'keyframes' ? 2 : 1);
+        }) || '';
+      }
+    });
+    if (succeeded && nextSlot) { setDirty(false); remember({selection: nextSlot}); }
+    else if (succeeded && next) setNotice(`No more rendered ${reviewStage === 'clips' ? 'clips' : 'frame pairs'} waiting for review.`);
+  }
+  async function saveFeedback(note: string) {
+    if (!reviewSlot) throw new Error('The review slot is no longer available.');
+    const succeeded = await mutate('feedback', () => updateAcceptance({sessionId, root, stage: reviewStage, shot: reviewSlot.shot ?? undefined, accepted: false, reason: note}));
+    if (!succeeded) throw new Error('Feedback was not saved. Your local draft is kept.');
+  }
+  function generationSlots(phase: Generation['phase'], scope: Generation['scope']): string[] {
+    return rows.filter((row) => {
+      const target = phase === 'stills' ? row.frames : row.clip;
+      if (target?.state === 'accepted') return false;
+      if (phase === 'stills' && row.clip?.state === 'rejected' && row.frames?.state !== 'rejected') return false;
+      if (scope === 'selected') return row.slot === selected?.slot;
+      if (scope === 'missing') return (target?.artifacts.length || 0) < (phase === 'stills' ? 2 : 1);
+      return target?.state === 'rejected' || target?.state === 'stale';
+    }).map((row) => row.slot);
+  }
+  function openGeneration(phase: Generation['phase'], scope: Generation['scope']) {
+    if (!generation) void loadSettings();
+    const slots = generationSlots(phase, scope);
+    setGeneration({phase, scope, slots, revision: progress?.revision || '', drafts: filmDraftToken(sessionId, root, slots)});
+  }
+  async function submitGeneration() {
+    const decision = generation;
+    if (!decision || !decision.slots.length || frozen || settingsLoading || settingsError || (decision.phase === 'video' ? !videoSettings?.model : !imageModel)) return;
+    if (hasFilmDrafts(sessionId, root, decision.slots)) { setError('Save or discard each targeted shot’s local draft before generating. No request was sent.'); return; }
+    if (decision.revision !== (progress?.revision || '') || decision.drafts !== filmDraftToken(sessionId, root, decision.slots)) {
+      setError('The film or a draft changed while you reviewed this decision. Review the refreshed scope and submit again.');
+      openGeneration(decision.phase, decision.scope); return;
+    }
+    const frameGate = decision.phase === 'video' && decision.slots.some((slot) => frameMap.get(slot)?.state !== 'accepted');
+    const portraitGate = decision.phase === 'stills' && payload?.stages.some((stage) => stage.stage === 'portraits' && stage.slots.some((slot) => slot.artifacts.length > 0 && slot.state !== 'accepted'));
+    if (frameGate || portraitGate) { setError(frameGate ? 'Accept both frames for every targeted shot before rendering its clip.' : 'Review and accept portraits before generating frames.'); return; }
+    const video = {...videoSettings};
+    const stage = decision.phase === 'video' ? 'clips' : 'keyframes';
+    const text = redoRequestText(decision.slots.map((shot) => ({shot, stage, title: slotName(stage, shot), reason: (stage === 'clips' ? clipMap : frameMap).get(shot)?.reason || (stage === 'clips' ? clipMap : frameMap).get(shot)?.note || ''})), root)
+      + `\nUse the configured ${decision.phase === 'video' ? `video model ${JSON.stringify(video.model)} from provider ${JSON.stringify(video.provider || '')}` : `image model ${JSON.stringify(imageModel)}`}. Stop after the stated phase; do not retry a failure or begin another paid phase without a new explicit decision.`;
+    const succeeded = await mutate('generate', async () => {
+      const config = await getAgentConfig();
+      if (!mounted.current || generationRef.current !== decision || decision.revision !== (liveProgress.current?.revision || '') || decision.drafts !== filmDraftToken(sessionId, root, decision.slots)) throw new Error('The generation decision changed. Review it again.');
+      if (decision.phase === 'stills' && config.sections.image.model !== imageModel) {
+        setImageModel(config.sections.image.model);
+        throw new Error('The global image model changed. Review its updated name and submit again.');
+      }
+      let restart = false;
+      if (decision.phase === 'video') {
+        const previous = config.sections.video;
+        const baseline = savedVideoSettings.current;
+        if (baseline && ['provider', 'model', 'base_url', 'resolution', 'effective_clip_seconds'].some((key) => previous[key as keyof ConfigSection] !== baseline[key as keyof ConfigSection])) {
+          savedVideoSettings.current = previous;
+          setVideoSettings(previous);
+          throw new Error('Global video settings changed. Review the updated selection before submitting again.');
+        }
+        restart = previous.provider !== video.provider || previous.model !== video.model || previous.base_url !== video.base_url || previous.resolution !== video.resolution;
+        if (restart) await saveAgentConfig({...config, sections: {...config.sections, video: {...previous, provider: video.provider, model: video.model || previous.model, base_url: video.base_url || previous.base_url, resolution: video.resolution}}});
+        savedVideoSettings.current = {...previous, ...video};
+      }
+      if (!mounted.current || generationRef.current !== decision || decision.revision !== (liveProgress.current?.revision || '') || decision.drafts !== filmDraftToken(sessionId, root, decision.slots)) throw new Error('The film or a draft changed. No generation request was sent.');
+      const at = Date.now();
+      setNotice('');
+      setAttemptAt(at);
+      setAsked({slots: decision.slots, stage, at});
+      try { await onAskAgent(text, restart); } catch (reason) { if (mounted.current) { setAsked(null); setAttemptAt(null); } throw reason; }
+      film.wake();
+    });
+    if (succeeded) setGeneration(null);
+  }
+  async function reviewCoverage() {
+    if (!window.confirm(`Review this film against the script using ${reviewModel || 'the configured language model'}? This may make a paid language-model call; its cost is unknown. It will not generate media.`)) return;
+    await mutate('review', async () => { await onAskAgent(reviewRequestText(root) + '\nReview only. Do not generate media or retry automatically.'); film.wake(); });
+  }
+
+  if (!sessionId) return <div className="artifacts-empty"><Film size={24} /><strong>Select a project</strong><span>Your film workbench appears here.</span></div>;
+  if (!payload) return <div className="artifact-document-state">{film.error || 'Loading film…'}{film.error && <button onClick={() => void film.refresh().catch(() => {})}>Retry loading</button>}</div>;
+  const preset = videoProviderPreset(videoSettings?.provider || '');
+  const models = [...(videoSettings?.model && !preset?.models.some((model) => model === videoSettings.model) ? [videoSettings.model] : []), ...(preset?.models || [])];
+  const missingCount = rows.filter((row) => matches(row, 'missing')).length;
+  const targetHasDraft = generation ? hasFilmDrafts(sessionId, root, generation.slots) : false;
+  const generationBlocked = generation?.phase === 'video' ? generation.slots.some((slot) => frameMap.get(slot)?.state !== 'accepted') : payload.stages.some((stage) => stage.stage === 'portraits' && stage.slots.some((slot) => slot.artifacts.length > 0 && slot.state !== 'accepted'));
+  const phaseModel = generation?.phase === 'video' ? videoSettings?.model : imageModel;
+  const changedVideoModel = videoSettings?.provider !== savedVideoSettings.current?.provider || videoSettings?.model !== savedVideoSettings.current?.model;
+  const generationCost = generation?.phase === 'video' && payload.totals.clipCostUsd > 0
+    ? `${changedVideoModel ? 'Cost for this new selection is unknown. ' : ''}Saved-settings reference: ≈$${(generation.slots.length * payload.totals.clipSeconds * payload.totals.clipCostUsd).toFixed(2)} for ${generation.slots.length} clip${generation.slots.length === 1 ? '' : 's'} at ${payload.totals.clipSeconds}s. Provider/model changes and other charges can change the actual price.`
+    : 'Cost unknown. Image, reference-selection, and provider charges are not quoted by this workbench.';
+
+  return <section className="timeline-view film-workbench">
+    <header className="film-toolbar">
+      <div><h2>Film</h2><span>{rows.length} shots · {payload.totals.acceptedKeyframes}/{payload.totals.keyframes} frames accepted · {missingCount} incomplete</span></div>
+      <div className="film-toolbar-actions">
+        <button className="timeline-action" disabled={Boolean(busy)} onClick={() => void film.refresh().catch(() => {})} aria-label="Refresh film"><RefreshCw size={14} />Refresh</button>
+        <button className="timeline-action is-primary" disabled={frozen || !rows.length} onClick={() => openGeneration(ui.preview === 'clip' ? 'video' : 'stills', selected ? 'selected' : 'missing')}><Plus size={14} />Generate…</button>
       </div>
-
-      <div className="reel-body">
-        <header className="reel-row-head">
-          <button className="reel-toggle" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
-            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            <h3>{slotTitle(stage.stage, slot)}</h3>
-          </button>
-          {redrawState || waiting ? (
-            <span className={`timeline-state is-redrawing${redrawState === 'interrupted' ? ' is-stopped' : ''}`}>
-              <RefreshCw size={11} className={redrawState === 'interrupted' ? undefined : 'is-spinning'} />
-              {redrawState === 'interrupted' ? 'Redraw stopped' : redrawState === 'stalled' ? 'Redrawing, no progress' : waiting && !redrawState ? 'Waiting for the render' : 'Redrawing'}
-            </span>
-          ) : (
-            <span className={`timeline-state is-${slot.state}`}>{STATE_LABELS[slot.state]}</span>
-          )}
-          {flagged.map((flag) => (
-            <span className="reel-flag" key={flag}><AlertTriangle size={11} /> {flag}</span>
-          ))}
-          {!flagged.length && shownPlan && !open && <span className="reel-row-hint">plan is consistent</span>}
-          {shotScoped && stage.stage === 'keyframes' && filmOrder.length > 0 && (
-            <span className="reel-row-hint">{filmPosition(filmOrder, String(slot.shot))}</span>
-          )}
-          {/* A shot nothing has been drawn for has no frames to show, so its brief is the
-              only thing that says what was added. */}
-          {slot.artifacts.length === 0 && plan?.brief && <span className="reel-row-brief">{plan.brief}</span>}
-          <div className="reel-controls">
-            <button
-              className="timeline-action"
-              onClick={() => onToggle(!locked)}
-              disabled={slot.state === 'planned' || busy === key || (framesIncomplete && !locked)}
-              title={framesIncomplete ? 'This shot has one of its two frames; render it again to finish it before accepting' : undefined}
-            >
-              {locked ? <><Lock size={13} /> Accepted</> : <><Unlock size={13} /> Accept</>}
-            </button>
-            <button className="timeline-action" onClick={onReject} disabled={slot.state === 'planned' || busy === key || Boolean(redrawState)}>
-              <ThumbsDown size={13} /> {slot.state === 'rejected' ? 'Edit note' : 'Reject'}
-            </button>
-            {stage.stage === 'keyframes' && shotScoped && (
-              <button className="timeline-action" onClick={() => setRemoving(true)} disabled={Boolean(busy) || rendering} title="Take this shot out of the film">
-                <Trash2 size={13} /> Remove
-              </button>
-            )}
-            {stage.stage === 'keyframes' && shotScoped && filmOrder.includes(String(slot.shot)) && (
-              <>
-                <button
-                  className="timeline-action is-quiet"
-                  onClick={() => onMove('earlier')}
-                  disabled={Boolean(busy) || rendering || !moveTarget(filmOrder, String(slot.shot), 'earlier')}
-                  title="Move this shot one place earlier in the film"
-                >
-                  <ChevronUp size={13} /> Earlier
-                </button>
-                <button
-                  className="timeline-action is-quiet"
-                  onClick={() => onMove('later')}
-                  disabled={Boolean(busy) || rendering || !moveTarget(filmOrder, String(slot.shot), 'later')}
-                  title="Move this shot one place later in the film"
-                >
-                  <ChevronDown size={13} /> Later
-                </button>
-              </>
-            )}
-            {onRenderClip && (
-              <button
-                className="timeline-action is-primary"
-                onClick={onRenderClip}
-                disabled={Boolean(busy) || rendering}
-                title={`Render just this shot's clip · ${oneClipCost}`}
-              >
-                <Video size={13} /> Render this clip
-              </button>
-            )}
-            {canRedo(stage.stage, slot) && (
-              <button className="timeline-action is-primary" onClick={() => onRedo()} disabled={Boolean(busy) || rendering || waiting} title="Redraw just this shot">
-                <RefreshCw size={13} className={redoing || redrawState || waiting ? 'is-spinning' : undefined} /> {redoing ? 'Asking…' : 'Redraw'}
-              </button>
-            )}
+    </header>
+    {statusLine && <p className={`timeline-render-status${rendering ? ' is-active' : ''}`} role="status">{rendering && <RefreshCw size={12} className="is-spinning" />}{statusLine}</p>}
+    {asked && <p className="timeline-render-status is-active" role="status"><RefreshCw size={12} className="is-spinning" />Generation request sent — waiting for the agent to start {asked.stage === 'clips' ? 'clips' : 'frames'} for {asked.slots.map((slot) => slotName('keyframes', slot)).join(', ')}. No automatic retry. <button className="timeline-action" onClick={() => window.dispatchEvent(new CustomEvent('film-open-assistant'))}>Open Assistant</button> <button className="timeline-action" onClick={() => { if (window.confirm('Stop tracking this request? This does not cancel an agent or render. Check Assistant before submitting again to avoid duplicate charges.')) setAsked(null); }}>Clear waiting notice</button></p>}
+    {failure && <p className="timeline-failure" role="alert"><AlertTriangle size={14} /><span><strong>{attemptAt === null ? 'The last render failed' : 'This generation failed'}{failure.slots.length ? ` for ${failure.slots.map((slot) => slotName(failure.stage, slot)).join(', ')}` : ''}.</strong> {failure.reason} No automatic retry has been requested.</span><button className="timeline-action" onClick={() => window.dispatchEvent(new CustomEvent('film-open-assistant'))}>Open Assistant</button></p>}
+    {(activity === 'stalled' || activity === 'interrupted') && <p className="film-warning">{activity === 'stalled' ? 'The render has stopped writing progress; it may be stalled.' : 'The render was interrupted.'} Inspect the agent response before making another generation decision. <button className="timeline-action" onClick={() => window.dispatchEvent(new CustomEvent('film-open-assistant'))}>Open Assistant</button></p>}
+    {(error || film.error) && <p className="timeline-error" role="alert">{error || film.error}</p>}
+    {notice && <p className="timeline-notice" role="status">{notice}</p>}
+    {!rows.length && <div className="film-empty"><Film size={28} /><h3>Your film starts with a plan</h3><p>Open Assistant to develop your idea and create a script and shot plan. Nothing is generated from this screen automatically.</p><button className="timeline-action is-primary" onClick={() => window.dispatchEvent(new CustomEvent('film-open-assistant'))}>Open Assistant</button></div>}
+    <div className="film-layout">
+      <aside className="film-reel" aria-label="Film order">
+        <div className="film-filters" aria-label="Filter shots">{filters.map((filter) => <button key={filter.key} aria-pressed={ui.filter === filter.key} onClick={() => remember({filter: filter.key})}>{filter.label}<span>{rows.filter((row) => matches(row, filter.key)).length}</span></button>)}</div>
+        <div className="film-reel-scroll" ref={reelRef} onScroll={(event) => {
+          const scroll = event.currentTarget.scrollTop;
+          uiRef.current = {...uiRef.current, scroll};
+          try { localStorage.setItem(uiKey, JSON.stringify(uiRef.current)); } catch { /* Optional view preference. */ }
+        }}>
+          {filtered.map((row) => {
+            const thumb = byPath.get(row.frames?.artifacts[0] || row.clip?.artifacts[0] || '');
+            const active = redraw?.slots.includes(row.slot) && (activity === 'running' || activity === 'stalled' || activity === 'interrupted');
+            return <button key={row.slot} className={`film-shot${ui.selection === row.slot ? ' is-selected' : ''}`} aria-current={ui.selection === row.slot ? 'true' : undefined} onClick={() => select(row.slot)}>
+              <span className="film-shot-thumb">{thumb ? <img src={thumbnailUrl(thumb, 240)} loading="lazy" alt="" /> : <ImageIcon size={22} />}</span>
+              <span className="film-shot-content"><strong>{slotName('keyframes', row.slot)}<small>{order.indexOf(row.slot) + 1}/{order.length}</small></strong><span className="film-shot-brief">{row.plan?.brief || row.plan?.firstFrame.description || 'No description yet'}</span><span className="film-shot-states"><span className={`is-${row.frames?.state || 'planned'}`}>Frames: {(row.frames?.artifacts.length || 0) < 2 ? `${row.frames?.artifacts.length || 0}/2 missing` : STATE_LABELS[row.frames!.state]}</span><span className={`is-${row.clip?.state || 'planned'}`}>Clip: {row.clip ? STATE_LABELS[row.clip.state] : 'Missing'}</span></span>{active && <span className="film-shot-progress">{activity === 'stalled' ? 'No recent progress' : activity === 'interrupted' ? 'Interrupted' : 'Regenerating'}</span>}{asked?.slots.includes(row.slot) && <span className="film-shot-progress">Waiting for agent</span>}</span>
+            </button>;
+          })}
+          {!filtered.length && rows.length > 0 && <p className="timeline-empty">No shots match this filter. Your selected shot stays open.</p>}
+        </div>
+        <details className="film-sequence-review"><summary>Portraits & final film</summary>{payload.stages.filter((stage) => stage.scope === 'session').map((stage) => <button key={stage.stage} className={`film-sequence-button${ui.selection === `@${stage.stage}` ? ' is-selected' : ''}`} onClick={() => select(`@${stage.stage}`)}>{stage.stage === 'portraits' ? 'Character portraits' : 'Final film'}<span className={`timeline-state is-${stage.state}`}>{STATE_LABELS[stage.state]}</span></button>)}</details>
+        {Boolean(film.data?.removed.length) && <details className="film-removed"><summary>Removed shots ({film.data?.removed.length})</summary><p>Kept on disk and excluded from the film.</p>{film.data?.removed.map((entry) => <div key={entry.slot}><span>{slotName('keyframes', entry.slot)} · {entry.files} files</span><button className="timeline-action" disabled={frozen} onClick={() => void mutate('restore', () => restoreShot({sessionId, root, slot: entry.slot}))}><Undo2 size={12} />Restore</button></div>)}</details>}
+      </aside>
+      <main className="film-review" aria-label="Selected shot review">
+        {selected || sessionStage ? <>
+          <header className="film-selection-head"><div><h3>{selected ? slotName('keyframes', selected.slot) : sessionStage?.stage === 'portraits' ? 'Character portraits' : 'Final film'}</h3><span>{selected ? filmPosition(order, selected.slot) : 'Sequence-wide review and approval'}</span></div>{selected && <div className="film-preview-tabs" role="group" aria-label="Preview media">{([{key: 'first', label: 'First frame'}, {key: 'last', label: 'Last frame'}, {key: 'clip', label: 'Clip'}] as const).map((tab) => <button key={tab.key} aria-pressed={ui.preview === tab.key} onClick={() => { if (tab.key === ui.preview || leaveDraft()) remember({preview: tab.key}); }}>{tab.label}</button>)}</div>}</header>
+          <div className={`film-preview${expanded ? ' is-expanded' : ''}`} role={expanded ? 'dialog' : undefined} aria-modal={expanded ? true : undefined} aria-label={expanded ? 'Expanded media viewer' : 'Media viewer'}>
+            {selectedArtifact ? selectedArtifact.kind === 'video' ? <video ref={videoRef} key={artifactUrl(selectedArtifact)} src={artifactUrl(selectedArtifact)} poster={thumbnailUrl(selectedArtifact)} controls playsInline preload="metadata" /> : <img key={artifactUrl(selectedArtifact)} src={artifactUrl(selectedArtifact)} alt={selected ? `${slotName('keyframes', selected.slot)} ${ui.preview === 'last' ? 'last' : 'first'} frame` : selectedArtifact.name} /> : <div className="film-preview-missing"><ImageIcon size={30} /><span>{ui.preview === 'clip' ? 'No clip yet' : 'This frame has not been generated'}</span></div>}
+            {selectedArtifact && <button className="film-expand" aria-label={expanded ? 'Close expanded preview' : 'Expand preview'} onClick={() => setExpanded((value) => !value)}><ZoomIn size={15} />{expanded ? 'Close' : 'Expand'}</button>}
           </div>
-        </header>
-
-        {slot.state === 'rejected' && slot.reason && (
-          <p className="timeline-reason"><ThumbsDown size={12} /> {slot.reason}</p>
-        )}
-        {slot.state !== 'rejected' && slot.note && (
-          <p className="timeline-note"><RefreshCw size={12} /> Redrawn to fix: {slot.note}</p>
-        )}
-        {(redrawState || waiting) && (
-          <p className="timeline-redraw-note">
-            <RefreshCw size={12} className={redrawState === 'interrupted' ? undefined : 'is-spinning'} />
-            {redrawState === 'interrupted'
-              ? ' The render stopped before it finished this shot. Redraw it again to replace what is missing.'
-              : redrawState === 'stalled'
-                ? ' The render has written nothing for a while — it may have stalled.'
-                : ' The render is drawing this shot again now — the new frames appear here as they land.'}
-          </p>
-        )}
-
-        {removing && (
-          <div className="plan-remove-confirm" role="alertdialog" aria-label={`Remove ${slotTitle(stage.stage, slot)}`}>
-            <p>
-              Take {slotTitle(stage.stage, slot)} out of the film? Its camera stops listing it, so it is not rendered and not
-              counted in the runtime. Its frames and brief are kept under <code>.removed_shots/</code>, so this can be undone.
-            </p>
-            <div className="plan-actions">
-              <button className="timeline-action" onClick={() => setRemoving(false)}>Keep it</button>
-              <button className="timeline-action is-danger" onClick={() => { setRemoving(false); onRemove(); }} disabled={Boolean(busy)}>
-                <Trash2 size={13} /> Remove the shot
-              </button>
-            </div>
-          </div>
-        )}
-
-        {open && shotScoped && (
-          <ShotPlanPanel
-            sessionId={sessionId}
-            root={root}
-            slot={String(slot.shot)}
-            stage={stage.stage}
-            plan={plan}
-            onRedraw={(note) => onRedo(note)}
-            onChanged={onPlanChanged}
-          />
-        )}
-        {open && shotScoped && stage.stage === 'keyframes' && (
-          <footer className="reel-foot">
-            <button
-              className="timeline-action"
-              disabled={Boolean(busy) || rendering}
-              title="Add a shot after this one, starting from this shot's plan"
-              onClick={() => onDuplicate(plan?.brief || '')}
-            >
-              <Copy size={13} /> Duplicate as a new shot
+          {sessionStage && previewPaths.length > 1 && <div className="film-session-thumbs">{previewPaths.map((path, index) => { const artifact = byPath.get(path); return artifact ? <button key={path} aria-label={`View ${artifact.name}`} aria-pressed={index === sessionMedia} onClick={() => setSessionMedia(index)}><img src={thumbnailUrl(artifact, 160)} loading="lazy" alt={artifact.name} /></button> : null; })}</div>}
+          <div className="film-review-actions">
+            <span className={`timeline-state is-${reviewSlot?.state || 'planned'}`}>{reviewSlot ? STATE_LABELS[reviewSlot.state] : 'Missing'}</span>
+            <button className="timeline-action" disabled={frozen || !reviewSlot?.artifacts.length} onClick={() => inspector.current?.focusFeedback()}>Needs changes</button>
+            <button className="timeline-action" disabled={frozen || dirty || !reviewSlot?.artifacts.length || (incomplete && !locked)} onClick={() => void accept(!locked)}>
+              {locked ? <><Lock size={13} />Unlock {reviewStage === 'clips' ? 'clip' : reviewStage === 'keyframes' ? 'frames' : 'approval'}</> : <><Unlock size={13} />Accept {reviewStage === 'clips' ? 'clip' : reviewStage === 'keyframes' ? 'frames' : 'approval'}</>}
             </button>
-            <span className="reel-row-hint">the new shot starts as a copy of this one; edit its frames before rendering it</span>
-          </footer>
-        )}
-        {open && !shotScoped && (
-          <p className="reel-row-hint">The whole sequence in one slot: accept it, and the render may move on.</p>
-        )}
-      </div>
-    </article>
-  );
+            {selected && <button className="timeline-action is-primary" disabled={frozen || dirty || !reviewSlot?.artifacts.length || incomplete || locked} onClick={() => void accept(true, true)}><Check size={13} />Accept & next</button>}
+          </div>
+          {incomplete && <p className="film-warning">Both first and last frames must exist before this shot can be accepted.</p>}
+          {reviewSlot?.reason && <p className="timeline-reason">Needs changes: {reviewSlot.reason}</p>}
+          {reviewSlot?.note && !reviewSlot.reason && <p className="timeline-note">Previous take regenerated to fix: {reviewSlot.note}</p>}
+          {selected?.plan && planInconsistencies(selected.plan).map((flag) => <p className="film-warning" key={flag}><AlertTriangle size={13} />{flag}</p>)}
+          {sessionStage && <ShotPlanPanel
+            key={`${sessionId}:${root}:${sessionStage.stage}`} ref={inspector}
+            sessionId={sessionId} root={root} slot={`@${sessionStage.stage}`} stage={sessionStage.stage}
+            feedback={reviewSlot?.reason || ''} accepted={locked} disabled={frozen} canRegenerate={false}
+            onChanged={film.refresh} onSaveFeedback={saveFeedback}
+            onRegenerate={() => openGeneration('stills', 'missing')} onDirtyChange={setDirty}
+          />}
+          {selected && <>
+            <ShotPlanPanel key={selectedIdentity} ref={inspector} sessionId={sessionId} root={root} slot={selected.slot} stage={reviewStage} plan={selected.plan} feedback={reviewSlot?.reason || ''} accepted={selected.frames?.state === 'accepted' || selected.clip?.state === 'accepted'} disabled={frozen} canRegenerate={!frozen && (!locked || dirty)} onChanged={film.refresh} onSaveFeedback={saveFeedback} onRegenerate={() => openGeneration(ui.preview === 'clip' ? 'video' : 'stills', 'selected')} onDirtyChange={setDirty} />
+            <details className="film-structure"><summary>Shot structure</summary><p>Order changes invalidate the final film. New shots copy the selected plan; removed media is kept for restoration.</p><div className="plan-actions"><button className="timeline-action" disabled={frozen || !moveTarget(order, selected.slot, 'earlier')} onClick={() => { if (leaveDraft()) void mutate('move', () => moveShot({sessionId, root, slot: selected.slot, direction: 'earlier'})); }}><ChevronUp size={13} />Earlier</button><button className="timeline-action" disabled={frozen || !moveTarget(order, selected.slot, 'later')} onClick={() => { if (leaveDraft()) void mutate('move', () => moveShot({sessionId, root, slot: selected.slot, direction: 'later'})); }}><ChevronDown size={13} />Later</button><button className="timeline-action" disabled={frozen || dirty} onClick={() => void mutate('duplicate', () => createShot({sessionId, root, after: selected.slot, brief: selected.plan?.brief || ''}))}><Copy size={13} />Duplicate</button><button className="timeline-action is-danger" disabled={frozen} onClick={() => { if (window.confirm(`Remove ${slotName('keyframes', selected.slot)} from the film? Its brief, frames and local draft are kept. This invalidates the final film.`)) void mutate('remove', () => removeShot({sessionId, root, slot: selected.slot})); }}><Trash2 size={13} />Remove</button></div><label className="film-feedback"><span>New shot after this one</span><input value={newBrief} onChange={(event) => setNewBrief(event.target.value)} placeholder="What happens in it?" /></label><button className="timeline-action" disabled={frozen || dirty || !newBrief.trim()} onClick={() => void mutate('add', () => createShot({sessionId, root, after: selected.slot, brief: newBrief.trim()})).then((saved) => { if (saved) setNewBrief(''); })}><Plus size={13} />Add shot</button></details>
+          </>}
+        </> : <div className="film-preview-missing">Select a shot to review its frames, clip and plan.</div>}
+      </main>
+    </div>
+    <CoverageSection payload={film.data?.continuity} plans={plans} busy={frozen ? busy || 'rendering' : ''} onReview={() => void reviewCoverage()} onAdd={(suggestion) => void mutate('add-suggestion', () => createShot(addSuggestionRequest(sessionId, root, suggestion, [...plans.values()])))} onAddAll={(suggestions) => void mutate('add-all', async () => { const created: string[] = []; for (const [index, suggestion] of suggestions.entries()) { if (!mounted.current) return; const made = await createShot(addSuggestionRequest(sessionId, root, suggestion, [...plans.values()], suggestionAnchor(index, suggestions, created))); created.push(made.created.slot); } })} />
+    {generation && <div className="film-generation-backdrop" onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setGeneration(null); }}><section className="film-generation" role="dialog" aria-modal="true" aria-labelledby="film-generation-title"><header><h3 id="film-generation-title">Generation decision</h3><button className="timeline-action" disabled={Boolean(busy)} onClick={() => setGeneration(null)}>Cancel</button></header>
+      <div className="film-generation-fields"><label><span>Phase</span><select autoFocus value={generation.phase} disabled={Boolean(busy)} onChange={(event) => openGeneration(event.target.value as Generation['phase'], generation.scope)}><option value="stills">First & last frames · stills</option><option value="video">Clips · video</option></select></label><label><span>Scope</span><select value={generation.scope} disabled={Boolean(busy)} onChange={(event) => openGeneration(generation.phase, event.target.value as Generation['scope'])}><option value="selected" disabled={!selected}>Selected shot</option><option value="missing">Missing in this phase</option><option value="changes">Needs changes in this phase</option></select></label></div>
+      <p><strong>Exactly {generation.slots.length} shot{generation.slots.length === 1 ? '' : 's'}</strong>: {generation.slots.map((slot) => `${slotName('keyframes', slot)} [${slot}]`).join(', ') || 'Nothing eligible. Accepted takes are protected.'}</p><p className="plan-hint">Root: <code>{root}</code> · phase: <code>{generation.phase}</code>. {generation.phase === 'stills' ? 'Replaces selected frames and invalidates their clips and final approval.' : 'Replaces selected clips and may rebuild the final assembly; no other clips are requested.'}</p>
+      {generation.phase === 'stills' && selected?.clip?.state === 'rejected' && selected.frames?.state !== 'rejected' && <p className="film-warning">This shot has clip feedback, so the renderer currently targets its clip. Save feedback against the frames first if you intend to redraw frames instead.</p>}
+      {generation.phase === 'video' ? <div className="film-generation-fields"><label><span>Video provider</span><select value={videoSettings?.provider || ''} disabled={Boolean(busy) || settingsLoading} onChange={(event) => { const chosen = videoProviderPreset(event.target.value); setVideoSettings((current) => current ? {...current, provider: event.target.value, ...(chosen ? {base_url: chosen.baseUrl, model: chosen.defaultModel, resolution: chosen.resolution} : {})} : current); }}>{videoSettings?.provider && !preset && <option value={videoSettings.provider}>{videoSettings.provider}</option>}{Object.entries(VIDEO_PROVIDER_PRESETS).map(([value, entry]) => <option key={value} value={value}>{entry.label}</option>)}</select></label><label><span>Video model</span><select value={videoSettings?.model || ''} disabled={Boolean(busy) || settingsLoading} onChange={(event) => setVideoSettings((current) => current ? {...current, model: event.target.value} : current)}>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label></div> : <p>Image model: <strong>{imageModel || 'Loading configuration…'}</strong></p>}
+      <p className="film-warning">{generationCost}</p><p className="plan-hint">Video selection is saved to global configuration when you submit, affecting future renders in every project. Credentials are unchanged. Image model is configured globally in Settings. Failed requests are not automatically retried by this workbench.</p>
+      {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? 'Accept both frames for each targeted shot first.' : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
+      {error && <p className="timeline-error" role="alert">{error}</p>}
+      <button className="timeline-action is-primary" disabled={frozen || settingsLoading || Boolean(settingsError) || !phaseModel || !generation.slots.length || generationBlocked || targetHasDraft} onClick={() => void submitGeneration()}><RefreshCw size={14} />{busy === 'generate' ? 'Submitting…' : `Generate ${generation.phase} · ${generation.slots.length} shot${generation.slots.length === 1 ? '' : 's'} · ${phaseModel || 'model unavailable'}`}</button>
+    </section></div>}
+  </section>;
 }
 
-/**
- * The script-coverage review: what the film no longer plays, and the shots that would fix it.
- *
- * The review is the agent's; this shows it and turns a suggested shot into the same create
- * request the reel's own "add a shot" uses, so a suggestion is added the way any shot is.
- */
-function CoverageSection({payload, plans, busy, onReview, onAdd, onAddAll}: {
+function renderWrittenAfter(value: unknown, at: number): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const timestamp = Date.parse(String((value as Record<string, unknown>).timestamp || ''));
+  return Number.isFinite(timestamp) && timestamp >= at;
+}
+
+function parseRenderTrail(text: string): unknown[] {
+  return text.split('\n').filter((line) => line.trim()).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+}
+
+function CoverageSection({payload, busy, onReview, onAdd, onAddAll}: {
   payload?: ContinuityPayload;
   plans: Map<string, ShotPlan>;
   busy: string;
@@ -720,218 +434,36 @@ function CoverageSection({payload, plans, busy, onReview, onAdd, onAddAll}: {
   const warnings = warnChecks(review);
   const shots = payload?.shots ?? [];
   const runtime = runtimeLine(shots.length, payload?.clipSeconds ?? 0);
-  const asking = busy === 'review';
-  // This card is about the whole film, so it sits above the shots it is about. It opens
-  // itself when there is something to act on, and stays open once the user opens it.
-  const [opened, setOpened] = useState(false);
-  // Edits to a suggestion, and which one is open: what gets added is what the card shows,
-  // so a suggestion can be rewritten before it becomes a shot.
+  const [open, setOpen] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, ContinuitySuggestion>>({});
   const [openEditor, setOpenEditor] = useState<string | null>(null);
-  const open = opened || coverageNeedsAttention(payload ?? null);
-  // A review describes the timeline it was written against. Adding shots for gaps it named is
-  // only right while that timeline is still the one on screen.
+  const suggestions = (review?.suggestions || []).map((suggestion) => drafts[suggestion.id] || suggestion);
   const stale = payload?.stale ?? false;
-  // Bulk add uses what the card shows, so a suggestion edited in place is added as edited.
-  const suggestions = (review?.suggestions ?? []).map((item) => drafts[item.id] ?? item);
-  return (
-    <section className="reel-section coverage-section">
-      <header className="reel-section-head">
-        <button className="reel-toggle" onClick={() => setOpened((value) => !value)} aria-expanded={open}>
-          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          <h2>Script coverage</h2>
-        </button>
-        <span className="reel-section-hint">{reviewStatusLine(payload ?? null, {asking})}</span>
-        {review && counts.total > 0 && <span className="reel-section-count">{counts.covered}/{counts.total} beats</span>}
-        <div className="reel-section-actions">
-          {runtime && <span className="coverage-runtime">{runtime}</span>}
-          <button className="timeline-action" onClick={onReview} disabled={Boolean(busy)}>
-            {asking ? <RefreshCw size={13} className="is-spinning" /> : <FileJson size={13} />} {review ? 'Review again' : 'Review timeline'}
-          </button>
-        </div>
-      </header>
-
-      {open && (
-        <>
-          {!review && (
-            <p className="timeline-empty">
-              Nothing has checked this timeline against the script yet. Reviewing lists the beats the film
-              no longer plays, and proposes shots to fix them.
-            </p>
-          )}
-
-          {warnings.length > 0 && (
-            <ul className="coverage-checks">
-              {warnings.map((check) => (
-                <li className="coverage-check" key={`${check.id}:${check.message}`}>
-                  <AlertTriangle size={12} />
-                  <span>{check.message}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          {gaps.length > 0 && (
-            <div className="coverage-gaps">
-              {gaps.map((beat) => (
-                <article className={`coverage-gap is-${beat.status}`} key={`${beat.index}:${beat.text}`}>
-                  <span className="coverage-gap-status">{beat.status}</span>
-                  <p className="coverage-gap-text">{beat.text}</p>
-                  <p className="coverage-gap-where">
-                    {beat.covered_by.length
-                      ? `played by ${beat.covered_by.map((shot) => slotName('keyframes', String(shot))).join(', ')}`
-                      : 'no shot plays this'}
-                    {beat.note ? ` — ${beat.note}` : ''}
-                  </p>
-                </article>
-              ))}
-            </div>
-          )}
-
-          {review && review.suggestions.length > 0 && (
-            <div className="coverage-suggestions">
-              <div className="coverage-suggestions-head">
-                <h3>Suggested shots</h3>
-                <button
-                  className="timeline-action is-primary"
-                  onClick={() => onAddAll(suggestions)}
-                  disabled={Boolean(busy) || stale || suggestions.some((item) => !suggestionAddable(item, shots))}
-                  title={stale
-                    ? 'The timeline changed since this review — review it again before filling its gaps'
-                    : 'Add every suggested shot, in the order proposed'}
-                >
-                  <Plus size={13} /> Add all {suggestions.length}
-                </button>
-              </div>
-              {review.suggestions.map((suggestion) => {
-                // The draft is the suggestion until it is edited: what gets added is what the
-                // card shows, so the frame descriptions can be rewritten before the shot exists.
-                const draft = drafts[suggestion.id] ?? suggestion;
-                const addable = suggestionAddable(draft, shots);
-                const editing = openEditor === suggestion.id;
-                const editDraft = (patch: Partial<ContinuitySuggestion>) =>
-                  setDrafts((current) => ({...current, [suggestion.id]: {...draft, ...patch}}));
-                return (
-                  <article className="coverage-suggestion" key={suggestion.id}>
-                    <header className="coverage-suggestion-head">
-                      <strong>{suggestion.title || 'Suggested shot'}</strong>
-                      <span className="coverage-suggestion-where">{suggestionPosition(draft)}</span>
-                      {draft.characters.length > 0 && (
-                        <span className="coverage-suggestion-chars">{draft.characters.join(', ')}</span>
-                      )}
-                      {suggestionFraming(draft) && <span className="coverage-suggestion-size">{suggestionFraming(draft)}</span>}
-                      <div className="coverage-suggestion-actions">
-                        <button className="timeline-action is-quiet" onClick={() => setOpenEditor(editing ? null : suggestion.id)}>
-                          {editing ? 'Close' : 'Edit'}
-                        </button>
-                        <button
-                          className="timeline-action is-primary"
-                          onClick={() => onAdd(draft)}
-                          disabled={Boolean(busy) || !addable || stale}
-                          title={stale
-                            ? 'The timeline changed since this review — review it again before filling its gaps'
-                            : addable ? 'Add this shot to the film' : 'A shot needs a description, and a shot to sit after that the film still has.'}
-                        >
-                          <Plus size={13} /> Add shot
-                        </button>
-                      </div>
-                    </header>
-                    {editing ? (
-                      <div className="coverage-editor">
-                        <label className="coverage-field">
-                          <span>What the shot shows</span>
-                          <textarea rows={2} value={draft.visual_desc} onChange={(event) => editDraft({visual_desc: event.target.value})} />
-                        </label>
-                        <label className="coverage-field">
-                          <span>First frame — what the image is drawn from</span>
-                          <textarea rows={3} value={draft.frames.first} onChange={(event) => editDraft({frames: {...draft.frames, first: event.target.value}})} />
-                        </label>
-                        <label className="coverage-field">
-                          <span>Last frame — what the image is drawn from</span>
-                          <textarea rows={3} value={draft.frames.last} onChange={(event) => editDraft({frames: {...draft.frames, last: event.target.value}})} />
-                        </label>
-                        <label className="coverage-field">
-                          <span>Dialogue</span>
-                          <textarea rows={2} value={draft.audio_desc} onChange={(event) => editDraft({audio_desc: event.target.value})} />
-                        </label>
-                        {!addable && <p className="coverage-notes">A shot needs a description and a shot to sit after.</p>}
-                      </div>
-                    ) : (
-                      <>
-                        <p className="coverage-suggestion-text">{draft.visual_desc}</p>
-                        {draft.audio_desc && <p className="coverage-suggestion-audio">{draft.audio_desc}</p>}
-                        {draft.rationale && <p className="coverage-suggestion-why">{draft.rationale}</p>}
-                      </>
-                    )}
-                  </article>
-                );
-              })}
-            </div>
-          )}
-
-          {review?.notes && <p className="coverage-notes">{review.notes}</p>}
-        </>
-      )}
-    </section>
-  );
-}
-
-/** Add a shot at the end of the film. */
-function AddShotRow({busy, disabled, onCreate}: {busy: string; disabled: boolean; onCreate: (brief: string) => void}) {
-  const [brief, setBrief] = useState('');
-  return (
-    <article className="reel-row is-insert">
-      <div className="reel-strip">
-        <div className="reel-strip-missing">new shot</div>
-        <p className="reel-strip-meta"><span>no files yet</span></p>
-      </div>
-      <div className="reel-body">
-        <header className="reel-row-head">
-          <h3><Plus size={13} /> Add a shot at the end</h3>
-          <span className="reel-row-hint">it copies the last shot's plan, then you edit its frames</span>
-          <div className="reel-controls">
-            <button className="timeline-action is-primary" disabled={Boolean(busy) || disabled || !brief.trim()} onClick={() => { onCreate(brief.trim()); setBrief(''); }}>
-              <Plus size={13} /> Add shot
-            </button>
-          </div>
-        </header>
-        <input
-          className="plan-note"
-          value={brief}
-          onChange={(event) => setBrief(event.target.value)}
-          placeholder="What happens in it, in a sentence"
-          aria-label="What happens in the new shot"
-        />
-        <p className="reel-row-hint">Only the new shot is rendered — nothing already accepted is redrawn.</p>
-      </div>
-    </article>
-  );
-}
-
-/** The render's trail, one JSON row per line; a half-written row is skipped. */
-function parseRenderTrail(text: string): unknown[] {
-  return text.split('\n').filter((line) => line.trim()).flatMap((line) => {
-    try {
-      return [JSON.parse(line)];
-    } catch {
-      return [];
-    }
-  });
-}
-
-/**
- * When the render last produced anything: the newest write under the root it renders into.
- * A render holds no open handle the browser can see, so what it has written is the
- * evidence that it is still working.
- */
-function latestRenderedAt(artifacts: Artifact[] | undefined, root: string): string {
-  if (!root) return '';
-  return (artifacts || [])
-    .filter((artifact) => artifact.path.startsWith(`${root}/`))
-    .reduce((newest, artifact) => (artifact.updatedAt > newest ? artifact.updatedAt : newest), '');
-}
-
-function url(artifact: Artifact): string {
-  const separator = artifact.url.includes('?') ? '&' : '?';
-  return `${artifact.url}${separator}updated=${encodeURIComponent(artifact.updatedAt)}`;
+  return <section className="reel-section coverage-section film-coverage">
+    <header className="reel-section-head">
+      <button className="reel-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}<h2>Script coverage</h2></button>
+      <span className="reel-section-hint">{reviewStatusLine(payload ?? null, {asking: busy === 'review'})}</span>
+      {review && <span className="reel-section-count">{counts.covered}/{counts.total} beats</span>}
+      {runtime && <span className="coverage-runtime">{runtime}</span>}
+      <button className="timeline-action" disabled={Boolean(busy)} onClick={onReview}><FileJson size={13} />{review ? 'Review again…' : 'Review coverage…'}</button>
+    </header>
+    {!open && coverageNeedsAttention(payload ?? null) && <p className="film-warning"><AlertTriangle size={13} />{gaps.length} coverage gaps · {warnings.length} warnings{stale ? ' · review is out of date' : ''}. Expand to inspect; no suggested shot is added automatically.</p>}
+    {open && <div className="film-coverage-content">
+      {!review && <p className="timeline-empty">Review the film against its script to identify uncovered beats and propose real shots. This is an explicit language-model request, not media generation.</p>}
+      {review?.summary && <p>{review.summary}</p>}
+      {stale && <p className="film-warning">{payload?.staleReason || 'The film changed since this review.'} Review again before adding suggested shots.</p>}
+      {warnings.length > 0 && <ul className="coverage-checks">{warnings.map((check) => <li className="coverage-check" key={`${check.id}:${check.message}`}><AlertTriangle size={12} /><span>{check.message}</span></li>)}</ul>}
+      {gaps.length > 0 && <div className="coverage-gaps">{gaps.map((beat) => <article className={`coverage-gap is-${beat.status}`} key={`${beat.index}:${beat.text}`}><span className="coverage-gap-status">{beat.status}</span><p className="coverage-gap-text">{beat.text}</p><p className="coverage-gap-where">{beat.covered_by.length ? `Played by ${beat.covered_by.map((shot) => slotName('keyframes', String(shot))).join(', ')}` : 'No shot plays this'}{beat.note ? ` — ${beat.note}` : ''}</p></article>)}</div>}
+      {suggestions.length > 0 && <div className="coverage-suggestions"><div className="coverage-suggestions-head"><h3>Suggested shots</h3><button className="timeline-action" disabled={Boolean(busy) || stale || suggestions.some((suggestion) => !suggestionAddable(suggestion, shots))} onClick={() => onAddAll(suggestions)}><Plus size={13} />Add all {suggestions.length}</button></div>
+        {suggestions.map((suggestion) => {
+          const editing = openEditor === suggestion.id;
+          const edit = (patch: Partial<ContinuitySuggestion>) => setDrafts((current) => ({...current, [suggestion.id]: {...suggestion, ...patch}}));
+          return <article className="coverage-suggestion" key={suggestion.id}><header className="coverage-suggestion-head"><strong>{suggestion.title || 'Suggested shot'}</strong><span className="coverage-suggestion-where">{suggestionPosition(suggestion)}</span>{suggestionFraming(suggestion) && <span>{suggestionFraming(suggestion)}</span>}<span>{suggestion.characters.join(', ')}</span><div className="coverage-suggestion-actions"><button className="timeline-action" onClick={() => setOpenEditor(editing ? null : suggestion.id)}>{editing ? 'Close editor' : 'Edit suggestion'}</button><button className="timeline-action" disabled={Boolean(busy) || stale || !suggestionAddable(suggestion, shots)} onClick={() => onAdd(suggestion)}><Plus size={13} />Add shot</button></div></header>
+            {editing ? <div className="coverage-editor"><label className="coverage-field"><span>What the shot shows</span><textarea rows={2} value={suggestion.visual_desc} onChange={(event) => edit({visual_desc: event.target.value})} /></label><label className="coverage-field"><span>First frame description</span><textarea rows={3} value={suggestion.frames.first} onChange={(event) => edit({frames: {...suggestion.frames, first: event.target.value}})} /></label><label className="coverage-field"><span>Last frame description</span><textarea rows={3} value={suggestion.frames.last} onChange={(event) => edit({frames: {...suggestion.frames, last: event.target.value}})} /></label><label className="coverage-field"><span>Dialogue</span><textarea rows={2} value={suggestion.audio_desc} onChange={(event) => edit({audio_desc: event.target.value})} /></label></div> : <><p className="coverage-suggestion-text">{suggestion.visual_desc}</p>{suggestion.audio_desc && <p className="coverage-suggestion-audio">{suggestion.audio_desc}</p>}{suggestion.rationale && <p className="coverage-suggestion-why">{suggestion.rationale}</p>}</>}
+          </article>;
+        })}
+      </div>}
+      {review?.notes && <p className="coverage-notes">{review.notes}</p>}
+    </div>}
+  </section>;
 }

@@ -1,4 +1,5 @@
 import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, ContinuityPayload, JsonValue, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, ShotPlan, ShotPlanUpdateRequest, WorkspaceUpload} from './types';
+import type {FilmProgress, FilmSnapshot} from './filmSession';
 
 export async function getSessions() {
   return request<{activeSessionId: string; sessions: SessionSummary[]}>('/api/sessions');
@@ -30,6 +31,16 @@ export async function getHistory(sessionId: string) {
 
 export async function getArtifacts(sessionId: string) {
   return request<{artifacts: Artifact[]}>(`/api/artifacts?session=${encodeURIComponent(sessionId)}`);
+}
+
+export async function readFilmSnapshot(sessionId: string, root = '', signal?: AbortSignal) {
+  const query = new URLSearchParams({session: sessionId, root});
+  return request<FilmSnapshot>(`/api/film?${query}`, {signal, cache: 'no-store'});
+}
+
+export async function readFilmProgress(sessionId: string, root = '', signal?: AbortSignal) {
+  const query = new URLSearchParams({session: sessionId, root});
+  return request<FilmProgress>(`/api/progress?${query}`, {signal, cache: 'no-store'});
 }
 
 /** Whether an agent is running, which is what makes a written render status live or stale. */
@@ -141,8 +152,8 @@ export async function startAgent(options: {sessionId?: string; newSession?: bool
   return request<{ok: boolean}>('/api/agent/start', {method: 'POST', body: JSON.stringify(options)});
 }
 
-export async function sendMessage(text: string) {
-  return request<{ok: boolean}>('/api/messages', {method: 'POST', body: JSON.stringify({text})});
+export async function sendMessage(text: string, sessionId: string) {
+  return request<{ok: boolean}>('/api/messages', {method: 'POST', body: JSON.stringify({text, sessionId})});
 }
 
 export async function stopAgent() {

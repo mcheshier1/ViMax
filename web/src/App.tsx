@@ -12,12 +12,10 @@ import {
   FolderPlus,
   Files,
   Image as ImageIcon,
-  Menu,
+  MessageSquare,
   Moon,
   Palette,
-  PanelLeftClose,
-  PanelLeftOpen,
-  PanelRight,
+  Activity,
   Plus,
   RefreshCw,
   Save,
@@ -32,39 +30,41 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import {deleteSession, getAgentConfig, getArtifacts, getHistory, getSessions, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
-import {ArtifactsView, StoryboardPanel} from './ArtifactViews';
+import {deleteSession, getAgentConfig, getHistory, getSessions, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
+import {ArtifactsView, ScriptView} from './ArtifactViews';
 import {applyAgentEvent, appendLocalUser, composeAgentPrompt, createChatState, humanize} from './events';
 import {describeArtifacts, describeInvalidation, describeStyleMismatch, diffProjectFields, toProjectFields, type InvalidationConfirmation, type ProjectFields} from './projectMetadata';
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
-import type {AgentConfig, AgentEvent, Artifact, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
+import type {AgentConfig, AgentEvent, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
+import {videoProviderPreset} from './videoPresets';
+import {TimelineView} from './TimelineView';
+import {useFilmSession, type FilmSelection} from './filmSession';
+import './workbench-shell.css';
 
 const CONTEXT_TARGET = 160_000;
 
-type WorkspaceView = 'workspace' | 'project' | 'artifacts' | 'settings';
-
-const VIEW_HEADINGS: Record<Exclude<WorkspaceView, 'workspace'>, {title: string; subtitle?: string}> = {
-  project: {title: 'Project', subtitle: 'session metadata and style'},
-  artifacts: {title: 'Artifacts'},
-  settings: {title: 'Settings', subtitle: 'configs/agent.local.yaml'},
-};
+type WorkspaceView = 'film' | 'script' | 'assets';
+type UtilityView = 'project' | 'settings' | null;
+type AssistantScope = 'film' | 'shot';
+const EMPTY_CHAT = createChatState();
+const EMPTY_UPLOADS: WorkspaceUpload[] = [];
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState('');
-  const [chat, setChat] = useState<ChatState>(() => createChatState());
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('workspace');
-  const [agentReady, setAgentReady] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [storyboardPanelOpen, setStoryboardPanelOpen] = useState(false);
-  const [storyboardCount, setStoryboardCount] = useState(0);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('film');
+  const [utility, setUtility] = useState<UtilityView>(null);
+  const [drawer, setDrawer] = useState<'assistant' | 'activity' | null>(null);
+  const [selection, setSelection] = useState<FilmSelection | null>(null);
+  const [assistantScope, setAssistantScope] = useState<AssistantScope>('film');
+  const [chats, setChats] = useState<Record<string, ChatState>>({});
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [uploads, setUploads] = useState<Record<string, WorkspaceUpload[]>>({});
+  const [uploadingSession, setUploadingSession] = useState('');
+  const [sendingSession, setSendingSession] = useState('');
+  const [historyLoading, setHistoryLoading] = useState('');
   const [theme, setTheme] = useState<Theme>(() => resolveTheme(document.documentElement.dataset.theme, false));
-  const [draft, setDraft] = useState('');
-  const [workspaceUploads, setWorkspaceUploads] = useState<WorkspaceUpload[]>([]);
-  const [uploadingFiles, setUploadingFiles] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -77,16 +77,103 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-
+  const selectedSessionIdRef = useRef(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
+  const agentSessionRef = useRef('');
+  const agentRunningRef = useRef(false);
+  const sendingRef = useRef(false);
+  const dirtyFilmSessions = useRef(new Set<string>());
+  const loadedHistory = useRef(new Set<string>());
+  const historyRequests = useRef(new Map<string, Promise<void>>());
+  const pendingHistoryEvents = useRef(new Map<string, AgentEvent[]>());
+  const film = useFilmSession(selectedSessionId);
+  const filmRef = useRef(film);
+  filmRef.current = film;
+  const artifacts = film.data?.artifacts || [];
+  const chat = chats[selectedSessionId] || EMPTY_CHAT;
+  const draft = drafts[selectedSessionId] || '';
+  const workspaceUploads = uploads[selectedSessionId] || EMPTY_UPLOADS;
+  const uploadingFiles = uploadingSession === selectedSessionId && Boolean(selectedSessionId);
+  const busy = chat.busy || sendingSession === selectedSessionId && Boolean(selectedSessionId);
   const selectedSession = sessions.find((session) => session.sessionId === selectedSessionId);
   const slashMatches = useMemo(() => matchingSlashCommands(draft), [draft]);
-  const showSlashCommands = shouldShowSlashCommands(draft, chat.busy);
-  const runningRender = useMemo(
-    () => [...chat.messages].reverse().find((message) => message.role === 'activity'
-      && message.status === 'running'
-      && (message.tool || '').toLowerCase().includes('render_video')),
-    [chat.messages],
-  );
+  const showSlashCommands = shouldShowSlashCommands(draft, busy);
+  const contextPercent = Math.min(100, Math.round((chat.promptTokens / CONTEXT_TARGET) * 100));
+
+  const updateChat = useCallback((sessionId: string, update: (current: ChatState) => ChatState) => {
+    setChats((current) => ({...current, [sessionId]: update(current[sessionId] || createChatState())}));
+  }, []);
+
+  function setDraft(value: string) {
+    setDrafts((current) => ({...current, [selectedSessionId]: value}));
+  }
+
+  function confirmLeaveFilm() {
+    return !dirtyFilmSessions.current.has(selectedSessionIdRef.current) || window.confirm('This film has unsaved shot edits. Leave this view? Your local drafts will be kept, not discarded.');
+  }
+
+  function changeDestination(view: WorkspaceView) {
+    if (view !== workspaceView && workspaceView === 'film' && !confirmLeaveFilm()) return;
+    setWorkspaceView(view);
+    try {
+      window.localStorage.setItem(`vimax-view:${selectedSessionId}`, view);
+    } catch {
+      // Navigation remains available without browser storage.
+    }
+  }
+
+  function changeProject(sessionId: string) {
+    if (sessionId !== selectedSessionId && confirmLeaveFilm()) selectSession(sessionId);
+  }
+
+  function selectSession(sessionId: string) {
+    selectedSessionIdRef.current = sessionId;
+    setSelectedSessionId(sessionId);
+    let destination: WorkspaceView = 'film';
+    try {
+      const saved = window.localStorage.getItem(`vimax-view:${sessionId}`);
+      if (saved === 'script' || saved === 'assets') destination = saved;
+      window.localStorage.setItem('vimax-project', sessionId);
+    } catch {
+      // A new or storage-restricted project opens directly in Film.
+    }
+    setWorkspaceView(destination);
+    setSelection(null);
+    setAssistantScope('film');
+    setLoadError('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }
+
+  const refreshSessions = useCallback(async () => {
+    const state = await getSessions();
+    setSessions(state.sessions);
+    return state;
+  }, []);
+
+  const ensureHistory = useCallback((sessionId: string): Promise<void> => {
+    if (!sessionId || loadedHistory.current.has(sessionId)) return Promise.resolve();
+    const pending = historyRequests.current.get(sessionId);
+    if (pending) return pending;
+    setHistoryLoading(sessionId);
+    const request = getHistory(sessionId).then((history) => {
+      const events = pendingHistoryEvents.current.get(sessionId) || [];
+      const recordedTurns = new Set(history.messages.filter((message) => message.role === 'user' && message.id.endsWith('-user')).map((message) => message.id.slice(0, -5)));
+      let bufferedTurn = '';
+      let restored = createChatState(history.messages);
+      for (const event of events) {
+        bufferedTurn = event.turn_id || bufferedTurn;
+        if (!bufferedTurn || !recordedTurns.has(bufferedTurn)) restored = applyAgentEvent(restored, event);
+      }
+      updateChat(sessionId, () => restored);
+      loadedHistory.current.add(sessionId);
+      pendingHistoryEvents.current.delete(sessionId);
+    }).finally(() => {
+      historyRequests.current.delete(sessionId);
+      setHistoryLoading((current) => current === sessionId ? '' : current);
+    });
+    historyRequests.current.set(sessionId, request);
+    return request;
+  }, [updateChat]);
 
   useEffect(() => {
     applyTheme(theme);
@@ -97,118 +184,105 @@ export default function App() {
     }
   }, [theme]);
 
-  const refreshSessions = useCallback(async () => {
-    const state = await getSessions();
-    setSessions(state.sessions);
-    return state;
-  }, []);
-
-  const refreshArtifacts = useCallback(async (sessionId: string) => {
-    if (!sessionId) {
-      setArtifacts([]);
-      return;
-    }
-    const payload = await getArtifacts(sessionId);
-    setArtifacts(payload.artifacts);
-  }, []);
-
   useEffect(() => subscribeToEvents((event) => {
     if (event.type === 'sessions_changed') {
       setSessions(event.sessions || []);
-      if (event.activeSessionId) setSelectedSessionId(event.activeSessionId);
       return;
-    }
-    if (event.type === 'bridge_status') {
-      if (event.status === 'ready' || event.status === 'starting') setAgentReady(true);
-      if (event.status === 'stopped' || event.status === 'error') setAgentReady(false);
     }
     if (event.type === 'session') {
       const sessionId = event.session?.active_session_id || event.session?.session?.session_id || '';
-      if (sessionId) {
-        setSelectedSessionId(sessionId);
-        void refreshSessions();
-        void refreshArtifacts(sessionId);
-      }
+      if (sessionId) agentSessionRef.current = sessionId;
+      void refreshSessions().catch(() => {});
     }
-    setChat((current) => applyAgentEvent(current, event));
-  }, () => undefined), [refreshArtifacts, refreshSessions]);
+    if (event.type === 'bridge_status') {
+      if (event.status === 'ready' || event.status === 'starting') agentRunningRef.current = true;
+      if (event.status === 'stopped' || event.status === 'error') agentRunningRef.current = false;
+    }
+    const sessionId = agentSessionRef.current;
+    if (!sessionId) return;
+    if (!loadedHistory.current.has(sessionId)) {
+      const events = pendingHistoryEvents.current.get(sessionId) || [];
+      events.push(event);
+      pendingHistoryEvents.current.set(sessionId, events);
+    }
+    updateChat(sessionId, (current) => applyAgentEvent(current, event));
+    if (selectedSessionIdRef.current === sessionId && ['tool_start', 'tool_progress', 'tool_result', 'done', 'session'].includes(event.type || '')) filmRef.current.wake();
+  }, () => undefined), [refreshSessions, updateChat]);
 
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+    void refreshSessions().then((state) => {
+      if (cancelled || selectedSessionIdRef.current) return;
+      let previous = '';
       try {
-        const state = await refreshSessions();
-        if (cancelled || !state.activeSessionId) return;
-        setSelectedSessionId(state.activeSessionId);
-        const [history] = await Promise.all([
-          getHistory(state.activeSessionId),
-          refreshArtifacts(state.activeSessionId),
-          startAgent({sessionId: state.activeSessionId}),
-        ]);
-        if (!cancelled) {
-          setChat(createChatState(history.messages));
-          setAgentReady(true);
-        }
-      } catch (error) {
-        if (!cancelled) setLoadError(error instanceof Error ? error.message : String(error));
+        previous = window.localStorage.getItem('vimax-project') || '';
+      } catch {
+        // The server's active project remains the fallback.
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshArtifacts, refreshSessions]);
+      const sessionId = state.sessions.some((session) => session.sessionId === previous)
+        ? previous : state.activeSessionId || state.sessions[0]?.sessionId || '';
+      if (sessionId) selectSession(sessionId);
+    }).catch((error) => !cancelled && setLoadError(error instanceof Error ? error.message : String(error)));
+    return () => { cancelled = true; };
+  }, [refreshSessions]);
 
   useEffect(() => {
-    if (!runningRender || !selectedSessionId) return;
-    void refreshArtifacts(selectedSessionId);
-    const interval = window.setInterval(() => void refreshArtifacts(selectedSessionId), 2_000);
-    return () => {
-      window.clearInterval(interval);
-      void refreshArtifacts(selectedSessionId);
-    };
-  }, [refreshArtifacts, runningRender, selectedSessionId]);
+    if (!film.progress) return;
+    agentSessionRef.current = film.progress.activeSessionId;
+    agentRunningRef.current = film.progress.agentRunning;
+  }, [film.progress]);
+
+  useEffect(() => {
+    if (!drawer || !selectedSessionId) return;
+    const sessionId = selectedSessionId;
+    void ensureHistory(sessionId).catch((error) => {
+      if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
+    });
+  }, [drawer, selectedSessionId, ensureHistory]);
 
   useEffect(() => {
     const element = scrollRef.current;
-    if (!element) return;
-    element.scrollTo({top: element.scrollHeight, behavior: chat.busy ? 'smooth' : 'auto'});
-  }, [chat.messages, chat.busy]);
+    if (element) element.scrollTo({top: element.scrollHeight, behavior: chat.busy ? 'smooth' : 'auto'});
+  }, [chat.messages, chat.busy, drawer]);
 
   useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
     textarea.style.height = '0px';
     textarea.style.height = `${Math.min(168, Math.max(28, textarea.scrollHeight))}px`;
-  }, [draft]);
+  }, [draft, drawer]);
 
   useEffect(() => {
-    setWorkspaceUploads([]);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  }, [selectedSessionId]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (utility) setUtility(null);
+      else setDrawer(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [utility]);
 
-  async function openSession(sessionId: string) {
-    if (!sessionId || sessionId === selectedSessionId) {
-      setMobileSidebarOpen(false);
-      return;
-    }
-    setLoadError('');
-    setSelectedSessionId(sessionId);
-    setMobileSidebarOpen(false);
-    setChat(createChatState());
-    try {
-      const [history] = await Promise.all([
-        getHistory(sessionId),
-        refreshArtifacts(sessionId),
-        startAgent({sessionId}),
-      ]);
-      setChat(createChatState(history.messages));
-      setAgentReady(true);
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
-    }
-  }
+  useEffect(() => {
+    const onDraftChange = (event: Event) => {
+      const detail = (event as CustomEvent<{sessionId: string; dirty: boolean}>).detail;
+      if (!detail?.sessionId) return;
+      if (detail.dirty) dirtyFilmSessions.current.add(detail.sessionId);
+      else dirtyFilmSessions.current.delete(detail.sessionId);
+    };
+    const onOpenAssistant = () => {
+      setDrawer('assistant');
+      setAssistantScope('film');
+    };
+    window.addEventListener('film-drafts-change', onDraftChange);
+    window.addEventListener('film-open-assistant', onOpenAssistant);
+    return () => {
+      window.removeEventListener('film-drafts-change', onDraftChange);
+      window.removeEventListener('film-open-assistant', onOpenAssistant);
+    };
+  }, []);
 
   function openNewProjectDialog() {
+    if (!confirmLeaveFilm()) return;
     setNewProjectName('');
     setNewProjectStyle('');
     setNewProjectRequirement('');
@@ -216,32 +290,33 @@ export default function App() {
     setNewProjectOpen(true);
   }
 
+  async function waitForNewSession(previousSessionIds: Set<string>, initiatingSessionId: string) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (selectedSessionIdRef.current !== initiatingSessionId) throw new Error('The selected project changed before the new project was ready');
+      const state = await refreshSessions();
+      if (state.activeSessionId && !previousSessionIds.has(state.activeSessionId)) return state.activeSessionId;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error('The new project did not finish creating');
+  }
+
   async function newProject() {
     const projectName = newProjectName.trim();
     if (!projectName || creatingProject) return;
+    const initiatingSessionId = selectedSessionId;
+    const previousSessionIds = new Set(sessions.map((session) => session.sessionId));
     setCreatingProject(true);
     setNewProjectError('');
-    setLoadError('');
-    setMobileSidebarOpen(false);
     try {
-      await startAgent({
-        newSession: true,
-        projectName,
-        style: newProjectStyle.trim(),
-        userRequirement: newProjectRequirement.trim(),
-      });
-      setAgentReady(true);
-      await new Promise((resolve) => window.setTimeout(resolve, 450));
-      const state = await refreshSessions();
-      setSelectedSessionId(state.activeSessionId);
-      setChat(createChatState());
-      setArtifacts([]);
-      setWorkspaceView('workspace');
+      await startAgent({newSession: true, projectName, style: newProjectStyle.trim(), userRequirement: newProjectRequirement.trim()});
+      const sessionId = await waitForNewSession(previousSessionIds, initiatingSessionId);
+      agentSessionRef.current = sessionId;
+      agentRunningRef.current = true;
+      selectSession(sessionId);
+      setWorkspaceView('film');
+      setDrawer('assistant');
       setNewProjectOpen(false);
-      setNewProjectName('');
-      setNewProjectStyle('');
-      setNewProjectRequirement('');
-      textareaRef.current?.focus();
     } catch (error) {
       setNewProjectError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -249,87 +324,109 @@ export default function App() {
     }
   }
 
-  /**
-   * Send one instruction to the agent, starting it if it is not running. The timeline's
-   * "render the next phase" buttons go through here, so a request from the UI behaves
-   * exactly like one typed into the chat.
-   */
-  async function askAgent(text: string, attachments: string[] = []) {
+  /** Timeline instructions already name their scope. Only the composer adds its chosen context. */
+  async function askAgent(text: string, attachments: string[] = [], restartAgent = false, scope?: AssistantScope) {
     if (!text.trim()) return;
-    setChat((current) => appendLocalUser(current, text));
-    if (!agentReady) {
-      await startAgent(selectedSessionId ? {sessionId: selectedSessionId} : {newSession: true});
-      setAgentReady(true);
+    if (sendingRef.current) throw new Error('Wait for the current message to finish sending');
+    const sessionId = selectedSessionId;
+    if (!sessionId) throw new Error('Create or select a project before sending a message');
+    if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before sending');
+    const chosenShot = scope === 'shot' ? selection : null;
+    if (scope === 'shot' && !chosenShot) throw new Error('Select a shot in Film or choose Whole film');
+    const root = chosenShot?.root || film.data?.acceptance.root || '';
+    sendingRef.current = true;
+    setSendingSession(sessionId);
+    try {
+      await ensureHistory(sessionId);
+      if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before sending');
+      if (!agentRunningRef.current || agentSessionRef.current !== sessionId || restartAgent) {
+        await startAgent({sessionId});
+        agentSessionRef.current = sessionId;
+        agentRunningRef.current = true;
+      }
+      if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before sending');
+      const context = scope && !text.trimStart().startsWith('/')
+        ? ` Film context: ${JSON.stringify({session: sessionId, root, scope: scope === 'shot' ? 'selected-shot' : 'whole-film', ...(chosenShot ? {slot: chosenShot.slot, label: chosenShot.label} : {})})}. ${chosenShot ? 'Limit changes to this selected shot unless I explicitly request broader changes.' : 'This request concerns the whole film.'}`
+        : '';
+      updateChat(sessionId, (current) => appendLocalUser(current, text));
+      await sendMessage(composeAgentPrompt(text + context, attachments), sessionId);
+      filmRef.current.wake();
+    } catch (error) {
+      updateChat(sessionId, (current) => ({...current, busy: false}));
+      throw error;
+    } finally {
+      sendingRef.current = false;
+      setSendingSession('');
     }
-    await sendMessage(composeAgentPrompt(text, attachments));
   }
 
   async function submit() {
     const text = draft.trim();
-    if (!text || chat.busy || uploadingFiles) return;
+    if (!text || busy || uploadingFiles) return;
+    const sessionId = selectedSessionId;
     setLoadError('');
-    setDraft('');
     try {
-      await askAgent(text, workspaceUploads.map((file) => file.path));
-      setWorkspaceUploads([]);
+      await askAgent(text, workspaceUploads.map((file) => file.path), false, assistantScope);
+      setDrafts((current) => current[sessionId] === text || current[sessionId]?.trim() === text ? {...current, [sessionId]: ''} : current);
+      setUploads((current) => ({...current, [sessionId]: []}));
     } catch (error) {
-      const event: AgentEvent = {type: 'error', message: error instanceof Error ? error.message : String(error)};
-      setChat((current) => applyAgentEvent(current, event));
+      updateChat(sessionId, (current) => applyAgentEvent(current, {type: 'error', message: error instanceof Error ? error.message : String(error)}));
     }
   }
 
   async function uploadFiles(files: FileList | null) {
     const sessionId = selectedSessionId;
-    if (!files?.length) return;
-    if (!sessionId) {
-      setLoadError('Create or select a project before uploading files');
-      return;
-    }
-    setUploadingFiles(true);
+    if (!files?.length || !sessionId || uploadingSession) return;
+    setUploadingSession(sessionId);
     setLoadError('');
     let uploadedAny = false;
     try {
       for (const file of Array.from(files)) {
         const result = await uploadWorkspaceFile(sessionId, file);
         uploadedAny = true;
-        setWorkspaceUploads((current) => [
-          ...current.filter((item) => item.path !== result.file.path),
-          result.file,
-        ]);
+        setUploads((current) => ({...current, [sessionId]: [...(current[sessionId] || []).filter((item) => item.path !== result.file.path), result.file]}));
       }
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
+      if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
-      if (uploadedAny) await refreshArtifacts(sessionId);
-      setUploadingFiles(false);
+      if (uploadedAny && selectedSessionIdRef.current === sessionId) {
+        void filmRef.current.refresh().catch((error) => {
+          if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
+        });
+      }
+      setUploadingSession('');
       textareaRef.current?.focus();
     }
   }
 
   async function stop() {
-    await stopAgent();
-    setAgentReady(false);
-    setChat((current) => ({...current, busy: false}));
+    try {
+      await stopAgent();
+      agentRunningRef.current = false;
+      updateChat(agentSessionRef.current, (current) => applyAgentEvent(current, {type: 'bridge_status', status: 'stopped'}));
+      filmRef.current.wake();
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function confirmDelete() {
     if (!pendingDelete || deleting) return;
     const sessionId = pendingDelete.sessionId;
-    const deletingSelected = sessionId === selectedSessionId;
     setDeleting(true);
     setLoadError('');
     try {
       const state = await deleteSession(sessionId);
       setSessions(state.sessions);
       setPendingDelete(undefined);
-      if (deletingSelected) {
-        setSelectedSessionId('');
-        setChat(createChatState());
-        setArtifacts([]);
-        setAgentReady(false);
-        if (state.activeSessionId) await openSession(state.activeSessionId);
+      loadedHistory.current.delete(sessionId);
+      pendingHistoryEvents.current.delete(sessionId);
+      if (selectedSessionIdRef.current === sessionId) {
+        selectSession(state.activeSessionId || state.sessions[0]?.sessionId || '');
+        setUtility(null);
       }
+      if (agentSessionRef.current === sessionId) agentRunningRef.current = false;
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -337,294 +434,118 @@ export default function App() {
     }
   }
 
-  const contextPercent = Math.min(100, Math.round((chat.promptTokens / CONTEXT_TARGET) * 100));
-  const hasConversation = chat.messages.length > 0;
+  function openPlanningAssistant() {
+    setDrawer('assistant');
+    setAssistantScope('film');
+    if (!draft.trim()) setDraft('Help me plan this film. Develop the script and storyboard from my idea; do not generate paid images or video yet.');
+    textareaRef.current?.focus();
+  }
+
+  const assistantMessages = chat.messages.filter((message) => message.role !== 'activity');
+  const activityMessages = chat.messages.filter((message) => message.role === 'activity' || message.role === 'error');
 
   return (
-    <div className="app-shell">
-      <Sidebar
-        open={sidebarOpen}
-        mobileOpen={mobileSidebarOpen}
-        sessions={sessions}
-        selectedSessionId={selectedSessionId}
-        activeView={workspaceView}
-        onToggle={() => setSidebarOpen((value) => !value)}
-        onMobileClose={() => setMobileSidebarOpen(false)}
-        onNew={openNewProjectDialog}
-        onSelect={(sessionId) => void openSession(sessionId)}
-        onWorkspace={() => {
-          setWorkspaceView('workspace');
-          setMobileSidebarOpen(false);
-        }}
-        onProject={() => {
-          setWorkspaceView('project');
-          setMobileSidebarOpen(false);
-        }}
-        onArtifacts={() => {
-          setWorkspaceView('artifacts');
-          setMobileSidebarOpen(false);
-        }}
-        onSettings={() => {
-          setWorkspaceView('settings');
-          setMobileSidebarOpen(false);
-        }}
-        onDelete={setPendingDelete}
-      />
-
-      <main className="workspace-main">
-        {workspaceView === 'workspace' ? (
-          <div className="workspace-utility-bar">
-            <button className="icon-button mobile-only" onClick={() => setMobileSidebarOpen(true)} aria-label="Open navigation">
-              <Menu size={19} />
-            </button>
-            {!sidebarOpen && (
-              <button className="icon-button desktop-only" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">
-                <PanelLeftOpen size={18} />
-              </button>
-            )}
-            <span className="workspace-utility-spacer" />
-            <div className="workspace-utility-actions">
-              <ThemeToggle theme={theme} onToggle={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} />
-              <button className="icon-button artifact-toggle" onClick={() => setStoryboardPanelOpen((value) => !value)} aria-label="Toggle storyboard preview">
-                <PanelRight size={18} />
-                {storyboardCount > 0 && <span className="count-badge">{storyboardCount}</span>}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <header className="workspace-header">
-            <div className="workspace-title-row">
-              <button className="icon-button mobile-only" onClick={() => setMobileSidebarOpen(true)} aria-label="Open navigation">
-                <Menu size={19} />
-              </button>
-              {!sidebarOpen && (
-                <button className="icon-button desktop-only" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">
-                  <PanelLeftOpen size={18} />
-                </button>
-              )}
-              <div className="workspace-title-copy">
-                <strong>{VIEW_HEADINGS[workspaceView].title}</strong>
-                {VIEW_HEADINGS[workspaceView].subtitle && <span>{VIEW_HEADINGS[workspaceView].subtitle}</span>}
-              </div>
-            </div>
-            <ThemeToggle theme={theme} onToggle={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} />
-          </header>
-        )}
-
-        {workspaceView === 'workspace' ? (
-          <div className="conversation" ref={scrollRef}>
-            {!hasConversation ? (
-              <EmptyState theme={theme} />
-            ) : (
-              <div className="message-stream">
-                {chat.messages.map((message) => <MessageRow key={message.id} message={message} />)}
-                {chat.busy && <ThinkingRow messages={chat.messages} />}
-              </div>
-            )}
-          </div>
-        ) : workspaceView === 'project' ? (
-          <ProjectView
-            sessionId={selectedSessionId}
-            onChanged={() => {
-              void refreshSessions();
-              void refreshArtifacts(selectedSessionId);
-            }}
-          />
-        ) : workspaceView === 'artifacts' ? (
-          <ArtifactsView session={selectedSession} artifacts={artifacts} onAskAgent={(text) => askAgent(text)} />
-        ) : (
-          <SettingsView />
-        )}
-
-        {workspaceView === 'workspace' && <div className="composer-zone">
-          {loadError && (
-            <div className="inline-error" role="alert">
-              <span>{loadError}</span>
-              <button onClick={() => setLoadError('')} aria-label="Dismiss error"><X size={15} /></button>
-            </div>
-          )}
-          {showSlashCommands && <SlashCommandMenu matches={slashMatches} contextPercent={contextPercent} onSelect={(command) => {
-            setDraft(command);
-            textareaRef.current?.focus();
-          }} />}
-          <div className={`composer ${chat.busy ? 'is-busy' : ''}`}>
-            <textarea
-              ref={textareaRef}
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Tab' && slashMatches[0]) {
-                  event.preventDefault();
-                  setDraft(slashMatches[0].name);
-                  return;
-                }
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  void submit();
-                }
-              }}
-              placeholder="Describe what you want to make"
-              aria-label="Message ViMax"
-              disabled={chat.busy}
-              rows={1}
-            />
-            {(workspaceUploads.length > 0 || uploadingFiles) && (
-              <div className="composer-attachments" aria-live="polite">
-                {workspaceUploads.map((file) => (
-                  <span className="composer-attachment" key={file.path} title={file.path}>
-                    <FileText size={13} />
-                    <span>{file.name}</span>
-                    <button
-                      type="button"
-                      onClick={() => setWorkspaceUploads((current) => current.filter((item) => item.path !== file.path))}
-                      aria-label={`Remove ${file.name} from this message`}
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
-                ))}
-                {uploadingFiles && <span className="composer-uploading">Uploading…</span>}
-              </div>
-            )}
-            <div className="composer-controls">
-              <input
-                ref={fileInputRef}
-                className="composer-file-input"
-                type="file"
-                multiple
-                onChange={(event) => void uploadFiles(event.currentTarget.files)}
-                tabIndex={-1}
-              />
-              <button
-                type="button"
-                className="composer-add"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={!selectedSessionId || uploadingFiles || chat.busy}
-                aria-label="Upload files to workspace"
-                aria-busy={uploadingFiles}
-                title={selectedSessionId ? 'Upload files to workspace' : 'Create or select a project first'}
-              >
-                <Plus size={20} />
-              </button>
-              <div className="composer-spacer" />
-              {chat.busy ? (
-                <button className="send-button stop" onClick={() => void stop()} aria-label="Stop generation"><CircleStop size={18} /></button>
-              ) : (
-                <button className="send-button" onClick={() => void submit()} disabled={!draft.trim() || uploadingFiles} aria-label="Send message"><ArrowUp size={19} /></button>
-              )}
-            </div>
-          </div>
-        </div>}
-      </main>
-
-      <StoryboardPanel
-        open={storyboardPanelOpen && workspaceView === 'workspace'}
-        artifacts={artifacts}
-        activeRenderStage={runningRender?.stage}
-        onClose={() => setStoryboardPanelOpen(false)}
-        onCountChange={setStoryboardCount}
-      />
-      <DeleteProjectDialog
-        session={pendingDelete}
-        deleting={deleting}
-        onCancel={() => !deleting && setPendingDelete(undefined)}
-        onConfirm={() => void confirmDelete()}
-      />
-      <NewProjectDialog
-        open={newProjectOpen}
-        name={newProjectName}
-        style={newProjectStyle}
-        requirement={newProjectRequirement}
-        error={newProjectError}
-        creating={creatingProject}
-        onNameChange={(value) => {
-          setNewProjectName(value);
-          setNewProjectError('');
-        }}
-        onStyleChange={setNewProjectStyle}
-        onRequirementChange={setNewProjectRequirement}
-        onCancel={() => {
-          if (creatingProject) return;
-          setNewProjectOpen(false);
-          setNewProjectError('');
-        }}
-        onConfirm={() => void newProject()}
-      />
-    </div>
-  );
-}
-
-function Sidebar({open, mobileOpen, sessions, selectedSessionId, activeView, onToggle, onMobileClose, onNew, onSelect, onWorkspace, onProject, onArtifacts, onSettings, onDelete}: {
-  open: boolean;
-  mobileOpen: boolean;
-  sessions: SessionSummary[];
-  selectedSessionId: string;
-  activeView: WorkspaceView;
-  onToggle: () => void;
-  onMobileClose: () => void;
-  onNew: () => void;
-  onSelect: (sessionId: string) => void;
-  onWorkspace: () => void;
-  onProject: () => void;
-  onArtifacts: () => void;
-  onSettings: () => void;
-  onDelete: (session: SessionSummary) => void;
-}) {
-  return (
-    <>
-      {mobileOpen && <button className="sidebar-scrim" onClick={onMobileClose} aria-label="Close navigation" />}
-      <aside className={`sidebar ${open ? 'is-open' : 'is-collapsed'} ${mobileOpen ? 'is-mobile-open' : ''}`}>
-        <div className="sidebar-brand">
-          <strong>ViMax</strong>
-          <button className="icon-button sidebar-collapse desktop-only" onClick={onToggle} aria-label="Collapse navigation">
-            <PanelLeftClose size={17} />
-          </button>
-          <button className="icon-button mobile-only" onClick={onMobileClose} aria-label="Close navigation"><X size={18} /></button>
+    <div className="workbench-shell">
+      <header className="workbench-topbar">
+        <strong className="workbench-brand">ViMax</strong>
+        <div className="workbench-project-switcher">
+          <select value={selectedSessionId} onChange={(event) => changeProject(event.target.value)} aria-label="Project" disabled={creatingProject}>
+            {!selectedSessionId && <option value="">Select a project</option>}
+            {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{sessionTitle(session)}</option>)}
+          </select>
+          <button className="icon-button" onClick={openNewProjectDialog} aria-label="New project" title="New project"><Plus size={17} /></button>
         </div>
-        <nav className="primary-nav" aria-label="Primary navigation">
-          <button onClick={onNew}><FolderPlus size={17} /><span>New project</span></button>
-          <button className={activeView === 'workspace' ? 'is-active' : ''} onClick={onWorkspace}><Folder size={17} /><span>Workspace</span></button>
-          <button className={activeView === 'project' ? 'is-active' : ''} onClick={onProject}><Palette size={17} /><span>Project</span></button>
-          <button className={activeView === 'artifacts' ? 'is-active' : ''} onClick={onArtifacts}><Files size={17} /><span>Artifacts</span></button>
-          <button className={activeView === 'settings' ? 'is-active' : ''} onClick={onSettings}><Settings size={17} /><span>Settings</span></button>
+        <nav className="workbench-destinations" aria-label="Project views">
+          <button className={workspaceView === 'film' ? 'is-active' : ''} aria-current={workspaceView === 'film' ? 'page' : undefined} onClick={() => changeDestination('film')}><Film size={16} />Film</button>
+          <button className={workspaceView === 'script' ? 'is-active' : ''} aria-current={workspaceView === 'script' ? 'page' : undefined} onClick={() => changeDestination('script')}><FileText size={16} />Script</button>
+          <button className={workspaceView === 'assets' ? 'is-active' : ''} aria-current={workspaceView === 'assets' ? 'page' : undefined} onClick={() => changeDestination('assets')}><Files size={16} />Assets</button>
         </nav>
-        <div className="session-section">
-          <div className="section-label"><span>Projects</span><span>{sessions.length}</span></div>
-          <div className="session-list">
-            {sessions.map((session) => (
-              <div
-                key={session.sessionId}
-                className={`session-item ${session.sessionId === selectedSessionId ? 'is-selected' : ''}`}
-              >
-                <button className="session-open" onClick={() => onSelect(session.sessionId)}>
-                  <span className="session-copy">
-                    <strong>{sessionTitle(session)}</strong>
-                    <small>{relativeTime(session.updatedAt)} · {stageLabel(session.stage)}</small>
-                  </span>
-                </button>
-                <button className="session-delete" onClick={() => onDelete(session)} aria-label={`Delete ${sessionTitle(session)}`} title="Delete project">
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
-            {sessions.length === 0 && <span className="empty-list">No projects yet</span>}
+        <div className="workbench-utilities">
+          <button className="icon-button" onClick={() => setUtility('project')} disabled={!selectedSessionId} aria-label="Project details" title="Project details"><Palette size={17} /></button>
+          <button className="icon-button" onClick={() => setUtility('settings')} aria-label="Settings" title="Settings"><Settings size={17} /></button>
+          <ThemeToggle theme={theme} onToggle={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} />
+          <button className={`workbench-utility-button ${drawer === 'activity' ? 'is-active' : ''}`} onClick={() => setDrawer((current) => current === 'activity' ? null : 'activity')} aria-expanded={drawer === 'activity'}><Activity size={16} /><span>Activity</span>{chat.busy && <i className="workbench-busy-dot" />}</button>
+          <button className={`workbench-assistant-button ${drawer === 'assistant' ? 'is-active' : ''}`} onClick={() => setDrawer((current) => current === 'assistant' ? null : 'assistant')} aria-expanded={drawer === 'assistant'}><MessageSquare size={16} /><span>Assistant</span></button>
+        </div>
+      </header>
+      {loadError && <div className="workbench-error inline-error" role="alert"><span>{loadError}</span><button onClick={() => setLoadError('')} aria-label="Dismiss error"><X size={15} /></button></div>}
+      <div className={`workbench-body ${drawer ? 'has-drawer' : ''}`}>
+        <main className="workbench-main">
+          <div className="workbench-destination film-destination" hidden={workspaceView !== 'film'}>
+            {!selectedSessionId ? (
+              <section className="workbench-welcome">
+                <Film size={32} /><h1>Your film starts here</h1><p>Plan a story, shape each shot, and review the film in one place.</p>
+                <button className="workbench-primary" onClick={openNewProjectDialog}><Plus size={16} />Create a project</button>
+              </section>
+            ) : (
+              <>
+                {!film.loading && film.data && film.data.plans.length === 0 && <div className="workbench-planning-prompt"><div><strong>Give your film a starting point</strong><span>Use the Assistant to develop a script and shot plan before generating media.</span></div><button onClick={openPlanningAssistant}><MessageSquare size={15} />Plan with Assistant</button></div>}
+                <TimelineView key={selectedSessionId} session={selectedSession} artifacts={artifacts} film={film} active={workspaceView === 'film' && !utility} onAskAgent={(text, restartAgent) => askAgent(text, [], restartAgent)} onSelectionChange={setSelection} />
+              </>
+            )}
           </div>
-        </div>
-        <div className="sidebar-footer">
-          <span className="avatar">V</span>
-          <div><strong>Local workspace</strong><small>Local · ViMax</small></div>
-        </div>
-      </aside>
-    </>
-  );
-}
-
-function EmptyState({theme}: {theme: Theme}) {
-  return (
-    <section className="empty-state">
-      <img className="empty-state-logo" src={theme === 'dark' ? '/vimax-light.svg' : '/vimax-dark.svg'} alt="ViMax" />
-      <h1>What should we create?</h1>
-    </section>
+          {workspaceView === 'script' && <ScriptView key={selectedSessionId} session={selectedSession} artifacts={artifacts} onPlan={openPlanningAssistant} />}
+          {workspaceView === 'assets' && <ArtifactsView key={selectedSessionId} session={selectedSession} artifacts={artifacts} />}
+        </main>
+        {drawer && <aside className={`workbench-drawer ${drawer === 'assistant' ? 'assistant-drawer' : 'activity-drawer'}`} aria-label={drawer === 'assistant' ? 'Assistant' : 'Activity'}>
+          <header className="workbench-drawer-heading"><div><strong>{drawer === 'assistant' ? 'Assistant' : 'Activity'}</strong><span>{selectedSession ? sessionTitle(selectedSession) : 'No project selected'}</span></div><button className="icon-button" onClick={() => setDrawer(null)} aria-label={`Close ${drawer}`}><X size={18} /></button></header>
+          {drawer === 'assistant' ? <>
+            <div className="assistant-scope" aria-label="Assistant scope">
+              <span>Work on</span><div role="group" aria-label="Request scope">
+                <button aria-pressed={assistantScope === 'film'} onClick={() => setAssistantScope('film')}>Whole film</button>
+                <button aria-pressed={assistantScope === 'shot'} onClick={() => setAssistantScope('shot')} disabled={!selection} title={selection ? `${selection.root} · ${selection.slot}` : 'Select a shot in Film first'}>Selected shot</button>
+              </div>
+              <small>{assistantScope === 'shot' ? selection?.label || 'No shot selected — choose a shot or Whole film' : 'Story, structure, and film-wide changes'}</small>
+            </div>
+            <div className="conversation" ref={scrollRef}>
+              {historyLoading === selectedSessionId && selectedSessionId && <p className="assistant-loading" role="status">Loading conversation…</p>}
+              {!assistantMessages.length && <div className="assistant-intro"><MessageSquare size={23} /><h2>{selectedSessionId ? 'A creative partner, on request' : 'Create a project to begin'}</h2><p>{selectedSessionId ? 'Describe an idea, ask for a revision, or select a shot to keep the request focused. Nothing runs until you send.' : 'Keep your script, shots, and conversation together in a project.'}</p>{selectedSessionId ? <button onClick={openPlanningAssistant}>Draft a planning request</button> : <button onClick={openNewProjectDialog}>Create project</button>}</div>}
+              <div className="message-stream">{assistantMessages.map((message) => <MessageRow key={message.id} message={message} />)}{busy && <ThinkingRow messages={chat.messages} />}</div>
+            </div>
+            <div className="composer-zone">
+              {showSlashCommands && <SlashCommandMenu matches={slashMatches} contextPercent={contextPercent} onSelect={(command) => {setDraft(command); textareaRef.current?.focus();}} />}
+              <div className={`composer ${busy ? 'is-busy' : ''}`}>
+                <textarea ref={textareaRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
+                  if (event.key === 'Tab' && slashMatches[0]) {event.preventDefault(); setDraft(slashMatches[0].name); return;}
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {event.preventDefault(); void submit();}
+                }} placeholder={assistantScope === 'shot' ? 'What should change in this shot?' : 'Describe an idea or a film-wide change'} aria-label="Message ViMax" disabled={!selectedSessionId || busy} rows={2} />
+                {(workspaceUploads.length > 0 || uploadingFiles) && <div className="composer-attachments" aria-live="polite">
+                  {workspaceUploads.map((file) => <span className="composer-attachment" key={file.path} title={file.path}><FileText size={13} /><span>{file.name}</span><button type="button" onClick={() => setUploads((current) => ({...current, [selectedSessionId]: (current[selectedSessionId] || []).filter((item) => item.path !== file.path)}))} aria-label={`Remove ${file.name} from this message`}><X size={12} /></button></span>)}
+                  {uploadingFiles && <span className="composer-uploading">Uploading…</span>}
+                </div>}
+                <div className="composer-controls">
+                  <input ref={fileInputRef} className="composer-file-input" type="file" multiple onChange={(event) => void uploadFiles(event.currentTarget.files)} tabIndex={-1} />
+                  <button type="button" className="composer-add" onClick={() => fileInputRef.current?.click()} disabled={!selectedSessionId || Boolean(uploadingSession) || busy} aria-label="Upload files to workspace" title="Upload reference files"><Plus size={19} /></button>
+                  <span className="assistant-composer-hint">{assistantScope === 'shot' ? 'Selected shot' : 'Whole film'}</span><div className="composer-spacer" />
+                  {busy ? <button className="send-button stop" onClick={() => void stop()} aria-label="Stop generation"><CircleStop size={18} /></button> : <button className="send-button" onClick={() => void submit()} disabled={!selectedSessionId || !draft.trim() || uploadingFiles || assistantScope === 'shot' && !selection} aria-label="Send message"><ArrowUp size={19} /></button>}
+                </div>
+              </div>
+              <small className="assistant-draft-note">Drafts stay with their project.</small>
+            </div>
+          </> : <div className="workbench-activity-content">
+            <div className="workbench-activity-summary"><span>{busy ? 'Working' : film.progress?.agentRunning && film.progress.activeSessionId === selectedSessionId ? 'Agent connected' : 'No active request'}</span>{(busy || film.progress?.agentRunning && film.progress.activeSessionId === selectedSessionId) && <button onClick={() => void stop()}><CircleStop size={14} />Stop</button>}</div>
+            {historyLoading === selectedSessionId && selectedSessionId && <p role="status">Loading activity…</p>}
+            {activityMessages.map((message) => <MessageRow key={message.id} message={message} />)}
+            {!activityMessages.length && !film.progress?.trail && <p className="assistant-loading">Planning and generation activity will appear here.</p>}
+            {film.progress?.trail && <details className="activity-render-trail"><summary>Render log</summary><pre>{film.progress.trail}</pre></details>}
+          </div>}
+        </aside>}
+      </div>
+      {utility && <div className="workbench-utility-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setUtility(null)}>
+        <section className="workbench-utility-panel" role="dialog" aria-modal="true" aria-label={utility === 'project' ? 'Project details' : 'Settings'}>
+          <div className="workbench-utility-heading"><strong>{utility === 'project' ? 'Project details' : 'Settings'}</strong>{utility === 'project' && selectedSession && <button className="workbench-delete" onClick={() => setPendingDelete(selectedSession)}><Trash2 size={14} />Delete project</button>}<button className="icon-button" onClick={() => setUtility(null)} aria-label="Close utility"><X size={18} /></button></div>
+          {utility === 'project' ? <ProjectView key={selectedSessionId} sessionId={selectedSessionId} onChanged={() => {
+            void refreshSessions().catch((error) => setLoadError(String(error)));
+            void film.refresh().catch((error) => setLoadError(String(error)));
+            film.wake();
+          }} /> : <SettingsView />}
+        </section>
+      </div>}
+      <DeleteProjectDialog session={pendingDelete} deleting={deleting} onCancel={() => !deleting && setPendingDelete(undefined)} onConfirm={() => void confirmDelete()} />
+      <NewProjectDialog open={newProjectOpen} name={newProjectName} style={newProjectStyle} requirement={newProjectRequirement} error={newProjectError} creating={creatingProject}
+        onNameChange={(value) => {setNewProjectName(value); setNewProjectError('');}} onStyleChange={setNewProjectStyle} onRequirementChange={setNewProjectRequirement}
+        onCancel={() => {if (!creatingProject) {setNewProjectOpen(false); setNewProjectError('');}}} onConfirm={() => void newProject()} />
+    </div>
   );
 }
 
@@ -757,6 +678,16 @@ function SettingsView() {
     } : current);
   }
 
+  function selectVideoProvider(provider: string) {
+    const preset = videoProviderPreset(provider);
+    update('video', 'provider', provider);
+    if (preset) {
+      update('video', 'base_url', preset.baseUrl);
+      update('video', 'model', preset.defaultModel);
+      update('video', 'resolution', preset.resolution);
+    }
+  }
+
   async function save() {
     if (!config || saving) return;
     setSaving(true);
@@ -790,7 +721,7 @@ function SettingsView() {
             key={definition.key}
             definition={definition}
             value={config.sections[definition.key]}
-            onChange={(field, value) => update(definition.key, field, value)}
+            onChange={(field, value) => definition.key === 'video' && field === 'provider' ? selectVideoProvider(value) : update(definition.key, field, value)}
           />
         ))}
       </div>
@@ -799,7 +730,7 @@ function SettingsView() {
 }
 
 function ConfigSectionEditor({definition, value, onChange}: {
-  definition: {title: string; description: string};
+  definition: {key: keyof AgentConfig['sections']; title: string; description: string};
   value: ConfigSection;
   onChange: (field: keyof ConfigSection, value: string) => void;
 }) {
@@ -811,7 +742,36 @@ function ConfigSectionEditor({definition, value, onChange}: {
           <label><span>Model provider</span><input value={value.model_provider} onChange={(event) => onChange('model_provider', event.target.value)} /></label>
         )}
         <label><span>Model</span><input value={value.model} onChange={(event) => onChange('model', event.target.value)} /></label>
+        {definition.key === 'video' && (
+          <label><span>Provider</span>
+            <select value={value.provider || 'openrouter'} onChange={(event) => onChange('provider', event.target.value)}>
+              <option value="openrouter">OpenRouter</option><option value="yunwu">Yunwu</option>
+              <option value="agnes">Agnes AI</option><option value="ltx">LTX</option>
+            </select>
+          </label>
+        )}
         <label className="config-field-wide"><span>Base URL</span><input value={value.base_url} onChange={(event) => onChange('base_url', event.target.value)} inputMode="url" /></label>
+        {definition.key === 'video' && (
+          <>
+            {value.provider !== 'yunwu' && (
+              <>
+                <label><span>Resolution</span>
+                  <select value={value.resolution || (value.provider === 'ltx' ? '1080p' : '720p')} onChange={(event) => onChange('resolution', event.target.value)}>
+                    {(value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p']).map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
+                  </select>
+                </label>
+                <label><span>Clip duration (seconds)</span><input type="number" min={value.provider === 'agnes' ? 4 : value.provider === 'ltx' ? 6 : 1} max={value.provider === 'agnes' ? 12 : 20} value={value.clip_seconds || value.effective_clip_seconds || '8'} onChange={(event) => onChange('clip_seconds', event.target.value)} /></label>
+              </>
+            )}
+            {value.provider !== 'agnes' && value.provider !== 'yunwu' && (
+              <label><span>Generate audio</span>
+                <select value={value.generate_audio || 'true'} onChange={(event) => onChange('generate_audio', event.target.value)}>
+                  <option value="true">On</option><option value="false">Off</option>
+                </select>
+              </label>
+            )}
+</>
+        )}
         <label className="config-field-wide">
           <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? 'Configured' : 'Not configured'}</i></span>
           <input type="password" value={value.api_key} onChange={(event) => onChange('api_key', event.target.value)} placeholder={value.has_api_key ? 'Leave blank to keep current key' : 'Enter API key'} autoComplete="off" />
@@ -1172,14 +1132,3 @@ function stageLabel(stage: string) {
   return labels[stage] || humanize(stage || 'Created');
 }
 
-function relativeTime(value: string) {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return 'Recently';
-  const delta = Math.max(0, Date.now() - timestamp);
-  const minutes = Math.floor(delta / 60_000);
-  if (minutes < 1) return 'Now';
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
-}

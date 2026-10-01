@@ -14,6 +14,9 @@ DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 DEFAULT_IMAGE_BASE_URL = "https://yunwu.ai"
 DEFAULT_VIDEO_MODEL = "veo3.1-fast"
 DEFAULT_VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_VIDEO_PROVIDER = "openrouter"
+DEFAULT_VIDEO_RESOLUTION = "720p"
+DEFAULT_VIDEO_GENERATE_AUDIO = True
 # Eight seconds is the shortest length that carries a spoken line without rushing it.
 DEFAULT_VIDEO_CLIP_SECONDS = 8
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -138,20 +141,41 @@ def video_api_key(workspace_root: str | Path = ".") -> str:
     return config_value("video", "api_key", ["VIMAX_VIDEO_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
 
 
+def video_resolution(workspace_root: str | Path = ".") -> str:
+    return config_value("video", "resolution", ["VIMAX_OPENROUTER_VIDEO_RESOLUTION"], DEFAULT_VIDEO_RESOLUTION, workspace_root)
+
+
+def video_generate_audio(workspace_root: str | Path = ".") -> bool:
+    value = load_agent_config(workspace_root).get("video", {})
+    if isinstance(value, dict):
+        configured = value.get("generate_audio")
+        if isinstance(configured, bool):
+            return configured
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.environ.get("VIMAX_OPENROUTER_GENERATE_AUDIO")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return DEFAULT_VIDEO_GENERATE_AUDIO
+
+
 def api_provider_from_base_url(base_url: str) -> str:
     normalized = base_url.strip().lower()
     if "openrouter.ai" in normalized:
         return "openrouter"
     if "yunwu.ai" in normalized:
         return "yunwu"
+    if "agnes-ai.com" in normalized:
+        return "agnes"
+    if "ltx.io" in normalized:
+        return "ltx"
     return ""
 
 
 def video_provider(workspace_root: str | Path = ".") -> str:
-    """Infer the video API relay/provider from video.base_url.
+    """Choose a video API adapter from explicit provider or configured base URL."""
+    value = load_agent_config(workspace_root).get("video", {})
+    configured = value.get("provider", "") if isinstance(value, dict) else ""
+    return str(configured or api_provider_from_base_url(video_base_url(workspace_root))).strip().lower()
 
-    This is not a model provider setting. OpenRouter/Yunwu are transport/API
-    gateways here, so users should configure base_url and let the adapter pick
-    the matching implementation.
-    """
-    return api_provider_from_base_url(video_base_url(workspace_root))
+

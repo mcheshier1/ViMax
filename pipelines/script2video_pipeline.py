@@ -57,6 +57,11 @@ def _pipeline_print(quiet: bool, message: str) -> None:
     if not quiet:
         print(message)
 
+def _file_signature(path: str) -> Dict[str, int]:
+    stat = os.stat(path)
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 
 def _emit_text_plan_progress(progress, stage: str, message: str, metadata: Dict[str, Any] | None = None) -> None:
     if progress is not None:
@@ -107,27 +112,18 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         self.frame_events = {}
         # Set from the video model's catalogue at render start; assumed until then.
         self.frame_bracketing = True
-        # What a render has already drawn a video for: one video per render, clips and
-        # transitions both, because a video costs many times a frame (see `_claim_video`).
-        self._video_drawn_by = ""
-        # Shots whose frames this render is not drawing, because the transition video that
-        # would have produced them was deferred past the one-video rule.
+        # One clip/transition video per outer render. Idea mode passes this mutable
+        # allowance to each scene; flat renders keep their own mapping.
+        self.video_budget: Dict[str, str] = {}
         self._deferred_frame_shots: set[int] = set()
 
     def _claim_video(self, what: str) -> bool:
-        """Whether this render may draw a video, recording what it is for.
-
-        A clip costs many times a keyframe, and a render that names no shots is how a batch
-        nobody chose gets bought: nine clips went out in one run of this sequence. A
-        transition video is a paid clip too, drawn while stills are rendered, so a stills
-        pass over two parented cameras billed two of them without saying so. The first
-        caller to ask draws it; every other caller is told no and reports what it is
-        leaving for the next render.
-        """
-        if self._video_drawn_by:
+        """Claim the single paid-video allowance shared by an outer render."""
+        if self.video_budget.get("claimed_by"):
             return False
-        self._video_drawn_by = what
+        self.video_budget["claimed_by"] = what
         return True
+
 
     def reference_image_limit(self) -> Optional[int]:
         """Reference images the image model accepts, or ``None`` when unbounded.
@@ -195,7 +191,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         self.character_portrait_events = {}
         self.shot_desc_events = {}
         self.frame_events = {}
-        self._video_drawn_by = ""
         self._deferred_frame_shots = set()
 
         if characters is None:
@@ -279,13 +274,14 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         stop_after: str = DEFAULT_RENDER_PHASE,
         revision_notes: Dict[str, str] | None = None,
         only_shots: Optional[List[int]] = None,
+        video_budget: Optional[Dict[str, str]] = None,
     ) -> RenderOutcome:
         stop_after = normalize_phase(stop_after)
+        self.video_budget = video_budget if video_budget is not None else {}
+        self._deferred_frame_shots = set()
         # A redo names shots, and a run works on those shots: the stills of the others are left
         # for their own turn rather than drawn because a phase run was the easier way to ask.
-        only_set = {int(idx) for idx in only_shots} if only_shots else None
-        # What a human said was wrong with the shots being redrawn, by shot. A redraw
-        # without it repeats the mistake the note describes.
+        only_set = {int(idx) for idx in only_shots} if only_shots is not None else None
         self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
         _emit_render_progress(progress, "render_start", "Starting script2video render", {"stop_after": stop_after})
         self.frame_bracketing = await self._brackets_clips()
@@ -293,17 +289,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
             characters = await self.extract_characters(script=script, quiet=quiet)
 
-            # characters_path = os.path.join(self.working_dir, "characters.json")
-            # if os.path.exists(characters_path):
-            #     with open(characters_path, "r", encoding="utf-8") as f:
-            #         characters = [CharacterInScene.model_validate(c) for c in json.load(f)]
-            #     print(f"🚀 Loaded {len(characters)} characters from existing file.")
-            # else:
-            #     print(f"🔍 Extracting characters from script...")
-            #     characters = await self.extract_characters(script=script)
-            #     with open(characters_path, "w", encoding="utf-8") as f:
-            #         json.dump([c.model_dump() for c in characters], f, ensure_ascii=False, indent=4)
-            #     print(f"☑️ Extracted {len(characters)} characters from script and saved to {characters_path}.")
         else:
             characters = _normalize_model_list(characters, CharacterInScene, "characters")
             _emit_render_progress(progress, "extract_characters", "Using provided characters for render", {"provided": True, "count": len(characters)})
@@ -390,69 +375,96 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 progress=progress,
                 only_shots=only_shots,
             )
-            for camera in camera_tree
+            for camera in sorted(camera_tree, key=lambda item: item.idx)
             # A camera holding none of the named shots has nothing to draw: its cached frames
             # still serve as references, and redrawing them is not what was asked for.
             if only_set is None or only_set & set(camera.active_shot_idxs)
         ]
 
-        # Keyframes decide the look of the finished video and are the expensive part
-        # to get wrong, so the stills phase hands them back for review before any
-        # video generation is paid for.
         if stop_after == "stills":
             await asyncio.gather(*tasks)
-            stills = self._frame_stills(shot_descriptions)
+            ordered_shots = self._ordered_active_shots(camera_tree, shot_descriptions)
+            stills = self._frame_stills(ordered_shots)
             _emit_render_progress(
                 progress,
                 "stills_ready",
                 "Keyframes ready for review",
-                {"shot_count": len(shot_descriptions), "still_count": len(stills), "awaiting_confirmation": "video"},
+                {"shot_count": len(ordered_shots), "still_count": len(stills), "awaiting_confirmation": "video"},
             )
             return self.render_outcome("stills", style, stills=stills, awaiting="video")
 
-        _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
-        # One clip per render, always. A clip costs many times a frame, and a whole-film
-        # pass is how a batch nobody chose gets bought: nine clips went out in a single run
-        # of this sequence. The clip drawn is the first the film is missing, so the sequence
-        # fills from the front, and every other missing clip is named below and drawn when
-        # it is asked for. A redo names one shot, so it is a single clip already.
-        wanted_clips = [
-            shot_description
-            for shot_description in shot_descriptions
-            if (only_set is None or shot_description.idx in only_set)
-            and not os.path.exists(self.clip_path(shot_description.idx))
-            # A camera whose frames this run is not drawing has nothing to animate, and
-            # waiting on a frame that is never drawn would hang here instead of deferring.
-            and shot_description.idx not in self._deferred_frame_shots
+        # Finish all frame work first: a transition may own the shared video
+        # allowance, and a child whose transition was deferred has no frame
+        # event for a clip task to await.
+        await asyncio.gather(*tasks)
+
+        ordered_shots = self._ordered_active_shots(camera_tree, shot_descriptions)
+        final_video_path = os.path.join(self.working_dir, "final_video.mp4")
+        assembly_metadata_path = final_video_path + ".inputs.json"
+        active_order = [shot.idx for shot in ordered_shots]
+        if not active_order:
+            for path in (final_video_path, assembly_metadata_path):
+                if os.path.isfile(path):
+                    os.remove(path)
+            _emit_render_progress(progress, "concat_skipped", "There are no active shots to assemble", {"shot_count": 0})
+            _emit_render_progress(
+                progress, "render_done", "Script2video render complete", {"final_video_path": None, "phase": "video"}
+            )
+            return self.render_outcome("video", style, final_video_path="")
+
+
+        eligible_clips = [
+            shot
+            for shot in ordered_shots
+            if (only_set is None or shot.idx in only_set)
+            and not os.path.isfile(self.clip_path(shot.idx))
+            and shot.idx not in self._deferred_frame_shots
+            and os.path.isfile(self.frame_path(shot.idx, "first_frame"))
+            and (not self.frame_bracketing or os.path.isfile(self.frame_path(shot.idx, "last_frame")))
         ]
-        video_tasks = []
-        if wanted_clips and self._claim_video(f"the clip of shot {wanted_clips[0].idx}"):
-            # The clip drawn is the first the film is missing, so the sequence fills from the
-            # front; a redo names one shot, so it is a single clip already.
-            video_tasks = [
-                self.generate_video_for_single_shot(shot_description=wanted_clips[0], progress=progress)
-            ]
-        deferred_clips = [shot_description.idx for shot_description in wanted_clips[len(video_tasks):]]
+        frame_blocked_clips = [
+            shot.idx
+            for shot in ordered_shots
+            if (only_set is None or shot.idx in only_set)
+            and not os.path.isfile(self.clip_path(shot.idx))
+            and shot.idx not in self._deferred_frame_shots
+            and (
+                not os.path.isfile(self.frame_path(shot.idx, "first_frame"))
+                or (self.frame_bracketing and not os.path.isfile(self.frame_path(shot.idx, "last_frame")))
+            )
+        ]
+        if frame_blocked_clips:
+            _emit_render_progress(
+                progress,
+                "video_clips_waiting_for_frames",
+                "Some clips remain deferred because their required frames are unavailable",
+                {"deferred_clips": [str(idx) for idx in frame_blocked_clips]},
+            )
+        clip_claimed = bool(eligible_clips) and self._claim_video(f"the clip of shot {eligible_clips[0].idx}")
+        if clip_claimed:
+            if os.path.isfile(final_video_path):
+                os.remove(final_video_path)
+            if os.path.isfile(assembly_metadata_path):
+                os.remove(assembly_metadata_path)
+            await self.generate_video_for_single_shot(shot_description=eligible_clips[0], progress=progress)
+        deferred_clips = eligible_clips[1:] if clip_claimed else eligible_clips
         if deferred_clips:
             _emit_render_progress(
                 progress,
                 "video_clips_deferred",
                 f"One video is drawn per render: {len(deferred_clips)} more clip(s) are waiting for their own turn",
-                {"deferred_clips": [str(idx) for idx in deferred_clips]},
+                {"deferred_clips": [str(shot.idx) for shot in deferred_clips]},
             )
-        tasks.extend(video_tasks)
-        await asyncio.gather(*tasks)
 
         missing_clips = [
             shot_description.idx
-            for shot_description in shot_descriptions
-            if not os.path.exists(self.clip_path(shot_description.idx))
+            for shot_description in ordered_shots
+            if not os.path.isfile(self.clip_path(shot_description.idx))
         ]
-        final_video_path = os.path.join(self.working_dir, "final_video.mp4")
         if missing_clips:
-            # A re-run renders only the clips that are missing, so working a shot at a time is
-            # a normal way to work — and the film cannot be built until every shot has one.
-            # Building it anyway would fail on a clip nobody asked for yet.
+            for path in (final_video_path, assembly_metadata_path):
+                if os.path.isfile(path):
+                    os.remove(path)
             _emit_render_progress(
                 progress,
                 "concat_skipped",
@@ -463,23 +475,58 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 progress, "render_done", "Script2video render complete", {"final_video_path": None, "phase": "video"}
             )
             return self.render_outcome("video", style, final_video_path="")
-        if os.path.exists(final_video_path):
-            print(f"🚀 Skipped concatenating videos, already exists.")
-            _emit_render_progress(progress, "final_video_exists", "Final video already exists", {"path": final_video_path})
+
+        assembly_inputs = {
+            "version": 1,
+            "active_shot_idxs": active_order,
+            "clips": [
+                {"shot_idx": shot.idx, **_file_signature(self.clip_path(shot.idx))}
+                for shot in ordered_shots
+            ],
+        }
+        cache_matches = False
+        if os.path.isfile(final_video_path):
+            try:
+                with open(assembly_metadata_path, "r", encoding="utf-8") as metadata_file:
+                    cache_matches = json.load(metadata_file) == assembly_inputs
+            except (OSError, ValueError, TypeError):
+                pass
+        if os.path.isfile(final_video_path) and not cache_matches:
+            os.remove(final_video_path)
+        if not cache_matches and os.path.isfile(assembly_metadata_path):
+            os.remove(assembly_metadata_path)
+
+        if os.path.isfile(final_video_path):
+            print(f"🚀 Skipped concatenating videos, cached inputs are unchanged.")
+            _emit_render_progress(progress, "final_video_exists", "Final video already exists for the active inputs", {"path": final_video_path})
         else:
             print(f"🎬 Starting concatenating videos...")
-            _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(shot_descriptions)})
+            _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(ordered_shots)})
             video_clips = [
                 VideoFileClip(self.clip_path(shot_description.idx))
-                for shot_description in shot_descriptions
+                for shot_description in ordered_shots
             ]
             final_video = concatenate_videoclips(video_clips)
             final_video.write_videofile(final_video_path, codec="libx264", preset="medium")
+            with open(assembly_metadata_path, "w", encoding="utf-8") as metadata_file:
+                json.dump(assembly_inputs, metadata_file, ensure_ascii=False, indent=2)
             print(f"☑️ Concatenated videos, saved to {final_video_path}.")
             _emit_render_progress(progress, "concat_done", "Final video concatenated", {"path": final_video_path})
 
         _emit_render_progress(progress, "render_done", "Script2video render complete", {"final_video_path": final_video_path, "phase": "video"})
         return self.render_outcome("video", style, final_video_path=final_video_path)
+
+    @staticmethod
+    def _ordered_active_shots(camera_tree: List[Camera], shot_descriptions: List[ShotDescription]) -> List[ShotDescription]:
+        """Resolve playback order from camera order and each camera's stored shot order."""
+        by_idx = {shot.idx: shot for shot in shot_descriptions}
+        return [
+            by_idx[shot_idx]
+            for camera in sorted(camera_tree, key=lambda item: item.idx)
+            for shot_idx in camera.active_shot_idxs
+            if shot_idx in by_idx
+        ]
+
 
 
     async def generate_frames_for_single_camera(
@@ -497,11 +544,17 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             # nothing to play — and the shots that were in it are kept under .removed_shots/,
             # so this is a hole in the plan rather than lost work.
             return
-        wanted = {int(idx) for idx in only_shots} if only_shots else None
-        # 1. generate the first_frame of the first shot of the camera
+        wanted = {int(idx) for idx in only_shots} if only_shots is not None else None
         first_shot_idx = camera.active_shot_idxs[0]
         by_idx = self._descriptions_by_idx(shot_descriptions)
         first_shot_ff_path = self.frame_path(first_shot_idx, "first_frame")
+        if os.path.exists(first_shot_ff_path):
+            self.frame_events[first_shot_idx]["first_frame"].set()
+        elif wanted is not None and first_shot_idx not in wanted:
+            raise RuntimeError(
+                f"Cannot render scoped shot(s) {sorted(wanted)} in camera {camera.idx}: "
+                f"required first frame for excluded shot {first_shot_idx} is missing"
+            )
         _emit_render_progress(progress, "camera_frames_start", f"Generating frames for camera {camera.idx}", {"camera_idx": camera.idx, "active_shot_idxs": camera.active_shot_idxs})
 
         if os.path.exists(first_shot_ff_path):
@@ -521,10 +574,18 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             
             # generate the first_frame based on the shot_description.ff_desc
             if camera.parent_shot_idx is not None:
-                # generate the first_frame based on the transition video
                 parent_shot_idx = camera.parent_shot_idx
-                await self.frame_events[parent_shot_idx]["first_frame"].wait()
-                parent_shot_ff_path = self.frame_path(parent_shot_idx, "first_frame")
+                parent_event = self.frame_events[parent_shot_idx]["first_frame"]
+                parent_frame_path = self.frame_path(parent_shot_idx, "first_frame")
+                if os.path.exists(parent_frame_path):
+                    parent_event.set()
+                elif wanted is not None and parent_shot_idx not in wanted:
+                    raise RuntimeError(
+                        f"Cannot render scoped shot {first_shot_idx}: required parent frame "
+                        f"for excluded shot {parent_shot_idx} is missing"
+                    )
+                await parent_event.wait()
+                parent_shot_ff_path = parent_frame_path
                 transition_video_path = os.path.join(self.shot_video_dir(first_shot_idx), f"transition_video_from_shot_{parent_shot_idx}.mp4")
 
                 if os.path.exists(transition_video_path):
@@ -532,8 +593,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                     _emit_render_progress(progress, "transition_video_exists", f"Transition video for shot {first_shot_idx} already exists", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx, "path": transition_video_path})
                 else:
                     if not self._claim_video(f"the transition into shot {first_shot_idx}"):
-                        # This camera's frames come from that transition, so none of them are
-                        # drawn this run — and the clip phase must not wait on them.
                         self._deferred_frame_shots.update(camera.active_shot_idxs)
                         _emit_render_progress(progress, "transition_video_deferred", f"One video is drawn per render: the transition into shot {first_shot_idx} waits for its own turn", {"shot_idx": first_shot_idx, "parent_shot_idx": parent_shot_idx, "camera_idx": camera.idx})
                         return
@@ -569,7 +628,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                         f"The composition and background are correct but some elements may be wrong. The wrong elements should be replaced.\nWrong elements: {camera.missing_info}.\nYou must select this image as the main reference and replace the characters in the image with the provided character portraits. Don't change the background."
                     )
                 )
-
 
             # 如果子镜头缺少信息，则需要选择参考图像生成
             # A shot being redrawn goes through the same path as one the plan calls
@@ -1317,5 +1375,8 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             "first_frame": asyncio.Event(),
             "last_frame": asyncio.Event(),
         }
+        for frame_type in ("first_frame", "last_frame"):
+            if os.path.exists(self.frame_path(shot_brief_description.idx, frame_type)):
+                self.frame_events[shot_brief_description.idx][frame_type].set()
 
         return shot_description

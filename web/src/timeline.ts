@@ -247,6 +247,11 @@ export function rejections(stages: AcceptanceStage[]): Rejection[] {
     .map((slot) => ({title: slotTitle(stage.stage, slot), reason: (slot.reason || '').trim(), shot: slotKey(slot), stage: stage.stage})));
 }
 
+/** Rejections that can be sent to the shot-scoped redraw tool. */
+export function redoableRejections(items: Rejection[]): Rejection[] {
+  return items.filter((item) => REDOABLE_STAGES.has(item.stage) && item.shot.trim().length > 0);
+}
+
 /**
  * The instruction that turns typed guidance into a redraw. The reasons are quoted
  * verbatim: they are the user's words about what went wrong, and the point of recording
@@ -254,12 +259,13 @@ export function rejections(stages: AcceptanceStage[]): Rejection[] {
  * named explicitly so a redraw cannot quietly spread into shots nobody asked about.
  */
 export function redoRequestText(items: Rejection[], root = ''): string {
-  if (items.length === 0) return '';
-  const stages = [...new Set(items.map((item) => item.stage))];
+  const redoable = redoableRejections(items);
+  if (redoable.length === 0) return '';
+  const stages = [...new Set(redoable.map((item) => item.stage))];
   const phase = redoOrderedPhase(stages);
   // The slot key is stated beside the name on the card: the Timeline numbers shots from
   // one and the keys are shot directories numbered from zero, so "Shot 3" is slot "2".
-  const lines = items.map((item) => `- ${item.title} (slot key "${item.shot}"): ${item.reason || 'no reason given'}`);
+  const lines = redoable.map((item) => `- ${item.title} (slot key "${item.shot}"): ${item.reason || 'no reason given'}`);
   return [
     `Redraw exactly these shots${root ? ` in ${root}` : ''} in ${phase}, and no others:`,
     ...lines,
@@ -267,9 +273,9 @@ export function redoRequestText(items: Rejection[], root = ''): string {
     // A redraw asked for from a card names the slot itself, so the guard that exists to stop a
     // person confusing the card's "Shot 3" with slot 3 has nothing to protect here — and it has
     // been refusing an honest redraw because some *other* shot carries a rejection note.
-    `Run vimax_render_video with exactly these arguments and no others: ${root ? `render_mode="${root}", ` : ''}${redoArgument(items)}, stop_after="${phase}", allow_unreviewed_redo=true.`,
+    `Run vimax_render_video with exactly these arguments and no others: ${root ? `render_mode="${root}", ` : ''}${redoArgument(redoable)}, stop_after="${phase}", allow_unreviewed_redo=true.`,
     `The render clears those shots\' artifacts and puts each note into the prompt it redraws from, so state the problem in your own words above if the note is thin.`,
-    'Every other shot and every accepted artifact stays as it is, and the redraw comes back for review before any clip is rendered.',
+    `Every other shot and every accepted artifact stays as it is. Return the ${phase} outputs for review; do not begin another generation phase.`,
     'Do not change render_mode: a redraw never moves the sequence to another root.',
   ].join('\n');
 }
@@ -292,7 +298,7 @@ export function redoOneText(root: string, stage: string, slot: AcceptanceSlot, n
 
 /** `redo_shots=["2"]`, the explicit form of the same request. */
 export function redoArgument(items: Rejection[]): string {
-  return `redo_shots=[${items.map((item) => JSON.stringify(item.shot)).join(', ')}]`;
+  return `redo_shots=[${redoableRejections(items).map((item) => JSON.stringify(item.shot)).join(', ')}]`;
 }
 
 /**
@@ -367,14 +373,14 @@ export function failedRedraw(events: unknown): RenderFailure | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const row = events[index];
     if (!isStatus(row)) continue;
+    if (row.status === 'dependency_missing' || row.error_type === 'dependency_missing') return null;
     if (row.status === 'error') {
       const slots = Array.isArray(row.redone_shots) ? row.redone_shots.map(String) : [];
       const reason = String(row.error || row.error_type || 'the render gave no reason').trim();
       return {stage: String(row.phase || '') === 'video' ? 'clips' : 'keyframes', slots, reason: reason.length > 300 ? `${reason.slice(0, 300)}…` : reason};
     }
-    // Anything else that ends a render means this failure is not the newest word.
-    if (row.status === 'rendered' || row.awaiting_confirmation) return null;
-    if (Array.isArray(row.redone_shots) && row.redone_shots.length) return null;
+    // Older producers/history rows start a redraw by naming its shots, without render_started.
+    if (row.render_started || (row.status === 'rendering' && Array.isArray(row.redone_shots) && row.redone_shots.length > 0) || row.status === 'rendered' || row.awaiting_confirmation) return null;
   }
   return null;
 }
@@ -392,8 +398,13 @@ export function activeRedraw(events: unknown): Redraw | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const row = events[index];
     if (!isStatus(row)) continue;
-    if (row.status === 'error' || row.status === 'rendered' || row.awaiting_confirmation) return null;
+    if (row.status === 'error' || row.status === 'rendered' || row.status === 'dependency_missing' || row.error_type === 'dependency_missing' || row.awaiting_confirmation) return null;
     const slots = row.redone_shots;
+    if (row.render_started) {
+      return Array.isArray(slots) && slots.length
+        ? {stage: String(row.phase || '') === 'video' ? 'clips' : 'keyframes', slots: slots.map(String)}
+        : null;
+    }
     if (Array.isArray(slots) && slots.length) {
       return {stage: String(row.phase || '') === 'video' ? 'clips' : 'keyframes', slots: slots.map(String)};
     }
@@ -419,7 +430,7 @@ export function askedRenderFinished(events: unknown, askedAt: number): boolean {
     if (!isStatus(row)) continue;
     const at = Date.parse(String(row.timestamp || ''));
     if (Number.isNaN(at) || at < askedAt) continue;
-    if (row.status === 'error' || row.status === 'rendered' || row.awaiting_confirmation) return true;
+    if (row.status === 'error' || row.status === 'rendered' || row.status === 'dependency_missing' || row.error_type === 'dependency_missing' || row.awaiting_confirmation) return true;
   }
   return false;
 }

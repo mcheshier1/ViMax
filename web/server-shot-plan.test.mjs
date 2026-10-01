@@ -2,14 +2,31 @@ import {existsSync} from 'node:fs';
 import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {afterEach, describe, expect, it} from 'vitest';
-import {createShot, readRemovedShots, readShotPlan, removeShot, restoreShot, updateShotPlan} from './server-lib.mjs';
+import {afterEach, describe, expect, it, vi} from 'vitest';
+import {createShot, readRemovedShots, readShotPlan, readRenderAcceptance, removeShot, restoreShot, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
 
+const storageTestControl = vi.hoisted(() => ({failAcceptanceWrite: false}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    writeFile: (filePath, ...args) => {
+      const target = String(filePath);
+      if (storageTestControl.failAcceptanceWrite && target.includes('.render_acceptance.json.') && target.endsWith('.tmp')) {
+        const error = new Error('injected acceptance metadata failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      return actual.writeFile(filePath, ...args);
+    },
+  };
+});
 const roots = [];
 const SESSION_ID = 'session-1';
 const ROOT = 'script2video';
 
 afterEach(async () => {
+  storageTestControl.failAcceptanceWrite = false;
   await Promise.all(roots.splice(0).map((root) => rm(root, {recursive: true, force: true})));
 });
 
@@ -255,5 +272,74 @@ describe('adding and restoring shots', () => {
     expect(listed.removed.map((entry) => entry.slot)).toEqual(['4']);
     expect(listed.removed[0].hasBrief).toBe(true);
     await expect(restoreShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '9'})).rejects.toThrow(/has not been removed/);
+  });
+  it('restores adjacent removals to their original order and keeps one canonical ending', async () => {
+    const {root, working} = await fixture();
+    await withFilm(working, [0, 1, 2]);
+    await writeFile(path.join(working, ROOT, 'camera_tree.json'), JSON.stringify([
+      {idx: 0, active_shot_idxs: [0, 1, 2], parent_shot_idx: null},
+    ]));
+    const storyboardPath = path.join(working, ROOT, 'storyboard.json');
+    const storyboard = JSON.parse(await readFile(storyboardPath, 'utf8'));
+    await writeFile(storyboardPath, JSON.stringify(storyboard.map((row) => ({...row, is_last: row.idx === 2}))));
+    const endingPath = path.join(working, ROOT, 'shots', '2', 'shot_description.json');
+    const ending = JSON.parse(await readFile(endingPath, 'utf8'));
+    await writeFile(endingPath, JSON.stringify({...ending, is_last: true}));
+
+    await remove(root, '0');
+    await remove(root, '1');
+    await restoreShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '0'});
+    await restoreShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '1'});
+
+    const cameras = JSON.parse(await readFile(path.join(working, ROOT, 'camera_tree.json'), 'utf8'));
+    expect(cameras[0].active_shot_idxs).toEqual([0, 1, 2]);
+    const descriptions = await Promise.all([0, 1, 2].map((slot) => readFile(
+      path.join(working, ROOT, 'shots', String(slot), 'shot_description.json'), 'utf8',
+    ).then((text) => JSON.parse(text))));
+    expect(descriptions.filter((description) => description.is_last).map((description) => description.idx)).toEqual([2]);
+    const endingRows = JSON.parse(await readFile(storyboardPath, 'utf8')).filter((row) => row.is_last);
+    expect(endingRows.map((row) => row.idx)).toEqual([2]);
+  });
+
+  it('rejects a removed-directory collision without changing the live shot or timeline', async () => {
+    const {root, working} = await fixture();
+    await withFilm(working, [2, 4]);
+    const treePath = path.join(working, ROOT, 'camera_tree.json');
+    const storyboardPath = path.join(working, ROOT, 'storyboard.json');
+    const originalTree = await readFile(treePath, 'utf8');
+    const originalStoryboard = await readFile(storyboardPath, 'utf8');
+    const collision = path.join(working, ROOT, '.removed_shots', '4');
+    await mkdir(collision, {recursive: true});
+    await writeFile(path.join(collision, 'sentinel.txt'), 'kept');
+
+    await expect(remove(root, '4')).rejects.toThrow(/Destination already exists/);
+
+    expect(await readFile(treePath, 'utf8')).toBe(originalTree);
+    expect(await readFile(storyboardPath, 'utf8')).toBe(originalStoryboard);
+    expect(existsSync(path.join(working, ROOT, 'shots', '4'))).toBe(true);
+    expect(await readFile(path.join(collision, 'sentinel.txt'), 'utf8')).toBe('kept');
+  });
+
+  it('rolls back a removal when acceptance metadata cannot be replaced', async () => {
+    const {root, working} = await fixture();
+    await withFilm(working, [2, 4]);
+    await writeFile(path.join(working, ROOT, 'final_video.mp4'), 'old film');
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, stage: 'final_video', accepted: true});
+    const treePath = path.join(working, ROOT, 'camera_tree.json');
+    const storyboardPath = path.join(working, ROOT, 'storyboard.json');
+    const originalTree = await readFile(treePath, 'utf8');
+    const originalStoryboard = await readFile(storyboardPath, 'utf8');
+    storageTestControl.failAcceptanceWrite = true;
+
+    await expect(remove(root, '4')).rejects.toThrow(/injected acceptance metadata failure/);
+
+    storageTestControl.failAcceptanceWrite = false;
+    expect(await readFile(treePath, 'utf8')).toBe(originalTree);
+    expect(await readFile(storyboardPath, 'utf8')).toBe(originalStoryboard);
+    expect(existsSync(path.join(working, ROOT, 'shots', '4'))).toBe(true);
+    expect(existsSync(path.join(working, ROOT, '.removed_shots', '4'))).toBe(false);
+    expect(await readFile(path.join(working, ROOT, 'final_video.mp4'), 'utf8')).toBe('old film');
+    const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('accepted');
   });
 });

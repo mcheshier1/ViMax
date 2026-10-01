@@ -1,12 +1,34 @@
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
-import {lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile} from 'node:fs/promises';
+import {lstat, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {readClipSettings} from './config-store.mjs';
+import {withProjectWriteLock} from './project-lock.mjs';
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
 const TEXT_EXTENSIONS = new Set(['.txt', '.md', '.json']);
+
+// All memoization is scoped to one read. A later request must see external writers,
+// including same-size replacements whose approval checksum no longer matches.
+function memoizeRead(operation) {
+  const reads = new Map();
+  return (key) => {
+    if (!reads.has(key)) reads.set(key, operation(key));
+    return reads.get(key);
+  };
+}
+
+function createFilmReadContext() {
+  return {
+    entries: memoizeRead((directory) => readdir(directory, {withFileTypes: true})),
+    stat: memoizeRead(stat),
+    lstat: memoizeRead(lstat),
+    json: memoizeRead(readJsonOptional),
+    hash: memoizeRead(sha256File),
+    scenes: new Map(),
+  };
+}
 
 export async function readSessionState(repoRoot) {
   const fallback = {activeSessionId: '', sessions: []};
@@ -157,53 +179,53 @@ function displayUserInput(value) {
 }
 
 export async function listSessionArtifacts(repoRoot, sessionId) {
-  const sessionRoot = resolveSessionRoot(repoRoot, sessionId);
-  const artifacts = [];
+  return collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, createFilmReadContext());
+}
+
+async function collectSessionArtifacts(sessionRoot, sessionId, context, referenced = []) {
+  const artifacts = new Map();
+
+  async function add(absolute) {
+    if (!absolute.startsWith(`${sessionRoot}${path.sep}`) || artifacts.has(absolute)) return;
+    const name = path.basename(absolute);
+    const extension = path.extname(name).toLowerCase();
+    const kind = IMAGE_EXTENSIONS.has(extension) ? 'image'
+      : VIDEO_EXTENSIONS.has(extension) ? 'video'
+        : TEXT_EXTENSIONS.has(extension) ? 'document' : null;
+    if (!kind) return;
+    const info = await context.stat(absolute).catch(() => null);
+    if (!info?.isFile()) return;
+    const relativePath = relativeArtifactPath(sessionRoot, absolute);
+    artifacts.set(absolute, {
+      path: relativePath,
+      name,
+      kind,
+      size: info.size,
+      updatedAt: info.mtime.toISOString(),
+      url: `/api/artifact?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(relativePath)}`,
+    });
+  }
 
   async function walk(directory) {
-    let entries;
-    try {
-      entries = await readdir(directory, {withFileTypes: true});
-    } catch {
-      return;
-    }
+    const entries = await context.entries(directory).catch(() => []);
     for (const entry of entries) {
-      if (artifacts.length >= 400 || entry.name.startsWith('.')) continue;
+      if (artifacts.size >= 400) break;
+      if (entry.name.startsWith('.')) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) {
-        // `cache/` holds moviepy's scene-split debris from a transition render.
-        // It is scratch, fully represented by the transition video beside it, so
-        // it is not offered as a browsable artifact. Deletion still covers it
-        // (see collectStyleDerivedArtifacts), which walks for cleanup, not browsing.
-        if (entry.name === 'cache') continue;
-        await walk(absolute);
-        continue;
+        // Moviepy scratch debris is represented by the transition video beside it.
+        if (entry.name !== 'cache') await walk(absolute);
+      } else if (entry.isFile()) {
+        await add(absolute);
       }
-      if (!entry.isFile()) continue;
-      const extension = path.extname(entry.name).toLowerCase();
-      const kind = IMAGE_EXTENSIONS.has(extension)
-        ? 'image'
-        : VIDEO_EXTENSIONS.has(extension)
-          ? 'video'
-          : TEXT_EXTENSIONS.has(extension)
-            ? 'document'
-            : null;
-      if (!kind) continue;
-      const info = await stat(absolute);
-      const relativePath = path.relative(sessionRoot, absolute).split(path.sep).join('/');
-      artifacts.push({
-        path: relativePath,
-        name: entry.name,
-        kind,
-        size: info.size,
-        updatedAt: info.mtime.toISOString(),
-        url: `/api/artifact?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(relativePath)}`,
-      });
     }
   }
 
   await walk(sessionRoot);
-  return artifacts.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  // Browsing is bounded, but the film must never lose a preview because an unrelated
+  // folder filled that budget. These paths came from symlink-free stage discovery.
+  for (const absolute of referenced) await add(absolute);
+  return [...artifacts.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
 export async function readProjectMetadata(repoRoot, sessionId) {
@@ -439,10 +461,10 @@ async function projectMetadata(repoRoot, sessionId, record) {
   };
 }
 
-async function readRenderManifest(repoRoot, workingDir) {
+async function readRenderManifest(repoRoot, workingDir, context = createFilmReadContext()) {
   if (!workingDir) return null;
   try {
-    const manifest = JSON.parse(await readFile(path.resolve(repoRoot, workingDir, 'render_manifest.json'), 'utf8'));
+    const manifest = await context.json(path.resolve(repoRoot, workingDir, 'render_manifest.json'));
     return manifest && typeof manifest === 'object' && !Array.isArray(manifest) ? manifest : null;
   } catch {
     return null;
@@ -607,7 +629,125 @@ export async function readRenderAcceptance(repoRoot, sessionId, root = '') {
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
   if (!record) return null;
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
-  return acceptancePayload(repoRoot, workingDir, await resolveRenderRoot(repoRoot, workingDir, root));
+  const context = createFilmReadContext();
+  return acceptancePayload(repoRoot, workingDir, await resolveRenderRoot(repoRoot, workingDir, root, context), context);
+}
+
+/** One coherent read budget for the film, without re-entering mutation locks. */
+export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  const context = createFilmReadContext();
+  const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
+  const discovery = await collectAcceptanceState(workingDir, resolved, context);
+  const referenced = [
+    ...discovery.portraits,
+    ...discovery.finalVideo,
+    ...discovery.shots.flatMap((shot) => [...shot.keyframes, ...shot.clips]),
+  ].map((relative) => path.resolve(workingDir, relative));
+  const [acceptance, plans, removed, continuity, artifacts] = await Promise.all([
+    acceptancePayload(repoRoot, workingDir, resolved, context, discovery),
+    shotPlansPayload(workingDir, resolved, discovery, context),
+    listRemoved(workingDir, resolved, context),
+    continuityPayload(repoRoot, workingDir, resolved, record, context, discovery),
+    collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, context, referenced),
+  ]);
+  return {acceptance, plans, removed, continuity, artifacts};
+}
+
+const PROGRESS_READ_BYTES = 256 * 1024;
+const PROGRESS_TRAIL_ROWS = 128;
+
+/** Fast polling reads only bounded status/trail data and a fixed set of metadata. */
+export async function readFilmProgress(repoRoot, sessionId, root = '') {
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  const resolved = await resolveRenderRoot(repoRoot, workingDir, root);
+  const [statusFile, trailFile, watched] = await Promise.all([
+    readProgressFile(path.join(workingDir, 'render_status.json')),
+    readProgressFile(path.join(workingDir, 'render_events.jsonl'), true),
+    Promise.all(['render_manifest.json', ACCEPTANCE_FILENAME, CONTINUITY_FILENAME, resolved]
+      .map(async (relative) => fileRevision(await stat(path.join(workingDir, relative)).catch(() => null)))),
+  ]);
+  const belongsToRoot = (value) => {
+    const eventRoot = value?.render_mode || value?.root;
+    return !eventRoot || eventRoot === resolved;
+  };
+  let status = progressObject(statusFile.text);
+  if (!belongsToRoot(status)) status = null;
+  const rows = trailFile.text.split('\n').map(progressObject).filter((row) => row && belongsToRoot(row));
+  const lastStatus = rows.findLast((row) => typeof row.status === 'string');
+  // A reader may overlap the producer's status-write / append pair. Prefer the newer
+  // complete record, and use the trail if the status file is temporarily half-written.
+  if (lastStatus && (!status || Date.parse(lastStatus.timestamp) > Date.parse(status.timestamp))) status = lastStatus;
+  if (status && !rows.some((row) => row.timestamp === status.timestamp && row.status === status.status)) rows.push(status);
+  const start = Math.max(0, rows.length - PROGRESS_TRAIL_ROWS);
+  const recent = rows.slice(start);
+  // Keep the latest decision before a busy tail so redraw/failure semantics survive
+  // ordinary progress chatter. The byte limit remains the hard bound on log history.
+  const isDecision = (row) => row.render_started || row.render_completed
+    || row.awaiting_confirmation || row.redone_shots?.length
+    || ['error', 'rendered', 'dependency_missing'].includes(row.status);
+  if (start && !recent.some(isDecision)) {
+    const decision = rows.slice(0, start).findLast(isDecision);
+    if (decision) recent[0] = decision;
+  }
+  const trail = recent.map((row) => JSON.stringify(row)).join('\n');
+  const timestamps = [statusFile.mtimeMs, trailFile.mtimeMs,
+    Date.parse(String(status?.timestamp || '')), ...recent.map((row) => Date.parse(String(row.timestamp || '')))]
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const lastProgressAt = timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : '';
+  // This revision is an invalidation hint, never an approval checksum. No media is
+  // opened here; periodic snapshots discover writes that do not touch these markers.
+  const revision = createHash('sha256').update(JSON.stringify([
+    resolved, record.updated_at, record.stage, statusFile.revision, trailFile.revision,
+    watched, status, trail,
+  ])).digest('hex');
+  return {status, trail, revision, lastProgressAt};
+}
+
+function progressObject(text) {
+  try {
+    const value = JSON.parse(text);
+    return isPlainObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function fileRevision(info) {
+  return info ? `${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}` : '';
+}
+
+async function readProgressFile(filePath, tail = false) {
+  let handle;
+  try {
+    handle = await open(filePath, 'r');
+    const info = await handle.stat();
+    const metadata = {revision: fileRevision(info), mtimeMs: info.mtimeMs};
+    if (!info.isFile() || (!tail && info.size > PROGRESS_READ_BYTES)) return {...metadata, text: ''};
+    const offset = tail ? Math.max(0, info.size - PROGRESS_READ_BYTES) : 0;
+    const buffer = Buffer.alloc(Math.min(info.size, PROGRESS_READ_BYTES));
+    let length = 0;
+    while (length < buffer.length) {
+      const {bytesRead} = await handle.read(buffer, length, buffer.length - length, offset + length);
+      if (!bytesRead) break;
+      length += bytesRead;
+    }
+    let text = buffer.toString('utf8', 0, length);
+    if (tail) {
+      // Discard a possible partial first row and any last row still being appended.
+      if (offset) text = text.slice(text.indexOf('\n') + 1);
+      text = text.slice(0, text.lastIndexOf('\n') + 1);
+    }
+    return {...metadata, text};
+  } catch {
+    return {text: '', revision: '', mtimeMs: 0};
+  } finally {
+    await handle?.close();
+  }
 }
 
 /**
@@ -617,6 +757,14 @@ export async function readRenderAcceptance(repoRoot, sessionId, root = '') {
  * with no reason deletes the entry rather than storing it as empty.
  */
 export async function updateRenderAcceptance(repoRoot, input = {}) {
+  const sessionId = typeof input?.sessionId === 'string' ? input.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, () => updateRenderAcceptanceUnlocked(repoRoot, input));
+}
+
+async function updateRenderAcceptanceUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -663,11 +811,11 @@ export async function updateRenderAcceptance(repoRoot, input = {}) {
   return acceptancePayload(repoRoot, workingDir, root);
 }
 
-async function acceptancePayload(repoRoot, workingDir, root) {
-  const store = await readAcceptanceFile(workingDir);
+async function acceptancePayload(repoRoot, workingDir, root, context = createFilmReadContext(), discovery = null) {
+  const store = await readAcceptanceFile(workingDir, context);
   const rootStore = isPlainObject(store[root]) ? store[root] : {};
   const shotStore = isPlainObject(rootStore.shots) ? rootStore.shots : {};
-  const discovery = await collectAcceptanceState(workingDir, root);
+  discovery ??= await collectAcceptanceState(workingDir, root, context);
 
   const stages = [];
   for (const stage of STAGE_ORDER) {
@@ -676,13 +824,13 @@ async function acceptancePayload(repoRoot, workingDir, root) {
     if (scope === 'session') {
       const paths = stage === 'portraits' ? discovery.portraits : discovery.finalVideo;
       const slotRecord = rootStore[stage];
-      slots = [slotPayload(null, await slotState(workingDir, slotRecord, paths), paths, slotRecord)];
+      slots = [slotPayload(null, await slotState(workingDir, slotRecord, paths, context), paths, slotRecord)];
     } else {
       slots = [];
       for (const shot of discovery.shots) {
         const paths = shot[stage];
         const slotRecord = isPlainObject(shotStore[shot.shot]) ? shotStore[shot.shot][stage] : undefined;
-        slots.push(slotPayload(shot.shot, await slotState(workingDir, slotRecord, paths), paths, slotRecord));
+        slots.push(slotPayload(shot.shot, await slotState(workingDir, slotRecord, paths, context), paths, slotRecord));
       }
     }
     const accepted = slots.length > 0 && slots.every((slot) => slot.state === 'accepted');
@@ -699,7 +847,7 @@ async function acceptancePayload(repoRoot, workingDir, root) {
   const rejected = stages.reduce((count, entry) => count + entry.slots.filter((slot) => slot.state === 'rejected').length, 0);
   // One clip's length and its per-second price, not a running total: the timeline
   // multiplies them by the clips that do not exist yet.
-  const clipSettings = await readClipSettings(repoRoot, String((await readRenderManifest(repoRoot, workingDir))?.video_model || ''));
+  const clipSettings = await filmClipSettings(repoRoot, workingDir, context);
   return {
     root,
     stages,
@@ -712,6 +860,12 @@ async function acceptancePayload(repoRoot, workingDir, root) {
       clipCostUsd: clipUsdPerSecond(clipSettings.model),
     },
   };
+}
+
+function filmClipSettings(repoRoot, workingDir, context) {
+  context.clipSettings ??= readRenderManifest(repoRoot, workingDir, context)
+    .then((manifest) => readClipSettings(repoRoot, String(manifest?.video_model || '')));
+  return context.clipSettings;
 }
 
 /** The payload slot: its state, plus the note against it, whether or not it was redrawn. */
@@ -738,14 +892,14 @@ function stageState(slots) {
 }
 
 /** planned (nothing on disk) | rendered (artifacts, no lock) | accepted | rejected | stale. */
-async function slotState(workingDir, record, paths) {
+async function slotState(workingDir, record, paths, context) {
   // A stored rejection outranks every other reading: the human's note is the point.
   if (isRejected(record)) return 'rejected';
   if (!paths.length) return 'planned';
   // A record without an acceptance — a rejection that was just redrawn, say — leaves the
   // new artifacts unreviewed: redrawing something is not accepting it.
   if (!isPlainObject(record) || typeof record.accepted_at !== 'string' || record.accepted_at === '') return 'rendered';
-  return (await acceptanceLockMatches(workingDir, record)) ? 'accepted' : 'stale';
+  return (await acceptanceLockMatches(workingDir, record, context)) ? 'accepted' : 'stale';
 }
 
 /** A slot record carrying a rejection note rather than an acceptance. */
@@ -753,7 +907,7 @@ function isRejected(record) {
   return isPlainObject(record) && typeof record.rejected_at === 'string' && record.rejected_at !== '';
 }
 
-async function acceptanceLockMatches(workingDir, record) {
+async function acceptanceLockMatches(workingDir, record, context) {
   if (!Array.isArray(record.artifacts) || record.artifacts.length === 0) return false;
   for (const artifact of record.artifacts) {
     if (!isPlainObject(artifact)) return false;
@@ -761,12 +915,12 @@ async function acceptanceLockMatches(workingDir, record) {
     if (!absolute.startsWith(`${workingDir}${path.sep}`)) return false;
     let info;
     try {
-      info = await stat(absolute);
+      info = await context.stat(absolute);
     } catch {
       return false;
     }
     if (!info.isFile() || info.size !== artifact.size) return false;
-    if (await sha256File(absolute) !== artifact.sha256) return false;
+    if (await context.hash(absolute) !== artifact.sha256) return false;
   }
   return true;
 }
@@ -793,11 +947,11 @@ function currentModelArtifacts(paths, modelDir) {
 }
 
 /** Every reviewable slot of a root, derived from the paths on disk. */
-async function collectAcceptanceState(workingDir, root) {
+async function collectAcceptanceState(workingDir, root, context = createFilmReadContext()) {
   const rootDir = path.join(workingDir, root);
   let manifest = null;
   try {
-    manifest = JSON.parse(await readFile(path.join(workingDir, 'render_manifest.json'), 'utf8'));
+    manifest = await context.json(path.join(workingDir, 'render_manifest.json'));
   } catch {
     manifest = null;
   }
@@ -805,30 +959,30 @@ async function collectAcceptanceState(workingDir, root) {
   const videoModelDir = safePathComponent(manifest?.video_model ?? '');
 
   const portraits = [];
-  await collectAcceptanceFiles(workingDir, path.join(rootDir, 'character_portraits'), (name) => name.toLowerCase().endsWith('.png'), portraits);
+  await collectAcceptanceFiles(workingDir, path.join(rootDir, 'character_portraits'), (name) => name.toLowerCase().endsWith('.png'), portraits, context);
   portraits.sort();
   portraits.splice(0, portraits.length, ...currentModelArtifacts(portraits, imageModelDir));
 
   const finalVideo = [];
   const finalPath = path.join(rootDir, 'final_video.mp4');
-  if (await isRegularFile(finalPath)) finalVideo.push(relativeArtifactPath(workingDir, finalPath));
+  if (await isRegularFile(finalPath, context)) finalVideo.push(relativeArtifactPath(workingDir, finalPath));
 
   const shots = [];
   // Script mode keeps shots flat under `shots/`, so the slot is the directory name.
   // Idea mode nests them under `scene_<idx>/shots/`, where the same shot index appears
   // once per scene, so the slot is scene-qualified. Same keys, same rule, as the gate.
-  const containers = await shotContainers(rootDir);
+  const containers = await shotContainers(rootDir, context);
   for (const {container, prefix} of containers) {
-    const entries = await readdir(container, {withFileTypes: true}).catch(() => []);
+    const entries = await context.entries(container).catch(() => []);
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
       const shotDir = path.join(container, entry.name);
       // A shot is planned only once its description exists, exactly like the render gate.
-      if (!(await isRegularFile(path.join(shotDir, 'shot_description.json')))) continue;
-      const keyframes = [];
-      await collectAcceptanceFiles(workingDir, shotDir, (name) => KEYFRAME_NAMES.has(name), keyframes);
-      const clips = [];
-      await collectAcceptanceFiles(workingDir, shotDir, (name) => name === 'video.mp4', clips);
+      if (!(await isRegularFile(path.join(shotDir, 'shot_description.json'), context))) continue;
+      const media = [];
+      await collectAcceptanceFiles(workingDir, shotDir, (name) => KEYFRAME_NAMES.has(name) || name === 'video.mp4', media, context);
+      const keyframes = media.filter((file) => KEYFRAME_NAMES.has(path.basename(file)));
+      const clips = media.filter((file) => path.basename(file) === 'video.mp4');
       shots.push({
         shot: `${prefix}${entry.name}`,
         keyframes: currentModelArtifacts(keyframes, imageModelDir).sort(),
@@ -836,15 +990,26 @@ async function collectAcceptanceState(workingDir, root) {
       });
     }
   }
-  shots.sort((left, right) => compareShotNames(left.shot, right.shot));
+  const playing = await filmOrder(workingDir, root, context);
+  const rank = new Map(playing.map((slot, index) => [slot, index]));
+  shots.sort((left, right) => {
+    const leftOrder = rank.get(left.shot);
+    const rightOrder = rank.get(right.shot);
+    if (leftOrder !== undefined || rightOrder !== undefined) {
+      if (leftOrder === undefined) return 1;
+      if (rightOrder === undefined) return -1;
+      return leftOrder - rightOrder;
+    }
+    return compareShotNames(left.shot, right.shot);
+  });
 
-  return {portraits, finalVideo, shots};
+  return {portraits, finalVideo, shots, order: playing};
 }
 
 /** Where a render root keeps its shots: flat, or one directory per scene. */
-async function shotContainers(rootDir) {
+async function shotContainers(rootDir, context = createFilmReadContext()) {
   const flat = path.join(rootDir, 'shots');
-  const entries = await readdir(rootDir, {withFileTypes: true}).catch(() => []);
+  const entries = await context.entries(rootDir).catch(() => []);
   if (entries.some((entry) => entry.isDirectory() && entry.name === 'shots')) {
     return [{container: flat, prefix: ''}];
   }
@@ -854,10 +1019,10 @@ async function shotContainers(rootDir) {
     .map((entry) => ({container: path.join(rootDir, entry.name, 'shots'), prefix: `${entry.name}/`}));
 }
 
-async function collectAcceptanceFiles(base, directory, isArtifact, artifacts) {
+async function collectAcceptanceFiles(base, directory, isArtifact, artifacts, context = createFilmReadContext()) {
   let entries;
   try {
-    entries = await readdir(directory, {withFileTypes: true});
+    entries = await context.entries(directory);
   } catch {
     return;
   }
@@ -866,7 +1031,7 @@ async function collectAcceptanceFiles(base, directory, isArtifact, artifacts) {
     const absolute = path.join(directory, entry.name);
     // `cache/` is moviepy scratch debris; whatever it holds is never a reviewable artifact.
     if (entry.isDirectory()) {
-      if (entry.name !== 'cache') await collectAcceptanceFiles(base, absolute, isArtifact, artifacts);
+      if (entry.name !== 'cache') await collectAcceptanceFiles(base, absolute, isArtifact, artifacts, context);
       continue;
     }
     // `withFileTypes` reports symlinks as neither directory nor file, so a link out is never followed.
@@ -913,9 +1078,9 @@ function removeAcceptance(store, root, shot, stage) {
   if (!Object.keys(rootStore).length) delete store[root];
 }
 
-async function readAcceptanceFile(workingDir) {
+async function readAcceptanceFile(workingDir, context = createFilmReadContext()) {
   try {
-    const payload = JSON.parse(await readFile(path.join(workingDir, ACCEPTANCE_FILENAME), 'utf8'));
+    const payload = await context.json(path.join(workingDir, ACCEPTANCE_FILENAME));
     return isPlainObject(payload) ? payload : {};
   } catch {
     return {};
@@ -924,18 +1089,16 @@ async function readAcceptanceFile(workingDir) {
 
 async function writeAcceptanceFile(workingDir, store) {
   const filePath = path.join(workingDir, ACCEPTANCE_FILENAME);
-  const temporaryPath = `${filePath}.${process.pid}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, {mode: 0o600});
-  await rename(temporaryPath, filePath);
+  await writeAtomic(filePath, `${JSON.stringify(store, null, 2)}\n`, 0o600);
 }
 
-async function resolveRenderRoot(repoRoot, workingDir, requested) {
+async function resolveRenderRoot(repoRoot, workingDir, requested, context = createFilmReadContext()) {
   const value = String(requested ?? '').trim();
   if (value) {
     if (!RENDER_ROOTS.has(value)) throw acceptanceError(`Unknown render root: ${value}`);
     return value;
   }
-  const manifest = await readRenderManifest(repoRoot, workingDir);
+  const manifest = await readRenderManifest(repoRoot, workingDir, context);
   const mode = String(manifest?.render_mode ?? '').trim();
   return RENDER_ROOTS.has(mode) ? mode : 'script2video';
 }
@@ -945,9 +1108,9 @@ function sessionWorkingDir(repoRoot, sessionId, record) {
   return workingDir ? path.resolve(repoRoot, workingDir) : resolveSessionRoot(repoRoot, sessionId);
 }
 
-async function isRegularFile(filePath) {
+async function isRegularFile(filePath, context = createFilmReadContext()) {
   try {
-    return (await stat(filePath)).isFile();
+    return (await context.stat(filePath)).isFile();
   } catch {
     return false;
   }
@@ -1096,6 +1259,30 @@ function sanitizeSession(record) {
 // is offered. A Timeline that cannot show or change them leaves the user able to re-run a
 // shot but not to say what it should have been, which is how a shot gets redrawn five times
 // with the same wrong answer.
+async function withTimelineMutation(repoRoot, input, operation) {
+  const sessionId = typeof input?.sessionId === 'string' ? input.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  return withProjectWriteLock(sessionWorkingDir(repoRoot, sessionId, record), operation);
+}
+
+function shotLocation(workingDir, root, slot) {
+  const key = String(slot ?? '');
+  const match = /^(scene_\d+)\/(\d+)$/.exec(key);
+  if (!match && !/^\d+$/.test(key)) throw acceptanceError(`Unknown shot: ${key || '(missing)'}`);
+  const container = path.join(workingDir, root, match ? match[1] : '');
+  const local = match ? match[2] : key;
+  return {
+    key,
+    local,
+    scene: match ? match[1] : '',
+    container,
+    shotDir: path.join(container, 'shots', local),
+    treePath: path.join(container, CAMERA_TREE_FILENAME),
+    storyboardPath: path.join(container, STORYBOARD_FILENAME),
+  };
+}
+
 const SHOT_DESCRIPTION_FILENAME = 'shot_description.json';
 const STORYBOARD_FILENAME = 'storyboard.json';
 const CAMERA_TREE_FILENAME = 'camera_tree.json';
@@ -1105,6 +1292,94 @@ const MAX_DESCRIPTION_LENGTH = 4000;
 // Written by the agent's vimax_review_timeline tool; the web layer only reads it.
 const CONTINUITY_FILENAME = 'continuity_review.json';
 
+async function withMutationTransaction(operation) {
+  const undo = [];
+  const backups = [];
+  const transaction = {
+    async write(filePath, contents) {
+      let previous = null;
+      let previousMode;
+      let previousTimes;
+      try {
+        const info = await lstat(filePath);
+        if (!info.isFile()) throw acceptanceError(`Cannot replace non-file metadata: ${path.basename(filePath)}`);
+        previous = await readFile(filePath);
+        previousMode = info.mode & 0o777;
+        previousTimes = {atime: info.atime, mtime: info.mtime};
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      await writeAtomic(filePath, contents);
+      undo.push(async () => {
+        if (previous === null) return rm(filePath, {force: true});
+        await writeAtomic(filePath, previous, previousMode);
+        await utimes(filePath, previousTimes.atime, previousTimes.mtime);
+      });
+    },
+    async mkdir(directory) {
+      await mkdir(directory);
+      undo.push(() => rm(directory, {recursive: true, force: true}));
+    },
+    async move(from, to) {
+      const parent = path.dirname(to);
+      let parentCreated = false;
+      try { await lstat(parent); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        await mkdir(parent, {recursive: true});
+        parentCreated = true;
+      }
+      if (parentCreated) undo.push(() => rm(parent, {recursive: true, force: true}));
+      try {
+        await lstat(to);
+        throw acceptanceError(`Destination already exists: ${path.basename(to)}`);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      await rename(from, to);
+      undo.push(() => rename(to, from));
+    },
+    async remove(filePath) {
+      try { await lstat(filePath); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+      const backup = `${filePath}.timeline-${randomUUID()}.bak`;
+      await rename(filePath, backup);
+      undo.push(() => rename(backup, filePath));
+      backups.push(backup);
+    },
+  };
+
+  try {
+    const result = await operation(transaction);
+    await Promise.all(backups.map((backup) => rm(backup, {recursive: true, force: true}).catch(() => {})));
+    return result;
+  } catch (cause) {
+    const failures = [];
+    for (const rollback of undo.reverse()) {
+      try { await rollback(); } catch (error) { failures.push(error.message); }
+    }
+    if (cause.statusCode === undefined) cause.statusCode = 500;
+    if (failures.length) {
+      const rollbackError = new Error(`Timeline mutation failed: ${cause.message}; rollback was incomplete: ${failures.join('; ')}`, {cause});
+      rollbackError.statusCode = 500;
+      throw rollbackError;
+    }
+    throw cause;
+  }
+}
+
+async function writeAtomic(filePath, contents, mode) {
+  const directory = path.dirname(filePath);
+  await mkdir(directory, {recursive: true});
+  const temporary = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, contents, {flag: 'wx', ...(mode === undefined ? {} : {mode})});
+    await rename(temporary, filePath);
+  } catch (error) {
+    await rm(temporary, {force: true}).catch(() => {});
+    throw error;
+  }
+}
+
 /**
  * The film's slots in playing order: camera by camera, in each camera's own order.
  *
@@ -1112,18 +1387,22 @@ const CONTINUITY_FILENAME = 'continuity_review.json';
  * the order the film plays in — the camera tree is. Anything comparing the timeline against
  * a review has to use this, or a review that is current reads as out of date.
  */
-async function filmOrder(workingDir, root) {
-  let cameras;
-  try {
-    cameras = JSON.parse(await readFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), 'utf8'));
-  } catch {
-    return [];
+async function filmOrder(workingDir, root, context = createFilmReadContext()) {
+  const rootDir = path.join(workingDir, root);
+  const entries = await context.entries(rootDir).catch(() => []);
+  const scenes = entries.filter((entry) => entry.isDirectory() && /^scene_\d+$/.test(entry.name))
+    .sort((left, right) => Number(left.name.slice(6)) - Number(right.name.slice(6)));
+  const containers = scenes.length ? scenes.map((entry) => ({name: entry.name, dir: path.join(rootDir, entry.name)}))
+    : [{name: '', dir: rootDir}];
+  const order = [];
+  for (const {name, dir} of containers) {
+    let cameras;
+    try { cameras = await context.json(path.join(dir, CAMERA_TREE_FILENAME)); } catch { continue; }
+    if (!Array.isArray(cameras)) continue;
+    order.push(...cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx))
+      .flatMap((camera) => (camera.active_shot_idxs || []).map((shot) => `${name ? `${name}/` : ''}${shot}`)));
   }
-  if (!Array.isArray(cameras)) return [];
-  return cameras
-    .slice()
-    .sort((left, right) => Number(left.idx) - Number(right.idx))
-    .flatMap((camera) => (camera.active_shot_idxs || []).map(String));
+  return order;
 }
 
 /**
@@ -1136,33 +1415,37 @@ export async function readContinuityReview(repoRoot, sessionId, root = '') {
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
   if (!record) return null;
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
-  const resolved = await resolveRenderRoot(repoRoot, workingDir, root);
+  const context = createFilmReadContext();
+  const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
+  return continuityPayload(repoRoot, workingDir, resolved, record, context);
+}
+
+async function continuityPayload(repoRoot, workingDir, root, record, context, discovery = null) {
   let review = null;
   try {
-    const payload = JSON.parse(await readFile(path.join(workingDir, CONTINUITY_FILENAME), 'utf8'));
+    const payload = await context.json(path.join(workingDir, CONTINUITY_FILENAME));
     review = isPlainObject(payload) ? payload : null;
   } catch {
     review = null;
   }
-  const discovery = await collectAcceptanceState(workingDir, resolved);
-  const playing = await filmOrder(workingDir, resolved);
-  // The camera tree is the film's order; the directories are the fallback for a root that has
-  // not been grouped into cameras yet.
-  const shots = playing.length ? playing : discovery.shots.map((entry) => String(entry.shot));
-  const {stale, reason} = await reviewStaleness(workingDir, resolved, review, shots);
-  const acceptance = await acceptancePayload(repoRoot, workingDir, resolved);
+  const playing = discovery?.order ?? await filmOrder(workingDir, root, context);
+  const shots = playing.length ? playing
+    : (discovery ?? await collectAcceptanceState(workingDir, root, context)).shots.map((entry) => String(entry.shot));
+  const {stale, reason} = await reviewStaleness(workingDir, root, review, shots, String(record.user_requirement ?? ''), context);
+  const clipSettings = await filmClipSettings(repoRoot, workingDir, context);
   return {
-    root: resolved,
+    root,
     review,
     stale,
     staleReason: reason,
     shots,
-    clipSeconds: Number(acceptance.totals?.clipSeconds) || 0,
+    clipSeconds: clipSettings.seconds,
   };
 }
 
-async function reviewStaleness(workingDir, root, review, shots) {
+async function reviewStaleness(workingDir, root, review, shots, userRequirement, context) {
   if (!review) return {stale: true, reason: 'No review yet.'};
+  if (review.root !== undefined && review.root !== root) return {stale: true, reason: 'The reviewed render root no longer matches.'};
   const reviewed = (Array.isArray(review.shots_reviewed) ? review.shots_reviewed : []).map(String);
   const added = shots.filter((shot) => !reviewed.includes(shot));
   const removed = reviewed.filter((shot) => !shots.includes(shot));
@@ -1172,20 +1455,94 @@ async function reviewStaleness(workingDir, root, review, shots) {
     if (removed.length) parts.push(`shots ${removed.join(', ')} removed`);
     return {stale: true, reason: `The timeline changed since this review: ${parts.join(', ')}.`};
   }
+
+  if (Object.hasOwn(review, 'input_files')) {
+    if (review.root !== root) return {stale: true, reason: 'The review does not identify this render root.'};
+    if (typeof review.user_requirement !== 'string' || review.user_requirement !== userRequirement) {
+      return {stale: true, reason: 'The user requirement changed since this review.'};
+    }
+    if (!isPlainObject(review.input_files)) return {stale: true, reason: 'The review input fingerprints are invalid.'};
+    const expected = await continuityInputPaths(workingDir, root, shots, context);
+    const missing = [...expected].filter((relative) => !Object.hasOwn(review.input_files, relative));
+    if (missing.length) return {stale: true, reason: `The review does not cover current inputs: ${missing.join(', ')}.`};
+    const changed = [];
+    for (const [relative, expectedHash] of Object.entries(review.input_files)) {
+      if (expectedHash !== null && (typeof expectedHash !== 'string' || !/^[a-f\d]{64}$/i.test(expectedHash))) {
+        return {stale: true, reason: `The review fingerprint for ${relative} is invalid.`};
+      }
+      const absolute = path.resolve(workingDir, relative);
+      if (absolute === workingDir || !absolute.startsWith(`${workingDir}${path.sep}`)) {
+        return {stale: true, reason: `The review input path ${relative} is invalid.`};
+      }
+      let current = null;
+      try {
+        const info = await context.lstat(absolute);
+        if (!info.isFile()) { changed.push(relative); continue; }
+        current = await context.hash(absolute);
+      } catch (error) {
+        if (error.code !== 'ENOENT') { changed.push(relative); continue; }
+      }
+      if (current !== expectedHash) changed.push(relative);
+    }
+    if (changed.length) return {stale: true, reason: `Inputs changed since this review: ${changed.join(', ')}.`};
+    return {stale: false, reason: ''};
+  }
+
+  // Older reviews have no fingerprints. Keep their source-mtime contract, but watch the
+  // actual root and scene inputs rather than guessing paths from a qualified shot identity.
   const reviewedAt = Date.parse(String(review.reviewed_at ?? ''));
   if (!Number.isFinite(reviewedAt)) return {stale: true, reason: 'The review has no timestamp.'};
-  const watched = [
-    CAMERA_TREE_FILENAME,
-    STORYBOARD_FILENAME,
-    ...shots.map((shot) => path.join('shots', shot, SHOT_DESCRIPTION_FILENAME)),
-  ];
+  const watched = await continuityInputPaths(workingDir, root, shots, context);
   const newer = [];
   for (const relative of watched) {
-    const info = await stat(path.join(workingDir, root, relative)).catch(() => null);
-    if (info && info.mtimeMs > reviewedAt) newer.push(relative);
+    const info = await context.stat(path.join(workingDir, relative)).catch(() => null);
+    if (info && info.mtimeMs > reviewedAt) newer.push(relative.slice(root.length + 1));
   }
   if (newer.length) return {stale: true, reason: `Edited since this review: ${newer.join(', ')}.`};
   return {stale: false, reason: ''};
+}
+
+async function continuityInputPaths(workingDir, root, shots, context) {
+  const paths = new Set();
+  const add = (absolute) => paths.add(path.relative(workingDir, absolute).split(path.sep).join('/'));
+  const rootDir = path.join(workingDir, root);
+  const scriptCandidates = root === 'script2video'
+    ? ['script.txt']
+    : root === 'idea2video'
+      ? ['script.json', 'story.txt']
+      : ['novel/novel_compressed.txt'];
+  for (const candidate of scriptCandidates) add(path.join(rootDir, candidate));
+
+  const containers = await shotContainers(rootDir, context);
+  if (!containers.length) containers.push({container: path.join(rootDir, 'shots'), prefix: ''});
+  for (const {container: shotsDir} of containers) {
+    const sceneDir = path.dirname(shotsDir);
+    for (const name of ['characters.json', CAMERA_TREE_FILENAME, STORYBOARD_FILENAME]) add(path.join(sceneDir, name));
+    for (const shot of shots) {
+      const location = shotLocation(workingDir, root, shot);
+      if (location.container === sceneDir) add(path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME));
+    }
+    await collectJsonInputs(shotsDir, add, context);
+    const removedDir = path.join(sceneDir, REMOVED_SHOTS_DIR);
+    const removed = await context.entries(removedDir).catch(() => []);
+    for (const entry of removed) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const kept = path.join(removedDir, entry.name);
+      for (const name of ['placement.json', 'brief.json', SHOT_DESCRIPTION_FILENAME]) add(path.join(kept, name));
+      await collectJsonInputs(kept, add, context);
+    }
+  }
+  return paths;
+}
+
+async function collectJsonInputs(directory, add, context) {
+  const entries = await context.entries(directory).catch(() => []);
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) await collectJsonInputs(absolute, add, context);
+    else if (entry.isFile() && (isShotInput(entry.name) || entry.name === 'brief.json' || entry.name === 'placement.json')) add(absolute);
+  }
 }
 
 /** Every shot's plan in one request: the reel shows all of them, not only the open ones. */
@@ -1193,17 +1550,19 @@ export async function readShotPlans(repoRoot, sessionId, root = '') {
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
   if (!record) return null;
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
-  const resolved = await resolveRenderRoot(repoRoot, workingDir, root);
-  const discovery = await collectAcceptanceState(workingDir, resolved);
+  const context = createFilmReadContext();
+  const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
+  const discovery = await collectAcceptanceState(workingDir, resolved, context);
+  return {root: resolved, plans: await shotPlansPayload(workingDir, resolved, discovery, context)};
+}
+
+async function shotPlansPayload(workingDir, root, discovery, context) {
   const plans = [];
-  for (const shot of discovery.shots) {
-    try {
-      plans.push(await shotPlanPayload(workingDir, resolved, shot.shot));
-    } catch {
-      // A shot with no readable plan is simply not part of what can be shown.
-    }
+  for (const {shot} of discovery.shots) {
+    try { plans.push(await shotPlanPayload(workingDir, root, shot, context)); }
+    catch { /* A shot with no readable plan is simply not part of what can be shown. */ }
   }
-  return {root: resolved, plans};
+  return plans;
 }
 
 /** The shots taken out of the film, with what is kept for them. */
@@ -1223,19 +1582,25 @@ async function isDirectory(target) {
   }
 }
 
-async function listRemoved(workingDir, root) {
-  const container = path.join(workingDir, root, REMOVED_SHOTS_DIR);
-  const entries = await readdir(container, {withFileTypes: true}).catch(() => []);
+async function listRemoved(workingDir, root, context = createFilmReadContext()) {
+  const rootDir = path.join(workingDir, root);
+  const containers = await shotContainers(rootDir, context);
+  if (!containers.length) containers.push({container: path.join(rootDir, 'shots'), prefix: ''});
   const removed = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-    const kept = path.join(container, entry.name);
-    const files = await readdir(kept, {withFileTypes: true}).catch(() => []);
-    removed.push({
-      slot: entry.name,
-      files: files.filter((file) => file.isFile() || file.isDirectory()).length,
-      hasBrief: files.some((file) => file.name === 'brief.json'),
-    });
+  for (const {container: shotsDir, prefix} of containers) {
+    const sceneDir = path.dirname(shotsDir);
+    const removedDir = path.join(sceneDir, REMOVED_SHOTS_DIR);
+    const entries = await context.entries(removedDir).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const kept = path.join(removedDir, entry.name);
+      const files = await context.entries(kept).catch(() => []);
+      removed.push({
+        slot: `${prefix}${entry.name}`,
+        files: files.filter((file) => file.isFile() || file.isDirectory()).length,
+        hasBrief: files.some((file) => file.name === 'brief.json'),
+      });
+    }
   }
   return removed.sort((left, right) => compareShotNames(left.slot, right.slot));
 }
@@ -1251,6 +1616,10 @@ export async function readShotPlan(repoRoot, sessionId, root = '', slot = '') {
 
 /** Rewrite one shot's plan: its frame descriptions and the characters each frame shows. */
 export async function updateShotPlan(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, () => updateShotPlanUnlocked(repoRoot, input));
+}
+
+async function updateShotPlanUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -1280,9 +1649,13 @@ export async function updateShotPlan(repoRoot, input = {}) {
   }
   if (!Object.keys(edits).length) throw acceptanceError('Nothing to save');
 
-  const target = path.join(workingDir, root, 'shots', slot, SHOT_DESCRIPTION_FILENAME);
+  const location = shotLocation(workingDir, root, slot);
+  const target = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
   const current = JSON.parse(await readFile(target, 'utf8'));
-  await writeFile(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
+  await withMutationTransaction(async (transaction) => {
+    await transaction.write(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+  });
   return shotPlanPayload(workingDir, root, slot);
 }
 
@@ -1299,6 +1672,10 @@ export async function updateShotPlan(repoRoot, input = {}) {
  * camera's transition.
  */
 export async function moveShot(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, () => moveShotUnlocked(repoRoot, input));
+}
+
+async function moveShotUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -1306,24 +1683,17 @@ export async function moveShot(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
+  const location = shotLocation(workingDir, root, slot);
   const direction = String(body.direction ?? '');
   if (direction && !['earlier', 'later'].includes(direction)) throw acceptanceError(`Unknown direction: ${direction}`);
 
-  const treePath = path.join(workingDir, root, CAMERA_TREE_FILENAME);
-  let tree;
-  try {
-    tree = JSON.parse(await readFile(treePath, 'utf8'));
-  } catch {
-    throw acceptanceError('This sequence has no camera tree to change');
-  }
-  const cameras = Array.isArray(tree) ? tree : [];
-  // The film's own order decides what "earlier" means, so a caller cannot act on an order it
-  // read a moment ago and have the shot land somewhere else. An explicit `after` is the same
-  // request the create endpoint takes: place this shot after that one.
-  const order = cameras
-    .slice()
-    .sort((left, right) => Number(left.idx) - Number(right.idx))
-    .flatMap((camera) => (camera.active_shot_idxs || []).map(String));
+  let cameras;
+  try { cameras = JSON.parse(await readFile(location.treePath, 'utf8')); }
+  catch { throw acceptanceError('This sequence has no camera tree to change'); }
+  if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
+  const prefix = location.scene ? `${location.scene}/` : '';
+  const order = cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx))
+    .flatMap((camera) => (camera.active_shot_idxs || []).map((local) => `${prefix}${local}`));
   const at = order.indexOf(slot);
   const after = direction
     ? direction === 'earlier'
@@ -1334,58 +1704,44 @@ export async function moveShot(repoRoot, input = {}) {
   if (direction && !after) {
     throw acceptanceError(`Shot ${slot} is already the film's ${direction === 'earlier' ? 'first' : 'last'} shot, so there is nowhere to move it`);
   }
-  const owner = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(slot));
+  const targetLocation = shotLocation(workingDir, root, after);
+  if (location.scene !== targetLocation.scene) throw acceptanceError('Shots cannot be moved between scenes');
+  const owner = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(location.local));
   if (!owner) throw acceptanceError(`Shot ${slot || '(missing)'} is not part of a camera in this sequence`);
-  const target = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(after));
+  const target = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(targetLocation.local));
   if (!target) throw acceptanceError(`Shot ${after || '(missing)'} is not part of the film, so ${slot} cannot follow it`);
   const leaving = owner !== target;
-
-  const remaining = (owner.active_shot_idxs || []).filter((idx) => String(idx) !== slot);
+  const remaining = (owner.active_shot_idxs || []).filter((idx) => String(idx) !== location.local);
   if (!remaining.length) {
     throw acceptanceError(`Shot ${slot} is the only shot of camera ${owner.idx}; moving it would leave the camera with nothing`);
   }
   if (leaving) {
-    const orphaned = cameras.find((camera) => String(camera.parent_shot_idx) === slot && camera !== owner);
+    const orphaned = cameras.find((camera) => String(camera.parent_shot_idx) === location.local && camera !== owner);
     if (orphaned) {
       throw acceptanceError(`Shot ${slot} is the shot camera ${orphaned.idx} moves away from; moving it would leave that camera without its transition`);
     }
   }
+  const planPath = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
+  let plan;
+  try { plan = JSON.parse(await readFile(planPath, 'utf8')); }
+  catch { throw acceptanceError(`Unknown shot: ${slot}`); }
+  const storyboard = await readJsonOptional(location.storyboardPath);
 
   owner.active_shot_idxs = remaining;
-  const ordered = (target.active_shot_idxs || []).filter((idx) => String(idx) !== slot);
-  const position = ordered.map(String).indexOf(after) + 1;
-  target.active_shot_idxs = [...ordered.slice(0, position), Number(slot), ...ordered.slice(position)];
-  await writeFile(treePath, `${JSON.stringify(cameras, null, 4)}\n`);
+  const ordered = (target.active_shot_idxs || []).filter((idx) => String(idx) !== location.local);
+  const position = ordered.map(String).indexOf(targetLocation.local) + 1;
+  target.active_shot_idxs = [...ordered.slice(0, position), Number(location.local), ...ordered.slice(position)];
+  const changedPlan = {...plan, cam_idx: target.idx};
+  const entry = Array.isArray(storyboard) && storyboard.find((row) => String(row?.idx) === location.local);
+  if (entry) entry.cam_idx = target.idx;
 
-  // Where it plays is which still its frames are drawn from, so the plan and the brief are
-  // moved into the target camera instead of being left pointing at the one it came from.
-  const planPath = path.join(workingDir, root, 'shots', slot, SHOT_DESCRIPTION_FILENAME);
-  let wasLast = false;
-  try {
-    const plan = JSON.parse(await readFile(planPath, 'utf8'));
-    wasLast = Boolean(plan.is_last);
-    await writeFile(planPath, `${JSON.stringify({...plan, cam_idx: target.idx}, null, 4)}\n`);
-  } catch {
-    // A shot with no plan has nothing to keep in step.
-  }
-  try {
-    const storyboard = JSON.parse(await readFile(path.join(workingDir, root, STORYBOARD_FILENAME), 'utf8'));
-    if (Array.isArray(storyboard)) {
-      const row = storyboard.find((entry) => String(entry?.idx) === slot);
-      if (row) row.cam_idx = target.idx;
-      await writeFile(path.join(workingDir, root, STORYBOARD_FILENAME), `${JSON.stringify(storyboard, null, 4)}\n`);
-    }
-  } catch {
-    // Likewise.
-  }
-
-  // Moving the film's ending out of last place would otherwise leave the ending marked on a
-  // shot that is no longer the end of the film.
-  if (wasLast) {
-    const lastCamera = cameras.slice().sort((left, right) => Number(right.idx) - Number(left.idx))[0];
-    const finalSlot = (lastCamera?.active_shot_idxs || []).slice(-1)[0];
-    if (finalSlot !== undefined && String(finalSlot) !== slot) await setLastShot(workingDir, root, finalSlot);
-  }
+  await withMutationTransaction(async (transaction) => {
+    await transaction.write(location.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
+    await transaction.write(planPath, `${JSON.stringify(changedPlan, null, 4)}\n`);
+    if (Array.isArray(storyboard)) await transaction.write(location.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], leaving);
+    await normalizeTimelineEnding(transaction, workingDir, root);
+  });
 
   return {...(await acceptancePayload(repoRoot, workingDir, root)), moved: {slot, after, camera: target.idx, position}};
 }
@@ -1399,6 +1755,10 @@ export async function moveShot(repoRoot, input = {}) {
  * plan are kept under `.removed_shots/`, so a shot removed by mistake can be put back.
  */
 export async function removeShot(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, () => removeShotUnlocked(repoRoot, input));
+}
+
+async function removeShotUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -1406,63 +1766,51 @@ export async function removeShot(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
-  const treePath = path.join(workingDir, root, CAMERA_TREE_FILENAME);
-  let tree;
-  try {
-    tree = JSON.parse(await readFile(treePath, 'utf8'));
-  } catch {
-    throw acceptanceError('This sequence has no camera tree to change');
-  }
-  const cameras = Array.isArray(tree) ? tree : [];
-  const owner = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(slot));
+  const location = shotLocation(workingDir, root, slot);
+  let cameras;
+  try { cameras = JSON.parse(await readFile(location.treePath, 'utf8')); }
+  catch { throw acceptanceError('This sequence has no camera tree to change'); }
+  if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
+  const owner = cameras.find((camera) => (camera.active_shot_idxs || []).map(String).includes(location.local));
   if (!owner) throw acceptanceError(`Shot ${slot} is not part of a camera in this sequence`);
-  // A camera may be left holding nothing: its shots are all under .removed_shots/, the render
-  // skips a camera with no shots, and restoring one puts it back in the camera it left. What
-  // cannot happen is taking away a shot another camera moves away from — that is its transition.
-  const remaining = (owner.active_shot_idxs || []).filter((idx) => String(idx) !== slot);
-  const orphaned = cameras.find((camera) => String(camera.parent_shot_idx) === slot && camera !== owner);
+  const orphaned = cameras.find((camera) => String(camera.parent_shot_idx) === location.local && camera !== owner);
   if (orphaned) {
     throw acceptanceError(`Shot ${slot} is the shot camera ${orphaned.idx} moves away from; removing it would leave that camera without its transition`);
   }
+  const planPath = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
+  let plan;
+  try { plan = JSON.parse(await readFile(planPath, 'utf8')); }
+  catch { throw acceptanceError(`Unknown shot: ${slot}`); }
+  const from = location.shotDir;
+  const to = path.join(location.container, REMOVED_SHOTS_DIR, location.local);
+  const storyboard = await readJsonOptional(location.storyboardPath);
+  if (storyboard !== undefined && !Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
+  const brief = Array.isArray(storyboard) ? storyboard.find((entry) => String(entry?.idx) === location.local) : null;
+  if (brief && await pathExists(path.join(from, 'brief.json'))) throw acceptanceError(`Shot ${slot} already has kept brief evidence`);
 
-  // Where it sat, read before the list changes: a shot put back goes back where it was.
-  const position = (owner.active_shot_idxs || []).map(String).indexOf(slot);
-  owner.active_shot_idxs = remaining;
-  // The film is every shot's clip joined, so a shot leaving makes it stale — and the
-  // concatenation is skipped while a film exists, which would keep the old cut on disk.
-  await rm(path.join(workingDir, root, 'final_video.mp4'), {force: true}).catch(() => {});
-  await writeFile(treePath, `${JSON.stringify(cameras, null, 4)}\n`);
-
-  const from = path.join(workingDir, root, 'shots', slot);
-  const to = path.join(workingDir, root, REMOVED_SHOTS_DIR, slot);
-  await mkdir(path.dirname(to), {recursive: true});
-  await rename(from, to).catch(() => {});
-  await setAsideBrief(workingDir, root, slot, to);
-  await writeFile(path.join(to, 'placement.json'), `${JSON.stringify({camera: owner.idx, position}, null, 4)}\n`);
-  await markLastShot(workingDir, root, remaining);
+  const active = owner.active_shot_idxs || [];
+  const position = active.map(String).indexOf(location.local);
+  const placement = {
+    camera: owner.idx,
+    position,
+    previous: position > 0 ? String(active[position - 1]) : null,
+    next: position + 1 < active.length ? String(active[position + 1]) : null,
+  };
+  owner.active_shot_idxs = active.filter((idx) => String(idx) !== location.local);
+  const remainingBriefs = brief ? storyboard.filter((entry) => String(entry?.idx) !== location.local) : null;
+  await withMutationTransaction(async (transaction) => {
+    await transaction.move(from, to);
+    await transaction.write(path.join(to, 'placement.json'), `${JSON.stringify(placement, null, 4)}\n`);
+    if (brief) {
+      await transaction.write(path.join(to, 'brief.json'), `${JSON.stringify(brief, null, 4)}\n`);
+      await transaction.write(location.storyboardPath, `${JSON.stringify(remainingBriefs, null, 4)}\n`);
+    }
+    await transaction.write(location.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
+    if (plan.is_last) await transaction.write(path.join(to, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify({...plan, is_last: false}, null, 4)}\n`);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await normalizeTimelineEnding(transaction, workingDir, root);
+  });
   return acceptancePayload(repoRoot, workingDir, root);
-}
-
-/**
- * Move a removed shot's brief out of the storyboard, into the shot's kept directory.
- *
- * The storyboard is what a re-plan walks: a brief left behind is a shot that comes back,
- * empty, the next time the film is planned. The brief is kept with the shot rather than
- * dropped, so restoring is putting two things back instead of writing one again.
- */
-async function setAsideBrief(workingDir, root, slot, keptDirectory) {
-  const storyboardPath = path.join(workingDir, root, STORYBOARD_FILENAME);
-  let storyboard;
-  try {
-    storyboard = JSON.parse(await readFile(storyboardPath, 'utf8'));
-  } catch {
-    return;
-  }
-  if (!Array.isArray(storyboard)) return;
-  const brief = storyboard.find((entry) => String(entry?.idx) === slot);
-  if (!brief) return;
-  await writeFile(path.join(keptDirectory, 'brief.json'), `${JSON.stringify(brief, null, 4)}\n`);
-  await writeFile(storyboardPath, `${JSON.stringify(storyboard.filter((entry) => String(entry?.idx) !== slot), null, 4)}\n`);
 }
 
 /**
@@ -1474,6 +1822,10 @@ async function setAsideBrief(workingDir, root, slot, keptDirectory) {
  * change the film's shape rather than undo the change.
  */
 export async function restoreShot(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, () => restoreShotUnlocked(repoRoot, input));
+}
+
+async function restoreShotUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -1481,47 +1833,52 @@ export async function restoreShot(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
-  const kept = path.join(workingDir, root, REMOVED_SHOTS_DIR, slot);
+  const location = shotLocation(workingDir, root, slot);
+  const kept = path.join(location.container, REMOVED_SHOTS_DIR, location.local);
+  const live = location.shotDir;
   if (!(await isDirectory(kept))) throw acceptanceError(`Shot ${slot || '(missing)'} has not been removed from this sequence`);
+  if (await pathExists(live)) throw acceptanceError(`Shot ${slot} already exists in this sequence`);
 
-  const placement = JSON.parse(await readFile(path.join(kept, 'placement.json'), 'utf8').catch(() => 'null'));
-  const cameras = JSON.parse(await readFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), 'utf8'));
+  const placement = await readJsonOptional(path.join(kept, 'placement.json'));
+  let cameras;
+  try { cameras = JSON.parse(await readFile(location.treePath, 'utf8')); }
+  catch { throw acceptanceError('This sequence has no camera tree to change'); }
+  if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
+  if (cameras.some((camera) => (camera.active_shot_idxs || []).map(String).includes(location.local))) {
+    throw acceptanceError(`Shot ${slot} is already part of this sequence`);
+  }
   const cameraIdx = Number.isFinite(Number(placement?.camera)) ? Number(placement.camera) : cameras[0]?.idx;
   const camera = cameras.find((entry) => Number(entry.idx) === Number(cameraIdx));
   if (!camera) throw acceptanceError(`Camera ${cameraIdx} is no longer in this sequence, so shot ${slot} has nowhere to go back to`);
-  const at = Number.isFinite(Number(placement?.position)) ? Number(placement.position) : (camera.active_shot_idxs || []).length;
   const active = [...(camera.active_shot_idxs || [])];
-  active.splice(Math.max(0, Math.min(at, active.length)), 0, Number(slot));
+  let position = Number.isFinite(Number(placement?.position)) ? Number(placement.position) : active.length;
+  const before = placement?.previous == null ? -1 : active.map(String).indexOf(String(placement.previous));
+  const after = placement?.next == null ? -1 : active.map(String).indexOf(String(placement.next));
+  if (before >= 0) position = before + 1;
+  else if (after >= 0) position = after;
+  position = Math.max(0, Math.min(position, active.length));
+  active.splice(position, 0, Number(location.local));
   camera.active_shot_idxs = active;
-  await writeFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), `${JSON.stringify(cameras, null, 4)}\n`);
 
-  await rename(kept, path.join(workingDir, root, 'shots', slot)).catch(() => {});
-  await putBackBrief(workingDir, root, slot);
-  // A shot coming back changes the film too: the same reason a removal drops it.
-  await rm(path.join(workingDir, root, 'final_video.mp4'), {force: true}).catch(() => {});
+  const briefPath = path.join(kept, 'brief.json');
+  const brief = await readJsonOptional(briefPath);
+  let storyboard = await readJsonOptional(location.storyboardPath);
+  if (storyboard === undefined) storyboard = [];
+  if (!Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
+  const nextStoryboard = brief && typeof brief === 'object'
+    ? [...storyboard.filter((entry) => String(entry?.idx) !== location.local), brief]
+    : storyboard;
+
+  await withMutationTransaction(async (transaction) => {
+    await transaction.move(kept, live);
+    await transaction.write(location.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
+    if (brief) await transaction.write(location.storyboardPath, `${JSON.stringify(nextStoryboard, null, 4)}\n`);
+    await transaction.remove(path.join(live, 'placement.json'));
+    if (brief) await transaction.remove(path.join(live, 'brief.json'));
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await normalizeTimelineEnding(transaction, workingDir, root);
+  });
   return acceptancePayload(repoRoot, workingDir, root);
-}
-
-/** Put a removed shot's brief back into the storyboard, in shot order. */
-async function putBackBrief(workingDir, root, slot) {
-  const storyboardPath = path.join(workingDir, root, STORYBOARD_FILENAME);
-  let brief;
-  try {
-    brief = JSON.parse(await readFile(path.join(workingDir, root, 'shots', slot, 'brief.json'), 'utf8'));
-  } catch {
-    return;
-  }
-  let storyboard = [];
-  try {
-    const parsed = JSON.parse(await readFile(storyboardPath, 'utf8'));
-    if (Array.isArray(parsed)) storyboard = parsed;
-  } catch {
-    storyboard = [];
-  }
-  const without = storyboard.filter((entry) => String(entry?.idx) !== slot);
-  without.push(brief);
-  without.sort((left, right) => Number(left.idx) - Number(right.idx));
-  await writeFile(storyboardPath, `${JSON.stringify(without, null, 4)}\n`);
 }
 
 /**
@@ -1534,6 +1891,10 @@ async function putBackBrief(workingDir, root, slot) {
  * edited is worth saying out loud.
  */
 export async function createShot(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, () => createShotUnlocked(repoRoot, input));
+}
+
+async function createShotUnlocked(repoRoot, input = {}) {
   const body = input && typeof input === 'object' ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
   const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
@@ -1541,17 +1902,21 @@ export async function createShot(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const after = String(body.after ?? '');
+  const afterLocation = shotLocation(workingDir, root, after);
   const brief = String(body.brief ?? '').trim();
   if (!brief) throw acceptanceError('Say what happens in the new shot');
   if (brief.length > MAX_BRIEF_LENGTH) throw acceptanceError(`The description must be at most ${MAX_BRIEF_LENGTH} characters`);
 
-  const cameras = JSON.parse(await readFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), 'utf8'));
-  const camera = cameras.find((entry) => (entry.active_shot_idxs || []).map(String).includes(after));
-  if (!camera) throw acceptanceError(`Shot ${after || '(missing)'} is not part of a camera, so there is nothing to add a shot after`);
+  let cameras;
+  try { cameras = JSON.parse(await readFile(afterLocation.treePath, 'utf8')); }
+  catch { throw acceptanceError('This sequence has no camera tree to change'); }
+  if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
+  const camera = cameras.find((entry) => (entry.active_shot_idxs || []).map(String).includes(afterLocation.local));
+  if (!camera) throw acceptanceError(`Shot ${after} is not part of a camera, so there is nothing to add a shot after`);
   const reference = await shotPlanPayload(workingDir, root, after);
+  const sourcePath = path.join(afterLocation.shotDir, SHOT_DESCRIPTION_FILENAME);
+  const source = JSON.parse(await readFile(sourcePath, 'utf8'));
 
-  // A shot suggested by a coverage review arrives with its own frames and dialogue, so
-  // that adding it produces the proposed shot rather than a copy of its neighbour.
   const frames = {};
   const audioDesc = String(body.audioDesc ?? '').trim();
   const motionDesc = String(body.motionDesc ?? '').trim();
@@ -1571,120 +1936,159 @@ export async function createShot(repoRoot, input = {}) {
     }
   }
 
-  // The next number nothing has held: a removed shot keeps its identity, so its number is
-  // not handed to a new shot that would then share its kept files.
-  const used = new Set(cameras.flatMap((entry) => entry.active_shot_idxs || []).map(Number));
-  const removedDir = path.join(workingDir, root, REMOVED_SHOTS_DIR);
+  const used = new Set((cameras.flatMap((entry) => entry.active_shot_idxs || [])).map(Number).filter(Number.isSafeInteger));
+  const removedDir = path.join(afterLocation.container, REMOVED_SHOTS_DIR);
   for (const entry of await readdir(removedDir, {withFileTypes: true}).catch(() => [])) {
-    if (entry.isDirectory() && /^\d+$/.test(entry.name)) used.add(Number(entry.name));
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const id = Number(entry.name);
+    if (Number.isSafeInteger(id)) used.add(id);
   }
-  const slot = used.size ? Math.max(...used) + 1 : 0;
-
-  // A camera's list is the order its shots play in, so the new shot is spliced where it
-  // belongs and the list is left alone: sorting it would move the shot to the end of the film.
-  const position = (camera.active_shot_idxs || []).map(String).indexOf(after) + 1;
-  const wasLast = Boolean(JSON.parse(await readFile(path.join(workingDir, root, 'shots', after, SHOT_DESCRIPTION_FILENAME), 'utf8')).is_last);
-  camera.active_shot_idxs = [...(camera.active_shot_idxs || []).slice(0, position), slot, ...(camera.active_shot_idxs || []).slice(position)];
-  await writeFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), `${JSON.stringify(cameras, null, 4)}\n`);
-
-  const storyboardPath = path.join(workingDir, root, STORYBOARD_FILENAME);
-  let storyboard = [];
-  try {
-    const parsed = JSON.parse(await readFile(storyboardPath, 'utf8'));
-    if (Array.isArray(parsed)) storyboard = parsed;
-  } catch {
-    storyboard = [];
+  let localSlot = used.size ? Math.max(...used) + 1 : 0;
+  let shotDir;
+  while (Number.isSafeInteger(localSlot)) {
+    shotDir = path.join(afterLocation.container, 'shots', String(localSlot));
+    if (!used.has(localSlot) && !(await pathExists(shotDir))) break;
+    localSlot += 1;
   }
-  storyboard.push({idx: slot, is_last: false, cam_idx: camera.idx, visual_desc: brief, audio_desc: audioDesc});
-  storyboard.sort((left, right) => Number(left.idx) - Number(right.idx));
-  await writeFile(storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
+  if (!Number.isSafeInteger(localSlot)) throw acceptanceError('No safe shot index remains in this sequence');
+  const slot = `${afterLocation.scene ? `${afterLocation.scene}/` : ''}${localSlot}`;
 
-  const source = JSON.parse(await readFile(path.join(workingDir, root, 'shots', after, SHOT_DESCRIPTION_FILENAME), 'utf8'));
-  const shotDir = path.join(workingDir, root, 'shots', String(slot));
-  await mkdir(shotDir, {recursive: true});
-  // Nothing of the reference shot's script survives the copy: its dialogue and its motion
-  // belong to the shot being copied from, and leaving them here makes the render play the
-  // wrong lines and move for the wrong shot.
-  const created = {...source, idx: slot, is_last: false, ...frames, audio_desc: audioDesc};
+  const position = (camera.active_shot_idxs || []).map(String).indexOf(afterLocation.local) + 1;
+  camera.active_shot_idxs = [
+    ...(camera.active_shot_idxs || []).slice(0, position),
+    localSlot,
+    ...(camera.active_shot_idxs || []).slice(position),
+  ];
+  let storyboard = await readJsonOptional(afterLocation.storyboardPath);
+  if (storyboard === undefined) storyboard = [];
+  if (!Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
+  storyboard = [...storyboard, {idx: localSlot, is_last: false, cam_idx: camera.idx, visual_desc: brief, audio_desc: audioDesc}];
+  const created = {...source, idx: localSlot, is_last: false, cam_idx: camera.idx, ...frames, audio_desc: audioDesc};
   if (motionDesc) created.motion_desc = motionDesc;
-  await writeFile(path.join(shotDir, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify(created, null, 4)}\n`);
-  if (wasLast) {
-    // The shot was added after the film's ending, so the film now ends with the new one.
-    await writeFile(path.join(workingDir, root, 'shots', after, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify({...source, is_last: false}, null, 4)}\n`);
-    await setLastShot(workingDir, root, slot);
-  }
+
+  await withMutationTransaction(async (transaction) => {
+    await transaction.mkdir(shotDir);
+    await transaction.write(path.join(shotDir, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify(created, null, 4)}\n`);
+    await transaction.write(afterLocation.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
+    await transaction.write(afterLocation.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await normalizeTimelineEnding(transaction, workingDir, root);
+  });
   return {
     ...(await acceptancePayload(repoRoot, workingDir, root)),
-    created: {slot: String(slot), copiedFrom: after, copiedPlan: Object.keys(frames).length === 0, plan: reference},
+    created: {slot, copiedFrom: after, copiedPlan: Object.keys(frames).length === 0, plan: reference},
   };
 }
 
-/** Mark one shot as the film's ending, clearing the mark anywhere else it sits. */
-async function setLastShot(workingDir, root, slot) {
-  const cameras = JSON.parse(await readFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), 'utf8'));
-  for (const candidate of new Set(cameras.flatMap((camera) => camera.active_shot_idxs || []).map(Number))) {
-    const file = path.join(workingDir, root, 'shots', String(candidate), SHOT_DESCRIPTION_FILENAME);
-    let description;
-    try {
-      description = JSON.parse(await readFile(file, 'utf8'));
-    } catch {
-      continue;
+async function invalidateTimelineOutputs(transaction, workingDir, root, shots, clearShotAcceptance = true) {
+  const store = await readAcceptanceFile(workingDir);
+  const before = JSON.stringify(store);
+  removeAcceptance(store, root, null, 'final_video');
+  if (clearShotAcceptance) {
+    for (const slot of shots) {
+      removeAcceptance(store, root, slot, 'keyframes');
+      removeAcceptance(store, root, slot, 'clips');
     }
-    const shouldBeLast = String(candidate) === String(slot);
-    if (Boolean(description.is_last) !== shouldBeLast) {
-      await writeFile(file, `${JSON.stringify({...description, is_last: shouldBeLast}, null, 4)}\n`);
+  }
+  if (JSON.stringify(store) !== before) {
+    await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
+  }
+
+  const rootDir = path.join(workingDir, root);
+  const films = new Set([path.join(rootDir, 'final_video.mp4')]);
+  for (const slot of shots) {
+    const location = shotLocation(workingDir, root, slot);
+    if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
+  }
+  for (const film of films) await transaction.remove(film);
+}
+
+async function normalizeTimelineEnding(transaction, workingDir, root) {
+  const order = await filmOrder(workingDir, root);
+  const last = order.at(-1) || '';
+  const rootDir = path.join(workingDir, root);
+  const containers = await shotContainers(rootDir);
+  if (!containers.length) containers.push({container: path.join(rootDir, 'shots'), prefix: ''});
+  for (const {container: shotsDir, prefix} of containers) {
+    const sceneDir = path.dirname(shotsDir);
+    const treePath = path.join(sceneDir, CAMERA_TREE_FILENAME);
+    const cameras = await readJsonOptional(treePath);
+    if (cameras === undefined) continue;
+    if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
+    const active = cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx))
+      .flatMap((camera) => (camera.active_shot_idxs || []).map(String));
+    for (const local of active) {
+      const planPath = path.join(shotsDir, local, SHOT_DESCRIPTION_FILENAME);
+      let plan;
+      try { plan = JSON.parse(await readFile(planPath, 'utf8')); }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      const isLast = `${prefix}${local}` === last;
+      if (plan.is_last !== isLast) await transaction.write(planPath, `${JSON.stringify({...plan, is_last: isLast}, null, 4)}\n`);
+    }
+
+    const storyboardPath = path.join(sceneDir, STORYBOARD_FILENAME);
+    const storyboard = await readJsonOptional(storyboardPath);
+    if (storyboard === undefined) continue;
+    if (!Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
+    const bySlot = new Map();
+    for (const entry of storyboard) {
+      const key = String(entry?.idx ?? '');
+      const entries = bySlot.get(key) || [];
+      entries.push(entry);
+      bySlot.set(key, entries);
+    }
+    const normalized = [];
+    const included = new Set();
+    for (const local of active) {
+      for (const [index, entry] of (bySlot.get(local) || []).entries()) {
+        const isLast = `${prefix}${local}` === last && index === 0;
+        normalized.push({...entry, is_last: isLast});
+      }
+      included.add(local);
+    }
+    for (const [local, entries] of bySlot) {
+      if (included.has(local)) continue;
+      normalized.push(...entries.map((entry) => ({...entry, is_last: false})));
+    }
+    if (JSON.stringify(normalized) !== JSON.stringify(storyboard)) {
+      await transaction.write(storyboardPath, `${JSON.stringify(normalized, null, 4)}\n`);
     }
   }
 }
 
-/**
- * Keep the film's ending marked after a shot leaves it.
- *
- * The mark says where the story ends, which the camera tree does not encode — cameras
- * interleave and a shot's number is its identity, not its place. So a mark that is still
- * standing is left where the plan put it, and only a mark that was removed is put on the
- * highest-numbered shot that remains.
- */
-async function markLastShot(workingDir, root, remainingInCamera) {
-  const cameras = JSON.parse(await readFile(path.join(workingDir, root, CAMERA_TREE_FILENAME), 'utf8'));
-  const present = new Set(cameras.flatMap((camera) => camera.active_shot_idxs || []).map(Number));
-  for (const slot of present) {
-    const file = path.join(workingDir, root, 'shots', String(slot), SHOT_DESCRIPTION_FILENAME);
-    try {
-      if (JSON.parse(await readFile(file, 'utf8')).is_last) return remainingInCamera;
-    } catch {
-      continue;
-    }
+async function readJsonOptional(filePath) {
+  try { return JSON.parse(await readFile(filePath, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
   }
-  if (present.size) await setLastShot(workingDir, root, Math.max(...present));
-  return remainingInCamera;
 }
 
-async function shotPlanPayload(workingDir, root, slot) {
-  const shotDir = path.join(workingDir, root, 'shots', String(slot));
+async function pathExists(target) {
+  try { await lstat(target); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+async function shotPlanPayload(workingDir, root, slot, context = createFilmReadContext()) {
+  const location = shotLocation(workingDir, root, slot);
+  const shotDir = location.shotDir;
   let description;
   try {
-    description = JSON.parse(await readFile(path.join(shotDir, SHOT_DESCRIPTION_FILENAME), 'utf8'));
+    description = await context.json(path.join(shotDir, SHOT_DESCRIPTION_FILENAME));
+    if (!description) throw new Error('Missing shot description');
   } catch {
-    // A slot with no plan is not a shot in this root: say so rather than failing obscurely.
     throw acceptanceError(`Unknown shot: ${slot || '(missing)'}`);
   }
-  const characters = await readSessionCharacters(workingDir, root);
+  const {characters, briefs} = await scenePlanMetadata(workingDir, location, context);
   const prompt = async (frame) => {
-    const cache = path.join(shotDir, `${frame}_selector_output.json`);
     try {
-      const cached = JSON.parse(await readFile(cache, 'utf8'));
-      return typeof cached.sent_prompt === 'string' ? cached.sent_prompt : '';
-    } catch {
-      return '';
-    }
+      const cached = await context.json(path.join(shotDir, `${frame}_selector_output.json`));
+      return typeof cached?.sent_prompt === 'string' ? cached.sent_prompt : '';
+    } catch { return ''; }
   };
   return {
-    slot: String(slot),
-    root,
-    // The brief is what the shot is for; the frame descriptions are how it is drawn. Both
-    // are shown, and a new shot copies both from the shot it is added after.
-    brief: await readBrief(workingDir, root, slot),
+    slot: String(slot), root,
+    brief: briefs.get(String(location.local)) || '',
     characters,
     firstFrame: {description: String(description.ff_desc || ''), visible: [...(description.ff_vis_char_idxs || [])], prompt: await prompt('first_frame')},
     lastFrame: {description: String(description.lf_desc || ''), visible: [...(description.lf_vis_char_idxs || [])], prompt: await prompt('last_frame')},
@@ -1692,21 +2096,26 @@ async function shotPlanPayload(workingDir, root, slot) {
   };
 }
 
-/** The one-line brief a shot came from, as the storyboard holds it. */
-async function readBrief(workingDir, root, slot) {
-  try {
-    const storyboard = JSON.parse(await readFile(path.join(workingDir, root, STORYBOARD_FILENAME), 'utf8'));
-    const entry = Array.isArray(storyboard) ? storyboard.find((shot) => String(shot?.idx) === String(slot)) : null;
-    return typeof entry?.visual_desc === 'string' ? entry.visual_desc : '';
-  } catch {
-    return '';
+function scenePlanMetadata(workingDir, location, context) {
+  if (!context.scenes.has(location.container)) {
+    context.scenes.set(location.container, (async () => {
+      const characters = await readSessionCharacters(workingDir, location.container, context);
+      const storyboard = await context.json(location.storyboardPath).catch(() => null);
+      const briefs = new Map();
+      for (const shot of Array.isArray(storyboard) ? storyboard : []) {
+        const key = String(shot?.idx);
+        if (!briefs.has(key)) briefs.set(key, typeof shot?.visual_desc === 'string' ? shot.visual_desc : '');
+      }
+      return {characters, briefs};
+    })());
   }
+  return context.scenes.get(location.container);
 }
 
 /** The characters a root can draw, from the plan beside its shots. */
-async function readSessionCharacters(workingDir, root) {
+async function readSessionCharacters(workingDir, root, context) {
   try {
-    const payload = JSON.parse(await readFile(path.join(workingDir, root, 'characters.json'), 'utf8'));
+    const payload = await context.json(path.isAbsolute(root) ? path.join(root, 'characters.json') : path.join(workingDir, root, 'characters.json'));
     if (!Array.isArray(payload)) return [];
     return payload
       .map((character) => ({idx: Number(character.idx), name: String(character.identifier_in_scene || '')}))

@@ -10,6 +10,7 @@ from agents.character_portraits_generator import CharacterPortraitsGenerator
 from agents.reference_image_selector import RefImageIndicesAndTextPrompt, ReferenceImageSelector
 from agents.storyboard_artist import StoryboardArtist
 from interfaces import Camera, CharacterInScene, ShotBriefDescription, ShotDescription
+from PIL import Image
 from pipelines.script2video_pipeline import Script2VideoPipeline, _group_shots_into_cameras
 
 
@@ -111,6 +112,83 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIsNone(result)
+
+
+    def _shot_description(self, idx):
+        return ShotDescription(
+            idx=idx,
+            is_last=True,
+            cam_idx=idx,
+            visual_desc=f"shot {idx}",
+            variation_type="small",
+            variation_reason="",
+            ff_desc=f"first {idx}",
+            ff_vis_char_idxs=[],
+            lf_desc=f"last {idx}",
+            lf_vis_char_idxs=[],
+            motion_desc="move",
+            audio_desc="none",
+        )
+
+    async def test_scoped_child_redraw_uses_a_cached_parent_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=tmp)
+            pipeline.revision_notes = {}
+            pipeline.frame_bracketing = True
+            pipeline.frame_events = {
+                idx: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}
+                for idx in (0, 1)
+            }
+            parent_frame = pipeline.frame_path(0, "first_frame")
+            os.makedirs(os.path.dirname(parent_frame), exist_ok=True)
+            Path(parent_frame).write_bytes(b"cached parent frame")
+
+            child_video_dir = Path(pipeline.shot_video_dir(1))
+            child_video_dir.mkdir(parents=True, exist_ok=True)
+            (child_video_dir / "transition_video_from_shot_0.mp4").write_bytes(b"cached transition")
+            Image.new("RGB", (16, 9), "red").save(child_video_dir / "new_camera_1.png")
+            child_last_frame = pipeline.frame_path(1, "last_frame")
+            os.makedirs(os.path.dirname(child_last_frame), exist_ok=True)
+            Path(child_last_frame).write_bytes(b"cached child end frame")
+
+            await asyncio.wait_for(
+                pipeline.generate_frames_for_single_camera(
+                    camera=Camera(idx=1, active_shot_idxs=[1], parent_shot_idx=0),
+                    shot_descriptions=[self._shot_description(0), self._shot_description(1)],
+                    characters=[],
+                    character_portraits_registry={},
+                    priority_shot_idxs=[],
+                    only_shots=[1],
+                ),
+                timeout=1,
+            )
+
+            self.assertTrue(os.path.exists(pipeline.frame_path(1, "first_frame")))
+            self.assertTrue(pipeline.frame_events[0]["first_frame"].is_set())
+            self.assertTrue(pipeline.frame_events[1]["first_frame"].is_set())
+
+    async def test_scoped_child_with_missing_excluded_parent_fails_instead_of_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=tmp)
+            pipeline.revision_notes = {}
+            pipeline.frame_bracketing = True
+            pipeline.frame_events = {
+                idx: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}
+                for idx in (0, 1)
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "required parent frame"):
+                await asyncio.wait_for(
+                    pipeline.generate_frames_for_single_camera(
+                        camera=Camera(idx=1, active_shot_idxs=[1], parent_shot_idx=0),
+                        shot_descriptions=[self._shot_description(0), self._shot_description(1)],
+                        characters=[],
+                        character_portraits_registry={},
+                        priority_shot_idxs=[],
+                        only_shots=[1],
+                    ),
+                    timeout=1,
+                )
 
 
 def test_a_character_named_only_in_the_frame_description_is_offered():

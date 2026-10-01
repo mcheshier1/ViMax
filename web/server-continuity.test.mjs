@@ -7,11 +7,12 @@
  * a copy of whatever shot it was placed after.
  */
 
+import {createHash} from 'node:crypto';
 import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {createShot, moveShot, readContinuityReview} from './server-lib.mjs';
+import {createShot, moveShot, readContinuityReview, readRemovedShots, readRenderAcceptance, readShotPlan, readShotPlans, removeShot, restoreShot, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
 
 const roots = [];
 const SESSION_ID = 'session-1';
@@ -29,7 +30,7 @@ async function fixture() {
   await mkdir(path.join(root, '.vimax'), {recursive: true});
   await writeFile(path.join(root, '.vimax', 'sessions.json'), JSON.stringify({
     active_session_id: SESSION_ID,
-    sessions: {[SESSION_ID]: {session_id: SESSION_ID, project_name: 'Film', working_dir: `.working_dir/${SESSION_ID}`}},
+    sessions: {[SESSION_ID]: {session_id: SESSION_ID, project_name: 'Film', working_dir: `.working_dir/${SESSION_ID}`, user_requirement: ''}},
   }));
   await mkdir(path.join(working, ROOT, 'shots', '2'), {recursive: true});
   await mkdir(path.join(working, ROOT, 'shots', '4'), {recursive: true});
@@ -55,6 +56,53 @@ async function fixture() {
   return {root, working};
 }
 
+async function ideaFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'vimax-idea-timeline-'));
+  const working = path.join(root, '.working_dir', SESSION_ID);
+  await mkdir(working, {recursive: true});
+  await mkdir(path.join(root, '.vimax'), {recursive: true});
+  await writeFile(path.join(root, '.vimax', 'sessions.json'), JSON.stringify({
+    active_session_id: SESSION_ID,
+    sessions: {[SESSION_ID]: {session_id: SESSION_ID, working_dir: `.working_dir/${SESSION_ID}`, user_requirement: ''}},
+  }));
+  await writeFile(path.join(working, 'render_manifest.json'), JSON.stringify({render_mode: 'idea2video'}));
+  await mkdir(path.join(working, 'idea2video'), {recursive: true});
+  await writeFile(path.join(working, 'idea2video', 'characters.json'), JSON.stringify([{idx: 0, identifier_in_scene: 'Global character'}]));
+  for (const [scene, slots, character] of [
+    ['scene_0', [4, 2], {idx: 0, identifier_in_scene: 'Scene Zero'}],
+    ['scene_1', [2], {idx: 7, identifier_in_scene: 'Scene One'}],
+  ]) {
+    const directory = path.join(working, 'idea2video', scene);
+    await mkdir(path.join(directory, 'shots'), {recursive: true});
+    await writeFile(path.join(directory, 'characters.json'), JSON.stringify([character]));
+    await writeFile(path.join(directory, 'camera_tree.json'), JSON.stringify([{idx: 0, active_shot_idxs: slots}]));
+    await writeFile(path.join(directory, 'storyboard.json'), JSON.stringify(
+      slots.map((idx) => ({idx, is_last: false, cam_idx: 0, visual_desc: `${scene} shot ${idx}`, audio_desc: ''})),
+    ));
+    for (const idx of slots) {
+      await mkdir(path.join(directory, 'shots', String(idx)), {recursive: true});
+      await writeFile(path.join(directory, 'shots', String(idx), 'shot_description.json'), JSON.stringify({
+        idx, ff_desc: `${scene} first ${idx}`, lf_desc: `${scene} last ${idx}`,
+        ff_vis_char_idxs: [character.idx], lf_vis_char_idxs: [character.idx], motion_desc: 'move', audio_desc: '',
+      }));
+    }
+  }
+  process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '5';
+  return {root, working};
+}
+
+async function fingerprints(working, paths) {
+  const result = {};
+  for (const relative of paths) {
+    try {
+      result[relative] = createHash('sha256').update(await readFile(path.join(working, relative))).digest('hex');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      result[relative] = null;
+    }
+  }
+  return result;
+}
 const shotDescription = async (working, slot) =>
   JSON.parse(await readFile(path.join(working, ROOT, 'shots', String(slot), 'shot_description.json'), 'utf8'));
 const storyboard = async (working) => JSON.parse(await readFile(path.join(working, ROOT, 'storyboard.json'), 'utf8'));
@@ -111,6 +159,50 @@ describe('adding a suggested shot', () => {
     const refused = await createShot(root, {...SUGGESTION, ffVis: [7]}).catch((error) => error);
 
     expect(refused.message).toMatch(/Unknown character index: 7/);
+  });
+  it('serializes simultaneous adds so both distinct briefs survive', async () => {
+    const {root, working} = await fixture();
+
+    const results = await Promise.all([
+      createShot(root, {sessionId: SESSION_ID, root: ROOT, after: '4', brief: 'first simultaneous addition'}),
+      createShot(root, {sessionId: SESSION_ID, root: ROOT, after: '4', brief: 'second simultaneous addition'}),
+    ]);
+
+    const slots = results.map((result) => result.created.slot);
+    expect(new Set(slots).size).toBe(2);
+    const tree = await cameras(working);
+    expect(tree[0].active_shot_idxs.map(String)).toHaveLength(4);
+    expect((await storyboard(working)).filter((row) => slots.includes(String(row.idx))).map((row) => row.visual_desc).sort()).toEqual([
+      'first simultaneous addition', 'second simultaneous addition',
+    ]);
+    for (const slot of slots) expect((await shotDescription(working, slot)).idx).toBe(Number(slot));
+  });
+
+  it('invalidates accepted assemblies on create and reorder and keeps endings canonical', async () => {
+    const {root, working} = await fixture();
+    const finalFilm = path.join(working, ROOT, 'final_video.mp4');
+    await writeFile(finalFilm, 'old film');
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, stage: 'final_video', accepted: true});
+
+    const created = await createShot(root, {sessionId: SESSION_ID, root: ROOT, after: '4', brief: 'new ending'});
+
+    expect(await readFile(finalFilm).catch(() => null)).toBeNull();
+    let acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('planned');
+    const createdPlan = await shotDescription(working, created.created.slot);
+    expect(createdPlan.is_last).toBe(true);
+    expect((await storyboard(working)).filter((row) => row.is_last).map((row) => String(row.idx))).toEqual([created.created.slot]);
+
+    await writeFile(finalFilm, 'old film after add');
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, stage: 'final_video', accepted: true});
+    await moveShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '2', after: created.created.slot});
+
+    expect(await readFile(finalFilm).catch(() => null)).toBeNull();
+    acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('planned');
+    const endingDescriptions = await Promise.all(['2', '4', created.created.slot].map((slot) => shotDescription(working, slot)));
+    expect(endingDescriptions.filter((plan) => plan.is_last).map((plan) => String(plan.idx))).toEqual(['2']);
+    expect((await storyboard(working)).filter((row) => row.is_last).map((row) => String(row.idx))).toEqual(['2']);
   });
 });
 
@@ -175,6 +267,57 @@ describe('reading a coverage review', () => {
     expect(payload.stale).toBe(true);
     expect(payload.staleReason).toMatch(/Edited since this review/);
     expect(payload.staleReason).toMatch(/shots\/4\/shot_description.json/);
+  });
+  it('stales reviews when the root, source script, or captured requirement changes', async () => {
+    const {root, working} = await fixture();
+    const scriptPath = path.join(working, ROOT, 'script.txt');
+    await writeFile(scriptPath, 'source script');
+    const inputs = await fingerprints(working, [
+      `${ROOT}/script.txt`,
+      `${ROOT}/characters.json`,
+      `${ROOT}/camera_tree.json`,
+      `${ROOT}/storyboard.json`,
+      `${ROOT}/shots/2/shot_description.json`,
+      `${ROOT}/shots/4/shot_description.json`,
+    ]);
+    const review = {
+      root: ROOT,
+      user_requirement: '',
+      input_files: inputs,
+      reviewed_at: new Date().toISOString(),
+      shots_reviewed: ['2', '4'],
+      beats: [],
+      suggestions: [],
+    };
+    await writeReview(working, review);
+    expect((await readContinuityReview(root, SESSION_ID, ROOT)).stale).toBe(false);
+
+    await writeFile(scriptPath, 'changed source script');
+    const scriptChange = await readContinuityReview(root, SESSION_ID, ROOT);
+    expect(scriptChange.stale).toBe(true);
+    expect(scriptChange.staleReason).toMatch(/script2video\/script.txt/);
+
+    await writeFile(scriptPath, 'source script');
+    const sessionsPath = path.join(root, '.vimax', 'sessions.json');
+    const sessions = JSON.parse(await readFile(sessionsPath, 'utf8'));
+    sessions.sessions[SESSION_ID].user_requirement = 'keep the ending quiet';
+    await writeFile(sessionsPath, JSON.stringify(sessions));
+    const requirementChange = await readContinuityReview(root, SESSION_ID, ROOT);
+    expect(requirementChange.stale).toBe(true);
+    expect(requirementChange.staleReason).toMatch(/user requirement changed/);
+  });
+
+  it('rejects a fingerprinted review belonging to another render root', async () => {
+    const {root, working} = await fixture();
+    await writeReview(working, {
+      root: 'idea2video', user_requirement: '', input_files: {},
+      reviewed_at: new Date().toISOString(), shots_reviewed: ['2', '4'], beats: [], suggestions: [],
+    });
+
+    const payload = await readContinuityReview(root, SESSION_ID, ROOT);
+
+    expect(payload.stale).toBe(true);
+    expect(payload.staleReason).toMatch(/render root/);
   });
 });
 
@@ -280,5 +423,35 @@ describe('moving a shot in the film', () => {
     const refused = await moveShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '2', direction: 'sideways'}).catch((error) => error);
 
     expect(refused.message).toMatch(/Unknown direction: sideways/);
+  });
+});
+
+describe('idea scene timeline storage', () => {
+  const sceneFile = (working, scene, ...parts) => path.join(working, 'idea2video', scene, ...parts);
+
+  it('reads, updates, adds, removes, lists, and restores scene-local shots', async () => {
+    const {root, working} = await ideaFixture();
+    const listed = await readShotPlans(root, SESSION_ID, 'idea2video');
+
+    expect(listed.plans.map((plan) => plan.slot)).toEqual(['scene_0/4', 'scene_0/2', 'scene_1/2']);
+    expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_0/2')).characters.map((character) => character.name)).toEqual(['Scene Zero']);
+    expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_1/2')).characters.map((character) => character.name)).toEqual(['Scene One']);
+
+    await updateShotPlan(root, {sessionId: SESSION_ID, root: 'idea2video', slot: 'scene_0/2', ffDesc: 'Updated scene-zero opening'});
+    expect(JSON.parse(await readFile(sceneFile(working, 'scene_0', 'shots', '2', 'shot_description.json'), 'utf8')).ff_desc)
+      .toBe('Updated scene-zero opening');
+    const created = await createShot(root, {sessionId: SESSION_ID, root: 'idea2video', after: 'scene_0/4', brief: 'A scene-zero insert'});
+    expect(created.created.slot).toBe('scene_0/5');
+    expect(JSON.parse(await readFile(sceneFile(working, 'scene_0', 'camera_tree.json'), 'utf8'))[0].active_shot_idxs).toEqual([4, 5, 2]);
+    await expect(moveShot(root, {
+      sessionId: SESSION_ID, root: 'idea2video', slot: 'scene_0/2', after: 'scene_1/2',
+    })).rejects.toThrow(/cannot be moved between scenes/);
+
+    await removeShot(root, {sessionId: SESSION_ID, root: 'idea2video', slot: created.created.slot});
+    const removed = await readRemovedShots(root, SESSION_ID, 'idea2video');
+    expect(removed.removed.map((entry) => entry.slot)).toEqual(['scene_0/5']);
+    await restoreShot(root, {sessionId: SESSION_ID, root: 'idea2video', slot: created.created.slot});
+    expect(JSON.parse(await readFile(sceneFile(working, 'scene_0', 'camera_tree.json'), 'utf8'))[0].active_shot_idxs).toEqual([4, 5, 2]);
+    expect(JSON.parse(await readFile(sceneFile(working, 'scene_0', 'storyboard.json'), 'utf8')).map((row) => row.idx)).toEqual([4, 5, 2]);
   });
 });

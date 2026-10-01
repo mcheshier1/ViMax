@@ -101,9 +101,10 @@ export function suggestionFraming(suggestion: ContinuitySuggestion): string {
  */
 export function suggestionAnchor(index: number, suggestions: ContinuitySuggestion[], created: string[]): string {
   const suggestion = suggestions[index];
-  const previous = index > 0 ? suggestions[index - 1] : undefined;
-  if (previous && created[index - 1] !== undefined && String(previous.after_shot) === String(suggestion.after_shot)) {
-    return String(created[index - 1]);
+  for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
+    if (String(suggestions[previousIndex].after_shot) === String(suggestion.after_shot) && created[previousIndex] !== undefined) {
+      return String(created[previousIndex]);
+    }
   }
   return String(suggestion.after_shot);
 }

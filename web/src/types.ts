@@ -226,6 +226,11 @@ export type ConfigSection = {
   base_url: string;
   api_key: string;
   has_api_key: boolean;
+  provider?: string;
+  resolution?: string;
+  clip_seconds?: string;
+  effective_clip_seconds?: string;
+  generate_audio?: string;
 };
 
 export type AgentConfig = {

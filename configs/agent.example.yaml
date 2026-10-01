@@ -13,14 +13,14 @@ image:
   api_key: ''
 
 video:
+  # Supported providers: openrouter, yunwu, agnes, ltx.
+  provider: openrouter
   model: <YOUR_VIDEO_MODEL>
   base_url: <YOUR_VIDEO_BASE_URL>
   api_key: ''
-  # Seconds each clip renders as. The dialogue has to fit in it, and it sets the runtime of
-  # the whole plan. Most models accept only a listed set of lengths: kwaivgi/kling-v3.0-std
-  # takes 3-15, kwaivgi/kling-video-o1 only 5 or 10. This file wins over an exported
-  # VIMAX_OPENROUTER_VIDEO_DURATION, which is invisible from a project.
+  resolution: 720p
   clip_seconds: 8
+  generate_audio: true
 
 # Optional. Fill these only when using novel2video planning.
 embedding:

@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import hashlib
+import os
 import json
 import tempfile
 import unittest
@@ -54,31 +55,38 @@ class FakeRevisionModel:
 
 
 class FailRenderIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
         raise RuntimeError("render failed")
 
 
 class FailRender403IdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
         raise RuntimeError("OpenRouter video create failed with HTTP 403: {'error': {'message': 'Key limit exceeded (total limit). Manage it using token sk-short', 'code': 403}}")
 
 
 class FailRenderContentFilterIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
         raise RuntimeError("Image generation failed for the first_frame of shot 13: OpenRouter image generation with model meta/muse-image failed with HTTP 400: {'error': {'message': 'The response was filtered due to the prompt triggering our content management policy.', 'code': 400, 'metadata': {'provider_name': 'Meta'}}}")
 
 
 class FailRenderMissingReferenceIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
         raise RuntimeError("Image generation failed for the first_frame of shot 0: [Errno 2] No such file or directory: '/tmp/session/script2video/character_portraits/0_Claude/front.png'")
 
 
 class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
         print("NOISE_FROM_RENDER_PIPELINE")
         final = self.working_dir / "final_video.mp4"
         final.write_text("video", encoding="utf-8")
         return RenderOutcome(phase="video", style=style, final_video_path=str(final))
+
+class RecordingIdeaScopePipeline(FakeIdeaPipeline):
+    scopes = []
+
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+        type(self).scopes.append(only_shots)
+        return RenderOutcome(phase="video", style=style)
 
 
 class FakeScriptPipeline:
@@ -739,6 +747,44 @@ class RedoRollbackTests(unittest.TestCase):
         self.assertFalse(film.exists())
         self.assertTrue((working / ".redo_backup" / "script2video" / "final_video.mp4").exists())
 
+    def test_scene_redo_holds_and_restores_scene_and_root_films(self):
+        from agent_runtime.vimax_adapters import _clear_redo_targets, _restore_redo_backup
+
+        working = self._cleared_session(tempfile.mkdtemp())
+        idea_root = working / "idea2video"
+        selected = idea_root / "scene_1" / "shots" / "0"
+        selected.mkdir(parents=True)
+        (selected / "shot_description.json").write_text('{"idx": 0}', encoding="utf-8")
+        clip = selected / "kwaivgi_kling-video-o1" / "video.mp4"
+        clip.parent.mkdir()
+        clip.write_bytes(b"old clip")
+        unrelated = idea_root / "scene_0" / "shots" / "0"
+        unrelated.mkdir(parents=True)
+        (unrelated / "shot_description.json").write_text('{"idx": 0}', encoding="utf-8")
+
+        scene_film = idea_root / "scene_1" / "final_video.mp4"
+        unrelated_film = idea_root / "scene_0" / "final_video.mp4"
+        root_film = idea_root / "final_video.mp4"
+        scene_film.write_bytes(b"old scene")
+        unrelated_film.write_bytes(b"unrelated scene")
+        root_film.write_bytes(b"old aggregate")
+
+        _clear_redo_targets(working, "idea2video", {"scene_1/0": "clips"})
+
+        self.assertFalse(clip.exists())
+        self.assertFalse(scene_film.exists())
+        self.assertFalse(root_film.exists())
+        self.assertEqual(unrelated_film.read_bytes(), b"unrelated scene")
+
+        restored = _restore_redo_backup(working, "idea2video")
+
+        self.assertEqual(clip.read_bytes(), b"old clip")
+        self.assertEqual(scene_film.read_bytes(), b"old scene")
+        self.assertEqual(root_film.read_bytes(), b"old aggregate")
+        self.assertEqual(unrelated_film.read_bytes(), b"unrelated scene")
+        self.assertIn("idea2video/scene_1/final_video.mp4", restored)
+        self.assertIn("idea2video/final_video.mp4", restored)
+
     def test_redrawing_keyframes_clears_the_film_too(self):
         from agent_runtime.vimax_adapters import _clear_redo_targets
 
@@ -1323,6 +1369,109 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(index.get(record["session_id"])["stale"]["final_video"])
 
 
+    async def test_script_revision_updates_target_without_replanning_or_switching_session(self):
+        for source in ({}, {"script": "different source"}, {"idea": "different idea"}):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                index = SessionIndex(tmp)
+                record = index.create(idea="original source")
+                working_dir = index.working_dir(record["session_id"])
+                root = working_dir / "script2video"
+                relative = "script2video/shots/17/shot_description.json"
+                target = working_dir / relative
+                target.parent.mkdir(parents=True)
+                target.write_text('[{"idx": 0, "description": "calm"}]', encoding="utf-8")
+                (root / "script.txt").write_text("original source", encoding="utf-8")
+                manifest = working_dir / "render_manifest.json"
+                manifest.write_text('{"render_mode": "script2video"}', encoding="utf-8")
+                manifest_before = manifest.read_bytes()
+                adapter = ViMaxAdapters(Path(tmp), index)
+                with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeRevisionModel()):
+                    result = await adapter.vimax_narrative_planning({
+                        "session_id": record["session_id"], "render_mode": "script2video",
+                        "revision_target": relative, "revision_instruction": "make it oppressive",
+                        **source,
+                    })
+                self.assertTrue(result.ok)
+                self.assertEqual(result.metadata["revised"], [relative])
+                self.assertEqual(json.loads(target.read_text())[0]["description"], "more oppressive")
+                self.assertEqual(result.metadata["session_id"], record["session_id"])
+                self.assertEqual(len(index.load()["sessions"]), 1)
+                self.assertEqual(index.get(record["session_id"])["idea"], "original source")
+                self.assertEqual((root / "script.txt").read_text(), "original source")
+                self.assertEqual(manifest.read_bytes(), manifest_before)
+                self.assertTrue(index.get(record["session_id"])["stale"]["final_video"])
+
+    async def test_revision_noop_preserves_artifact_stale_state_and_revision_log(self):
+        cases = [
+            ("shot_description.json", '{"description":"calm","idx":0}', '{"description":"calm","idx":0}'),
+            ("shot_description.json", '{"description":"calm","idx":0}', '{ "idx": 0, "description": "calm" }'),
+            ("notes.txt", "Already calm", "Already calm"),
+        ]
+        for filename, before, output in cases:
+            with self.subTest(filename=filename, output=output), tempfile.TemporaryDirectory() as tmp:
+                index = SessionIndex(tmp)
+                record = index.create(idea="original source")
+                working_dir = index.working_dir(record["session_id"])
+                relative = f"script2video/shots/17/{filename}"
+                target = working_dir / relative
+                target.parent.mkdir(parents=True)
+                target.write_text(before, encoding="utf-8")
+                (working_dir / "script2video" / "script.txt").write_text("original source", encoding="utf-8")
+                (working_dir / "render_manifest.json").write_text('{"render_mode":"script2video"}', encoding="utf-8")
+                index.mark_stale(record["session_id"], ["storyboard"])
+                stale_before = index.get(record["session_id"])["stale"]
+                index.append_log("revisions", {"previous": "revision"})
+                log = Path(tmp) / ".vimax" / "logs" / "revisions.jsonl"
+                log_before = log.read_bytes()
+                mtime_before = target.stat().st_mtime_ns
+                model = SimpleNamespace(ainvoke=None)
+                async def respond(prompt):
+                    return SimpleNamespace(content=output)
+                model.ainvoke = respond
+                with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=model):
+                    result = await ViMaxAdapters(Path(tmp), index).vimax_narrative_planning({
+                        "revision_target": relative, "revision_instruction": "keep it calm",
+                    })
+                self.assertFalse(result.ok)
+                self.assertEqual(result.metadata["error_type"], "revision_noop")
+                self.assertEqual(result.metadata["revised"], [])
+                self.assertEqual(target.read_bytes(), before.encode())
+                self.assertEqual(target.stat().st_mtime_ns, mtime_before)
+                self.assertEqual(index.get(record["session_id"])["stale"], stale_before)
+                self.assertEqual(log.read_bytes(), log_before)
+
+    async def test_script_revision_reports_missing_dependencies_and_instruction(self):
+        for instruction, error_type in [("change it", "dependency_missing"), ("", "missing_revision_instruction")]:
+            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as tmp:
+                index = SessionIndex(tmp)
+                record = index.create(idea="original source")
+                working_dir = index.working_dir(record["session_id"])
+                root = working_dir / "script2video"
+                (root / "script.txt").write_text("original source", encoding="utf-8")
+                (working_dir / "render_manifest.json").write_text('{"render_mode":"script2video"}', encoding="utf-8")
+                result = await ViMaxAdapters(Path(tmp), index).vimax_narrative_planning({
+                    "revision_target": "script2video/shots/17/shot_description.json",
+                    "revision_instruction": instruction, "render_mode": "script2video",
+                })
+                self.assertFalse(result.ok)
+                self.assertEqual(result.metadata["error_type"], error_type)
+
+    async def test_revision_can_repair_malformed_existing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="x")
+            relative = "idea2video/scene_0/storyboard.json"
+            target = index.working_dir(record["session_id"]) / relative
+            target.parent.mkdir(parents=True)
+            target.write_text("{invalid", encoding="utf-8")
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeRevisionModel()):
+                result = await ViMaxAdapters(Path(tmp), index).vimax_narrative_planning({
+                    "revision_target": relative, "revision_instruction": "repair the JSON",
+                })
+            self.assertTrue(result.ok)
+            self.assertEqual(result.metadata["revised"], [relative])
+            self.assertEqual(json.loads(target.read_text())[0]["description"], "more oppressive")
+
     async def test_revision_missing_instruction_marks_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
@@ -1507,3 +1656,139 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
             self.assertFalse(result.ok)
             self.assertEqual(result.metadata["error_type"], "dependency_missing")
+
+    async def test_idea_redraw_dispatch_preserves_scene_scope_and_partial_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="x", user_requirement="one short scene", style="cinematic")
+            working = Path(tmp) / record["working_dir"]
+            root = working / "idea2video"
+            (root / "story.txt").write_text("story", encoding="utf-8")
+            (root / "script.json").write_text("[]", encoding="utf-8")
+            (root / "characters.json").write_text("[]", encoding="utf-8")
+            for scene_idx in (0, 1):
+                scene = root / f"scene_{scene_idx}"
+                (scene / "shots" / "0").mkdir(parents=True)
+                (scene / "storyboard.json").write_text("[]", encoding="utf-8")
+                (scene / "camera_tree.json").write_text(json.dumps([{"idx": 0, "active_shot_idxs": [0]}]), encoding="utf-8")
+                shot = scene / "shots" / "0"
+                (shot / "shot_description.json").write_text('{"idx": 0}', encoding="utf-8")
+                frame = shot / "qwen_qwen-image-3" / "first_frame.png"
+                frame.parent.mkdir()
+                frame.write_bytes(b"selected frame" if scene_idx == 1 else b"unreviewed frame")
+
+            clip = root / "scene_1" / "shots" / "0" / "kwaivgi_kling-video-o1" / "video.mp4"
+            clip.parent.mkdir(parents=True)
+            clip.write_bytes(b"rejected clip")
+            selected_frame = root / "scene_1" / "shots" / "0" / "qwen_qwen-image-3" / "first_frame.png"
+            (working / "render_acceptance.json").write_text(json.dumps({
+                "idea2video": {"shots": {
+                    "scene_1/0": {
+                        "keyframes": {"accepted_at": "now", "artifacts": [{
+                            "path": "idea2video/scene_1/shots/0/qwen_qwen-image-3/first_frame.png",
+                            "size": len(selected_frame.read_bytes()),
+                            "sha256": hashlib.sha256(selected_frame.read_bytes()).hexdigest(),
+                        }]},
+                        "clips": {"rejected_at": "now", "reason": "wrong camera move"},
+                    },
+                }},
+            }), encoding="utf-8")
+
+            RecordingIdeaScopePipeline.scopes.clear()
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._enforce_render_sequence", return_value=None), \
+                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", RecordingIdeaScopePipeline):
+                result = await adapter.vimax_render_video({
+                    "stop_after": "video",
+                    "render_mode": "idea2video",
+                    "redo_shots": ["scene_1/0"],
+                })
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(RecordingIdeaScopePipeline.scopes, [["scene_1/0"]])
+            self.assertFalse(result.metadata["render_completed"])
+            self.assertIsNone(result.metadata["final_video_path"])
+            self.assertIn("final film is not ready", result.content)
+            self.assertEqual(index.get(record["session_id"])["stage"], "rendering")
+            status = json.loads((working / "render_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "rendering")
+            self.assertFalse(status["render_completed"])
+
+    async def test_project_busy_from_another_runtime_leaves_session_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="same source", user_requirement="keep this", style="old style")
+            working = Path(tmp) / record["working_dir"]
+            lock = working / ".timeline-write-lock"
+            lock.mkdir()
+            (lock / "owner.json").write_text(json.dumps({"pid": os.getpid(), "token": "node-writer"}), encoding="utf-8")
+            before = index.get(record["session_id"])
+
+            result = await ViMaxAdapters(Path(tmp), index).vimax_narrative_planning({
+                "session_id": record["session_id"],
+                "idea": "same source",
+                "user_requirement": "replace this",
+                "style": "new style",
+            })
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "project_busy")
+            self.assertEqual(index.get(record["session_id"]), before)
+            self.assertEqual(list((working / "idea2video").iterdir()), [])
+            self.assertEqual(list((working / "script2video").iterdir()), [])
+            self.assertFalse((working / "render_status.json").exists())
+
+    async def test_review_persists_source_fingerprints_captured_before_model_await(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            requirement = "45-60 seconds, no dialogue"
+            index = SessionIndex(tmp)
+            record = index.create(idea="source", user_requirement=requirement, style="cinematic")
+            working = Path(tmp) / record["working_dir"]
+            root = working / "script2video"
+            shots = root / "shots" / "0"
+            shots.mkdir(parents=True)
+            source_script = root / "script.txt"
+            original = "A cat watches the rain."
+            source_script.write_text(original, encoding="utf-8")
+            (root / "characters.json").write_text("[]", encoding="utf-8")
+            (root / "camera_tree.json").write_text(json.dumps([{"idx": 0, "active_shot_idxs": [0]}]), encoding="utf-8")
+            (root / "storyboard.json").write_text(json.dumps([{"idx": 0, "visual_desc": "cat watches rain", "audio_desc": ""}]), encoding="utf-8")
+            (shots / "shot_description.json").write_text(json.dumps({"idx": 0, "motion_desc": "still"}), encoding="utf-8")
+
+            async def edit_script_during_review(model, prompt):
+                source_script.write_text("changed while the model was waiting", encoding="utf-8")
+                return '{"summary":"ok","beats":[],"suggestions":[]}'
+
+            adapter = ViMaxAdapters(Path(tmp), index)
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._complete_with_chat_model", side_effect=edit_script_during_review):
+                result = await adapter.vimax_review_timeline({"session_id": record["session_id"], "render_mode": "script2video"})
+
+            self.assertTrue(result.ok, result.content)
+            review = json.loads((working / "continuity_review.json").read_text(encoding="utf-8"))
+            self.assertEqual(review["user_requirement"], requirement)
+            self.assertEqual(review["input_files"]["script2video/script.txt"], hashlib.sha256(original.encode()).hexdigest())
+            self.assertNotEqual(review["input_files"]["script2video/script.txt"], hashlib.sha256(source_script.read_bytes()).hexdigest())
+            self.assertEqual(review["input_files"]["script2video/characters.json"], hashlib.sha256(b"[]").hexdigest())
+            self.assertIn("script2video/camera_tree.json", review["input_files"])
+            self.assertIn("script2video/storyboard.json", review["input_files"])
+            self.assertIn("script2video/shots/0/shot_description.json", review["input_files"])
+
+    def test_render_status_and_event_timestamps_are_utc_milliseconds(self):
+        from datetime import datetime, timezone
+        from agent_runtime.vimax_adapters import _write_render_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            _write_render_status(working, status="rendering", payload={"session_id": "s"})
+            status = json.loads((working / "render_status.json").read_text(encoding="utf-8"))
+            event = json.loads((working / "render_events.jsonl").read_text(encoding="utf-8"))
+            timestamp = status["timestamp"]
+            parsed = datetime.fromisoformat(timestamp)
+
+            self.assertEqual(event["timestamp"], timestamp)
+            self.assertEqual(parsed.utcoffset(), timezone.utc.utcoffset(parsed))
+            self.assertEqual(parsed.isoformat(timespec="milliseconds"), timestamp)

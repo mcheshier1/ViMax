@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import logging
@@ -37,10 +37,14 @@ from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
 from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
+from tools.video_generator_agnes_api import VideoGeneratorAgnesAPI
+from tools.video_generator_ltx_api import VideoGeneratorLTXAPI
 
-from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_model, video_provider
+from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_generate_audio, video_model, video_provider, video_resolution
 from .models import ToolResult
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
+
+from utils.project_lock import ProjectBusyError, project_write_lock
 
 
 class _UnavailableGenerator:
@@ -63,6 +67,7 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "Pass the active session_id from prompt context when the user is working in the selected project. An empty active session is initialized in place; a different source on a non-empty session creates a new session instead of overwriting existing artifacts. If idea/script/revision_target are omitted and the active session has an idea, continue that session and fill missing structured text artifacts. "
                 "It does not generate keyframes, video clips, or final video. Call this before revising storyboard/shots when those artifacts do not exist. "
                 "render_mode picks the root to plan: \"script2video\" or \"idea2video\". A session can hold both — an abandoned first attempt beside the one being worked in — and planning would otherwise re-enter the idea root, so pass it whenever the session has more than one. The chosen root is pinned for the later render. "
+                "revision_target takes precedence over idea/script and render_mode: revise that existing session-relative artifact without replanning or switching sessions. revision_instruction is required. Unchanged content (including JSON formatting-only changes) returns ok=false with error_type=revision_noop and leaves the file and stale dependencies unchanged. "
             ),
             handler=adapter.vimax_narrative_planning,
             schema={
@@ -104,6 +109,7 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "Each phase reuses artifacts that already exist, so re-running a phase after a revision is cheap. "
                 "Changing the image model mid-sequence breaks visual consistency and is refused unless allow_model_change=true is passed with explicit user approval. "
                 "render_mode picks which root renders: \"script2video\", \"idea2video\" or \"novel2video\". A session can have more than one root planned (an abandoned first attempt beside the current one), and the render would otherwise pick the first ready root rather than the one the project is being worked in, so pass render_mode when the session has more than one. The chosen root is pinned in render_manifest.json and a later render refuses to switch roots. "
+                "Shot redraws use redo_shots with the zero-based slot keys shown in the Timeline, plus allow_unreviewed_redo only when the user explicitly requests a slot without a rejection note. redo_rejected=true redraws every rejected shot. A redraw is restricted to its shots and phase; its acceptance gate checks those shots only. "
                 "This checks that structured text artifacts exist before rendering and reports missing dependencies instead of pretending render started."
             ),
             handler=adapter.vimax_render_video,
@@ -113,6 +119,9 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "render_mode": ToolArgumentSchema(str, required=False, default=""),
                 "allow_model_change": ToolArgumentSchema(bool, required=False, default=False),
                 "allow_unlocked": ToolArgumentSchema(bool, required=False, default=False),
+                "redo_shots": ToolArgumentSchema(list, required=False, default=[]),
+                "redo_rejected": ToolArgumentSchema(bool, required=False, default=False),
+                "allow_unreviewed_redo": ToolArgumentSchema(bool, required=False, default=False),
             },
         ),
         ToolSpec(
@@ -134,11 +143,69 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
     ]
 
 
+def _project_locked(method: Any) -> Any:
+    async def locked(self: "ViMaxAdapters", args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
+        name = method.__name__
+        if name == "vimax_narrative_planning" and str(args.get("revision_target") or "").strip():
+            # An artifact revision stays in the selected session, even with source arguments.
+            args = {**args, "idea": "", "script": ""}
+        session_id = str(args.get("session_id", "") or "").strip()
+        explicit_session_id = bool(session_id)
+        call_args = args
+
+        # Resolve the target without touching an existing session. A conflicting
+        # writer must be rejected before set_active(), metadata, status, or artifacts
+        # are changed. A brand-new generated session has no prior project lock; explicit
+        # unknown IDs can still be locked at their deterministic directory before create.
+        if name in {"vimax_narrative_planning", "vimax_novel_planning"}:
+            if not session_id:
+                session_id = str((self.session_index.active() or {}).get("session_id") or "")
+            candidate = self.session_index.get(session_id) if session_id else None
+            if name == "vimax_narrative_planning":
+                source = str(args.get("idea", "") or "").strip() or str(args.get("script", "") or "").strip()
+            else:
+                source = str(args.get("novel_text", "") or "").strip()
+            if candidate is None and explicit_session_id and not (name == "vimax_novel_planning" and not source):
+                session_id = self.session_index._normalize_session_id(session_id)
+                working_dir = self.session_index._working_dir_for_id(session_id)
+                call_args = {**args, "session_id": session_id}
+                try:
+                    with project_write_lock(working_dir):
+                        return await method(self, call_args, runtime)
+                except ProjectBusyError as exc:
+                    return ToolResult(name, False, str(exc), {"error_type": "project_busy", "session_id": session_id})
+            if candidate is None or (source and _is_new_source_for_session(candidate, source)):
+                if name == "vimax_novel_planning" and not source:
+                    return await method(self, args, runtime)
+                session = self._resolve_session(
+                    session_id,
+                    idea=str(args.get("idea", "") or "").strip() if name == "vimax_narrative_planning" else str(args.get("novel_text", "") or "").strip(),
+                    script=str(args.get("script", "") or "").strip() if name == "vimax_narrative_planning" else "",
+                    user_requirement=str(args.get("user_requirement", "") or "").strip(),
+                    style=str(args.get("style", "") or "").strip(),
+                )
+                session_id = str(session["session_id"])
+                call_args = {**args, "session_id": session_id}
+        elif name in {"vimax_render_video", "vimax_review_timeline"} and not session_id:
+            session_id = str((self.session_index.active() or {}).get("session_id") or "")
+
+        if not session_id:
+            return await method(self, call_args, runtime)
+        working_dir = self.session_index.working_dir(session_id)
+        try:
+            with project_write_lock(working_dir):
+                return await method(self, call_args, runtime)
+        except ProjectBusyError as exc:
+            return ToolResult(name, False, str(exc), {"error_type": "project_busy", "session_id": session_id})
+    return locked
+
+
 class ViMaxAdapters:
     def __init__(self, workspace_root: Path, session_index: Any) -> None:
         self.workspace_root = workspace_root.resolve()
         self.session_index = session_index
 
+    @_project_locked
     async def vimax_narrative_planning(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
         idea = str(args.get("idea", "") or "").strip()
         script = str(args.get("script", "") or "").strip()
@@ -148,6 +215,12 @@ class ViMaxAdapters:
         session = self._resolve_session(str(args.get("session_id", "") or ""), idea=idea, script=script, user_requirement=user_requirement, style=requested_style)
         session_id = session["session_id"]
         working_dir = self.session_index.working_dir(session_id)
+        revision_target = str(args.get("revision_target") or "").strip()
+        if revision_target:
+            return await self._revise_narrative_artifact(
+                session_id, working_dir, revision_target,
+                str(args.get("revision_instruction") or "").strip(), runtime,
+            )
         idea_dir = working_dir / "idea2video"
         script_dir = working_dir / "script2video"
         idea_dir.mkdir(parents=True, exist_ok=True)
@@ -171,9 +244,6 @@ class ViMaxAdapters:
             user_requirement = user_requirement or str(session.get("user_requirement") or "").strip()
 
         if not idea and not script:
-            revision_target = str(args.get("revision_target") or "").strip()
-            if revision_target:
-                return await self._revise_narrative_artifact(session_id, working_dir, revision_target, str(args.get("revision_instruction") or "").strip(), runtime)
             session_idea = str(session.get("idea") or "").strip()
             if session_idea:
                 idea = session_idea
@@ -306,13 +376,27 @@ class ViMaxAdapters:
             chat_model = _build_chat_model()
             before = target_path.read_text(encoding="utf-8")
             revised = await _revise_artifact_with_llm(chat_model, target_path.relative_to(working_dir).as_posix(), before, revision_instruction)
+            unchanged = revised == before
             if target_path.suffix == ".json":
                 try:
                     revised_payload = json.loads(revised)
                 except json.JSONDecodeError as exc:
                     self.session_index.update_stage(session_id, "error", f"Revision failed: invalid JSON output: {exc}")
                     return ToolResult("vimax_narrative_planning", False, f"Revision output was not valid JSON: {exc}", {"error_type": "invalid_revision_json", "session_id": session_id, "revision_target": revision_target})
+                try:
+                    unchanged = revised_payload == json.loads(before)
+                except json.JSONDecodeError:
+                    # A valid replacement can repair a malformed existing artifact.
+                    unchanged = False
                 revised = json.dumps(revised_payload, ensure_ascii=False, indent=2)
+            if unchanged:
+                message = "Revision produced no content changes; the artifact was left unchanged."
+                self.session_index.update_stage(session_id, "error", message)
+                return ToolResult("vimax_narrative_planning", False, message, {
+                    "error_type": "revision_noop", "session_id": session_id,
+                    "revision_target": target_path.relative_to(working_dir).as_posix(),
+                    "revised": [],
+                })
             target_path.write_text(revised, encoding="utf-8")
         except Exception as exc:
             self.session_index.update_stage(session_id, "error", f"Revision failed: {exc}")
@@ -338,6 +422,7 @@ class ViMaxAdapters:
         }
         return ToolResult("vimax_narrative_planning", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
 
+    @_project_locked
     async def vimax_novel_planning(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
         novel_text = str(args.get("novel_text", "") or "").strip()
         user_requirement = str(args.get("user_requirement", "") or "").strip()
@@ -394,6 +479,7 @@ class ViMaxAdapters:
         }
         return ToolResult("vimax_novel_planning", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
 
+    @_project_locked
     async def vimax_render_video(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
         session_id = str(args.get("session_id", "") or "").strip()
         session = self.session_index.get(session_id) if session_id else self.session_index.active()
@@ -482,12 +568,13 @@ class ViMaxAdapters:
                 return ToolResult("vimax_render_video", False, model_change["error"], model_change)
             # A redo names shots, and this run works on those shots: the clips of the rest are
             # left for their own turn rather than generated because a batch was easier.
-            only_shots = (
-                [int(slot) for slot in (redo.get("slots") or {}) if str(slot).lstrip("-").isdigit()] if redo else None
-            ) or None
-            # The gate covers what this run will draw: naming shots makes it their gate rather
-            # than the whole phase's, so an unrelated shot's unreviewed frames cannot block work
-            # that has nothing to do with them. A run that names nothing still waits for all of it.
+            only_shots = list(redo.get("slots") or {}) if redo else None
+            script_only_shots = (
+                [int(slot) for slot in only_shots if str(slot).lstrip("-").isdigit()]
+                if only_shots is not None and render_mode == "script2video"
+                else only_shots
+            )
+            # The gate covers exactly the slots this invocation will draw.
             acceptance = None if bool(args.get("allow_unlocked", False)) else _acceptance_refusal(working_dir, render_mode, stop_after, only_shots)
             if acceptance is not None:
                 self.session_index.update_stage(session_id, "error", acceptance["error"])
@@ -503,7 +590,7 @@ class ViMaxAdapters:
             if render_mode == "idea2video":
                 idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"))
                 with _suppress_pipeline_output():
-                    outcome = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), quiet=True, stop_after=stop_after, revision_notes=revision_notes, progress=_pipeline_progress(runtime, session_id, tally=tally))
+                    outcome = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), quiet=True, stop_after=stop_after, revision_notes=revision_notes, progress=_pipeline_progress(runtime, session_id, tally=tally), only_shots=only_shots)
                 return self._render_outcome_result(runtime, session_id, working_dir, outcome, render_mode="idea2video", redo=redo, removed=removed, tally=tally)
             if render_mode == "script2video":
                 script_dir = working_dir / "script2video"
@@ -511,7 +598,7 @@ class ViMaxAdapters:
                 characters = _load_characters(script_dir / "characters.json")
                 pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir))
                 with _suppress_pipeline_output():
-                    outcome = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id, tally=tally), stop_after=stop_after, revision_notes=revision_notes, only_shots=only_shots)
+                    outcome = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id, tally=tally), stop_after=stop_after, revision_notes=revision_notes, only_shots=script_only_shots)
                 return self._render_outcome_result(runtime, session_id, working_dir, outcome, render_mode="script2video", redo=redo, removed=removed, tally=tally)
             if render_mode == "novel2video":
                 novel_dir = working_dir / "novel2video"
@@ -556,7 +643,6 @@ class ViMaxAdapters:
                 **({"redone_shots": sorted(redo.get("slots", {})), "cleared": len(removed), "cleared_paths": removed} if redo else {}),
                 **({"restored": restored} if restored else {}),
                 "error": error_text,
-                "where": _sanitize_error_text(_last_traceback_frames(where)),
                 "wrapped_error": wrapped_error_text,
                 "present": [path for path, present in checklist.items() if present],
                 "missing": [path for path, present in checklist.items() if not present],
@@ -580,6 +666,7 @@ class ViMaxAdapters:
         _write_render_status(working_dir, status="dependency_missing", payload=payload)
         return ToolResult("vimax_render_video", False, "No render mode matched current session.", payload)
 
+    @_project_locked
     async def vimax_review_timeline(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
         """Check the timeline against the script, and record what is missing.
 
@@ -653,7 +740,8 @@ class ViMaxAdapters:
                 metadata={"session_id": session_id, "render_mode": render_mode},
             )
 
-        reviewed_at = datetime.now().isoformat(timespec="seconds")
+        reviewed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        input_files = _coverage_input_files(working_dir, root_dir, render_mode)
         notes = ""
         try:
             chat_model = _build_chat_model()
@@ -679,7 +767,14 @@ class ViMaxAdapters:
             )
             review = normalize_review({}, root=render_mode, active_shots=active_shots, reviewed_at=reviewed_at)
 
-        stored = {**review, "session_id": session_id, "checks": [check.as_dict() for check in checks], "notes": notes}
+        stored = {
+            **review,
+            "session_id": session_id,
+            "checks": [check.as_dict() for check in checks],
+            "notes": notes,
+            "input_files": input_files,
+            "user_requirement": requirement,
+        }
         review_path = str(Path(write_review(str(working_dir), stored)).relative_to(self.workspace_root))
 
         gaps = [check for check in warnings if check.id == "dialogue_uncovered"]
@@ -689,7 +784,6 @@ class ViMaxAdapters:
             f"{len(review['beats'])} beat(s) judged, {len(gaps)} uncovered dialogue line(s)."
         ]
         lines.extend(f"  missing dialogue: {gap.message}" for gap in gaps)
-        lines.extend(f"  {check.id}: {check.message}" for check in warnings if check.id != "dialogue_uncovered")
         lines.extend(
             f"  {beat['status']} beat: {beat['text']}" + (f" — {beat['note']}" if beat["note"] else "")
             for beat in missing_beats
@@ -721,8 +815,6 @@ class ViMaxAdapters:
         The artifacts a redraw held are only dropped here, once the phase has run: a phase
         that raises instead keeps them for the rollback.
         """
-        if redo:
-            _discard_redo_backup(working_dir)
         stills = [str(Path(path).relative_to(self.workspace_root)) for path in outcome.stills]
         generated = (tally or {}).get("generated", 0)
         warnings = list((tally or {}).get("warnings") or [])
@@ -742,7 +834,7 @@ class ViMaxAdapters:
             "stills": stills,
             "awaiting_confirmation": outcome.awaiting_confirmation,
             "render_started": True,
-            "render_completed": outcome.phase == "video",
+            "render_completed": outcome.phase == "video" and bool(outcome.final_video_path),
             "final_video_path": str(Path(outcome.final_video_path).relative_to(self.workspace_root)) if outcome.final_video_path else None,
             "missing": [],
         }
@@ -781,12 +873,26 @@ class ViMaxAdapters:
                     stage=f"{outcome.phase}_ready",
                     metadata={**payload, "awaiting_confirmation": next_phase},
                 )
+            if redo:
+                _discard_redo_backup(working_dir)
             return ToolResult("vimax_render_video", True, content, payload)
+        if outcome.phase == "video" and not outcome.final_video_path:
+            content = "Video rendering made progress, but at least one scene is incomplete; the final film is not ready yet."
+            self.session_index.update_stage(session_id, "rendering", "Video clips rendered; final film is not complete")
+            _write_render_status(working_dir, status="rendering", payload=payload)
+            if runtime:
+                runtime.emit_progress(content, stage="video_progress", metadata=payload)
+            if redo:
+                _discard_redo_backup(working_dir)
+            return ToolResult("vimax_render_video", True, content, payload)
+
 
         self.session_index.update_stage(session_id, "rendered", "Final video rendered")
         _write_render_status(working_dir, status="rendered", payload=payload)
         if runtime:
             runtime.emit_progress("Render complete", stage="rendered", metadata=payload)
+        if redo:
+            _discard_redo_backup(working_dir)
         return ToolResult("vimax_render_video", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
 
     def _resolve_session(self, session_id: str, *, idea: str, script: str, user_requirement: str, style: str) -> dict[str, Any]:
@@ -976,18 +1082,23 @@ def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGenerato
     return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url)
 
 
-def _build_video_generator() -> VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRouterAPI:
+def _build_video_generator():
     api_key = video_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_VIDEO_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml video/llm api_key is required for video generation")
     model = video_model()
     base_url = video_base_url()
-    provider = video_provider().strip().lower()
+    provider = video_provider()
+    common = {"api_key": api_key, "model": model, "base_url": base_url, "clip_seconds": video_clip_seconds()}
     if provider == "openrouter":
-        return VideoGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url, clip_seconds=video_clip_seconds())
+        return VideoGeneratorOpenRouterAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
     if provider == "yunwu":
         return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
-    raise RuntimeError(f"Unsupported video base_url for automatic provider matching: {base_url}")
+    if provider == "agnes":
+        return VideoGeneratorAgnesAPI(**common, resolution=video_resolution())
+    if provider == "ltx":
+        return VideoGeneratorLTXAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
+    raise RuntimeError(f"Unsupported video provider '{provider}' for base URL: {base_url}")
 
 
 class _IdentityRewriter:
@@ -1088,7 +1199,7 @@ def _is_retryable_render_error(exc: Exception) -> bool:
 
 def _sanitize_error_text(text: str) -> str:
     sanitized = text
-    for marker in ("workspaces/default/keys/",):
+    for marker in ("Bearer ", "token "):
         if marker in sanitized:
             prefix, rest = sanitized.split(marker, 1)
             key_id = []
@@ -1113,7 +1224,7 @@ def _sanitize_error_text(text: str) -> str:
 def _write_render_status(working_dir: Path, *, status: str, payload: dict[str, Any]) -> None:
     working_dir.mkdir(parents=True, exist_ok=True)
     event = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "status": status,
         **payload,
     }
@@ -1442,6 +1553,59 @@ def _load_root_script(working_dir: Path, render_mode: str) -> str:
     return _read_text(working_dir / "idea2video" / "story.txt")
 
 
+def _coverage_input_files(working_dir: Path, root_dir: Path, render_mode: str) -> dict[str, str | None]:
+    """Fingerprint every source file the persisted coverage review can depend on."""
+    candidates = {
+        root_dir / "characters.json",
+        root_dir / "camera_tree.json",
+        root_dir / "storyboard.json",
+    }
+    if render_mode == "script2video":
+        candidates.add(root_dir / "script.txt")
+    else:
+        # script.json is preferred by _load_root_script; story.txt is its fallback.
+        candidates.update({root_dir / "script.json", root_dir / "story.txt"})
+
+    scene_dirs = sorted(
+        path for path in root_dir.glob("scene_*")
+        if path.is_dir() and path.name.removeprefix("scene_").isdigit()
+    )
+    for scene_dir in scene_dirs:
+        candidates.update({scene_dir / "camera_tree.json", scene_dir / "storyboard.json"})
+        shot_root = scene_dir / "shots"
+        if shot_root.is_dir():
+            candidates.update(
+                shot_dir / "shot_description.json"
+                for shot_dir in shot_root.iterdir()
+                if shot_dir.is_dir()
+            )
+
+    flat_shots = root_dir / "shots"
+    if flat_shots.is_dir():
+        candidates.update(
+            shot_dir / "shot_description.json"
+            for shot_dir in flat_shots.iterdir()
+            if shot_dir.is_dir()
+        )
+
+    removed_root = root_dir / ".removed_shots"
+    if removed_root.is_dir():
+        candidates.update(
+            slot_dir / "brief.json"
+            for slot_dir in removed_root.iterdir()
+            if slot_dir.is_dir()
+        )
+
+    fingerprints: dict[str, str | None] = {}
+    for path in sorted(candidates):
+        relative = path.relative_to(working_dir).as_posix()
+        try:
+            fingerprints[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            fingerprints[relative] = None
+    return fingerprints
+
+
 def _read_json_list(path: Path) -> list[dict[str, Any]]:
     """A JSON array of objects, or nothing when the file is missing or malformed."""
     try:
@@ -1728,7 +1892,7 @@ def _unaccepted_slots(working_dir: Path, root: str, stage: str) -> list[tuple[st
     ]
 
 
-def _acceptance_refusal(working_dir: Path, root: str, phase: str, only_shots: list[int] | None = None) -> dict[str, Any] | None:
+def _acceptance_refusal(working_dir: Path, root: str, phase: str, only_shots: list[int | str] | None = None) -> dict[str, Any] | None:
     """The reason a phase may not run yet, or None.
 
     Rendering a phase spends money on the artifacts the previous phase produced, so the
@@ -1976,14 +2140,20 @@ def _restore_redo_backup(working_dir: Path, root: str = "") -> list[str]:
 
 
 def _restored_target(relative: Path, root: str, planned: set[str]) -> Path:
-    """Where a held artifact goes back to: its own shot, unless that shot left the film.
-
-    The backup mirrors paths as they sit under the session root, so a held shot artifact
-    reads ``<root>/shots/<slot>/...``.
-    """
+    """Restore a held shot to its removed pile if it left the active timeline."""
     parts = relative.parts
-    if root and len(parts) >= 4 and parts[0] == root and parts[1] == "shots" and parts[2] not in planned:
+    if not root or not parts or parts[0] != root:
+        return relative
+    if len(parts) >= 4 and parts[1] == "shots" and parts[2] not in planned:
         return Path(root) / ".removed_shots" / parts[2] / Path(*parts[3:])
+    if (
+        len(parts) >= 5
+        and parts[1].startswith("scene_")
+        and parts[1][6:].isdigit()
+        and parts[2] == "shots"
+        and f"{parts[1]}/{parts[3]}" not in planned
+    ):
+        return Path(root) / parts[1] / ".removed_shots" / parts[3] / Path(*parts[4:])
     return relative
 
 
@@ -1993,13 +2163,7 @@ def _discard_redo_backup(working_dir: Path) -> None:
 
 
 def _clear_redo_targets(working_dir: Path, root: str, targets: dict[str, str]) -> list[str]:
-    """Move exactly the artifacts a redraw replaces out of the way, and nothing else.
-
-    A redraw leaves the plan alone: the shot description, the camera tree and the
-    character registry are inputs. The cached reference selection *is* cleared for
-    keyframes, because it holds the prompt that was sent last time — keeping it would
-    short-circuit the correction the redo exists to apply.
-    """
+    """Move invalidated artifacts and their assembled films aside for rollback."""
     root_dir = working_dir / root
     shot_dirs = dict(_shot_dirs(root_dir))
     removed: list[str] = []
@@ -2012,12 +2176,8 @@ def _clear_redo_targets(working_dir: Path, root: str, targets: dict[str, str]) -
             paths.extend(_shot_stage_paths(shot_dir, invalidated))
         if stage == "keyframes":
             paths.extend(shot_dir / f"{frame_type}_selector_output.json" for frame_type in ("first_frame", "last_frame"))
-            # A shot's first frame can be a camera still extracted from the transition video
-            # that leads into it (`new_camera_<idx>.png`). Clearing the frame but not that
-            # still leaves the redraw re-copying the same pixels: the frame is written again
-            # with a new timestamp and the old content, which is worse than not redrawing it.
-            # The transition itself is kept — it is a video-model call, and a redrawn shot's
-            # first frame is corrected from the portraits instead of copied from the still.
+            # Clearing a first frame must also clear a cached camera still that would
+            # otherwise copy the old pixels straight back into the redraw.
             paths.extend(shot_dir.rglob("new_camera_*.png"))
         for path in paths:
             if not path.exists() or not path.is_file():
@@ -2030,19 +2190,26 @@ def _clear_redo_targets(working_dir: Path, root: str, targets: dict[str, str]) -
                 continue
             removed.append(str(path.relative_to(working_dir)))
 
-    # The film is every shot's clip joined together, so redrawing any clip makes it stale.
-    # The concatenation is skipped while a film exists, which would strand the old edit on
-    # disk for good; clearing it lets the redraw's own run build it again from the new clips.
+    # A shot clip contributes to its scene film and to the root aggregate. Both
+    # ancestors must be rebuilt; unrelated scene films remain reusable.
     if any("clips" in REDO_INVALIDATES[stage] for stage in targets.values()):
-        film = root_dir / "final_video.mp4"
-        if film.exists() and film.is_file():
+        films = {root_dir / "final_video.mp4"}
+        if root == "idea2video":
+            for slot in targets:
+                if "/" in slot:
+                    scene, _ = slot.split("/", 1)
+                    if scene.startswith("scene_") and scene[6:].isdigit():
+                        films.add(root_dir / scene / "final_video.mp4")
+        for film in sorted(films):
+            if not film.exists() or not film.is_file():
+                continue
             held = working_dir / REDO_BACKUP_DIR / film.relative_to(working_dir)
             held.parent.mkdir(parents=True, exist_ok=True)
             try:
                 film.replace(held)
-                removed.append(str(film.relative_to(working_dir)))
             except OSError:
-                pass
+                continue
+            removed.append(str(film.relative_to(working_dir)))
     return removed
 
 

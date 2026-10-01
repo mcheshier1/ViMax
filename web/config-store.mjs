@@ -5,7 +5,7 @@ import {parse, stringify} from 'yaml';
 const SECTION_FIELDS = {
   llm: ['model_provider', 'model', 'base_url'],
   image: ['model', 'base_url'],
-  video: ['model', 'base_url'],
+  video: ['provider', 'model', 'base_url', 'resolution', 'clip_seconds', 'generate_audio'],
   embedding: ['model_provider', 'model', 'base_url'],
   reranker: ['model', 'base_url'],
 };
@@ -15,7 +15,7 @@ const DEFAULT_CLIP_SECONDS = 8;
 
 export async function readAgentConfig(repoRoot) {
   const {payload} = await loadConfig(repoRoot);
-  return publicConfig(payload);
+  return publicConfig(payload, effectiveClipSeconds(payload));
 }
 
 /**
@@ -31,12 +31,17 @@ export async function readAgentConfig(repoRoot) {
 export async function readClipSettings(repoRoot, renderedWith = '') {
   const {payload} = await loadConfig(repoRoot);
   const section = payload.video && typeof payload.video === 'object' ? payload.video : {};
-  const seconds = usableSeconds(section.clip_seconds) ?? usableSeconds(process.env.VIMAX_OPENROUTER_VIDEO_DURATION) ?? DEFAULT_CLIP_SECONDS;
+  const seconds = effectiveClipSeconds(payload);
   const configured = typeof section.model === 'string' ? section.model.trim() : '';
   // The configured model is what the next clip is rendered with; the manifest's record is
   // what the clips on disk were rendered with, and it is all there is when no config can be
   // read. The configured value wins, because a model change re-renders the clips.
   return {seconds, model: configured || String(renderedWith || '').trim()};
+}
+
+function effectiveClipSeconds(payload) {
+  const section = payload.video && typeof payload.video === 'object' ? payload.video : {};
+  return usableSeconds(section.clip_seconds) ?? usableSeconds(process.env.VIMAX_OPENROUTER_VIDEO_DURATION) ?? DEFAULT_CLIP_SECONDS;
 }
 
 function usableSeconds(value) {
@@ -65,7 +70,7 @@ export async function saveAgentConfig(repoRoot, input) {
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, stringify(payload, {lineWidth: 0}), {mode: 0o600});
   await rename(temporaryPath, configPath);
-  return publicConfig(payload);
+  return publicConfig(payload, effectiveClipSeconds(payload));
 }
 
 async function loadConfig(repoRoot) {
@@ -83,15 +88,22 @@ async function loadConfig(repoRoot) {
   return {configPath, payload};
 }
 
-function publicConfig(payload) {
+function publicConfig(payload, effectiveSeconds) {
   const sections = {};
   for (const [section, fields] of Object.entries(SECTION_FIELDS)) {
     const source = payload[section] && typeof payload[section] === 'object' ? payload[section] : {};
     const result = {};
-    for (const field of fields) result[field] = typeof source[field] === 'string' ? source[field] : '';
+    for (const field of fields) result[field] = typeof source[field] === 'string' ? source[field] : typeof source[field] === 'boolean' ? String(source[field]) : '';
+    if (section === 'video' && !result.provider) {
+      const baseUrl = String(source.base_url || '').toLowerCase();
+      result.provider = baseUrl.includes('agnes-ai.com') ? 'agnes'
+        : baseUrl.includes('ltx.io') ? 'ltx'
+          : baseUrl.includes('yunwu.ai') ? 'yunwu' : 'openrouter';
+    }
     result.api_key = '';
     result.has_api_key = Boolean(typeof source.api_key === 'string' && source.api_key.trim());
     sections[section] = result;
+    if (section === 'video') result.effective_clip_seconds = String(effectiveSeconds);
   }
   return {sections};
 }

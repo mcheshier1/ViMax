@@ -41,13 +41,15 @@ describe('agent config store', () => {
 
   it('falls back to the environment, then to eight seconds', async () => {
     const root = await fixture();
-    process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '10';
+    process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '5';
     try {
-      expect((await readClipSettings(root)).seconds).toBe(10);
+      expect((await readClipSettings(root)).seconds).toBe(5);
+      expect((await readAgentConfig(root)).sections.video).toMatchObject({clip_seconds: '', effective_clip_seconds: '5'});
     } finally {
       delete process.env.VIMAX_OPENROUTER_VIDEO_DURATION;
     }
     expect((await readClipSettings(root)).seconds).toBe(8);
+    expect((await readAgentConfig(root)).sections.video).toMatchObject({clip_seconds: '', effective_clip_seconds: '8'});
   });
 
   it('keeps a clip length through a save from the settings page', async () => {
@@ -72,6 +74,22 @@ describe('agent config store', () => {
     const saved = await readFile(path.join(root, 'configs', 'agent.local.yaml'), 'utf8');
     expect(saved).toContain('model: new-model');
     expect(saved).toContain('api_key: secret-value');
+  });
+
+  it('persists video provider and generation options without exposing its key', async () => {
+    const root = await fixture();
+    await saveAgentConfig(root, {sections: {video: {
+      provider: 'ltx', model: 'ltx-2-5-fast', base_url: 'https://api.ltx.io',
+      resolution: '1440p', clip_seconds: '10', generate_audio: 'false', api_key: 'video-secret',
+    }}});
+
+    const config = await readAgentConfig(root);
+    expect(config.sections.video).toMatchObject({
+      provider: 'ltx', model: 'ltx-2-5-fast', resolution: '1440p',
+      clip_seconds: '10', generate_audio: 'false', api_key: '', has_api_key: true,
+    });
+    expect(JSON.stringify(config)).not.toContain('video-secret');
+    expect(await readClipSettings(root)).toMatchObject({seconds: 10, model: 'ltx-2-5-fast'});
   });
 
   it('rejects invalid base URLs', async () => {

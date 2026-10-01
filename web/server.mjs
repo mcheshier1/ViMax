@@ -5,7 +5,8 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
-import {artifactContentType, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, resolveArtifactPath, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
+import {artifactContentType, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
+import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -98,6 +99,16 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/api/artifacts' && request.method === 'GET') {
       return sendJson(response, 200, {artifacts: await listSessionArtifacts(repoRoot, url.searchParams.get('session') || '')});
+    }
+    if (url.pathname === '/api/film' && request.method === 'GET') {
+      const payload = await readFilmSnapshot(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/progress' && request.method === 'GET') {
+      const payload = await readFilmProgress(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+      return payload
+        ? sendJson(response, 200, {...payload, agentRunning: Boolean(agentProcess), activeSessionId})
+        : sendJson(response, 404, {error: 'Project not found'});
     }
     if (url.pathname === '/api/continuity' && request.method === 'GET') {
       try {
@@ -194,8 +205,11 @@ const server = createServer(async (request, response) => {
       if (!acceptance) return sendJson(response, 404, {error: 'Project not found'});
       return sendJson(response, 200, acceptance);
     }
-    if (url.pathname === '/api/artifact' && request.method === 'GET') {
-      return streamArtifact(response, url.searchParams.get('session') || '', url.searchParams.get('path') || '');
+    if (url.pathname === '/api/artifact' && (request.method === 'GET' || request.method === 'HEAD')) {
+      return await serveArtifact(request, response, repoRoot, url.searchParams.get('session') || '', url.searchParams.get('path') || '');
+    }
+    if (url.pathname === '/api/thumbnail' && (request.method === 'GET' || request.method === 'HEAD')) {
+      return await serveThumbnail(request, response, repoRoot, url.searchParams.get('session') || '', url.searchParams.get('path') || '', url.searchParams.get('width'));
     }
     if (url.pathname === '/api/uploads' && request.method === 'POST') {
       const sessionId = url.searchParams.get('session') || '';
@@ -227,7 +241,10 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/api/messages' && request.method === 'POST') {
       const body = await readJsonBody(request);
       const text = String(body.text || '').trim();
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
       if (!text) return sendJson(response, 400, {error: 'Message text is required'});
+      if (!sessionId) return sendJson(response, 400, {error: 'Session id is required'});
+      if (sessionId !== activeSessionId) return sendJson(response, 409, {error: 'The requested project is no longer active'});
       if (!agentProcess?.stdin.writable) return sendJson(response, 409, {error: 'Agent is not running'});
       agentProcess.stdin.write(`${text}\n`);
       return sendJson(response, 202, {ok: true});
@@ -432,20 +449,15 @@ function formatByteLimit(bytes) {
 }
 
 function sendJson(response, status, payload) {
-  if (response.writableEnded) return;
+  if (response.writableEnded || response.destroyed) return;
+  if (response.headersSent) {
+    response.destroy();
+    return;
+  }
   response.writeHead(status, {'Content-Type': 'application/json; charset=utf-8'});
   response.end(JSON.stringify(payload));
 }
 
-async function streamArtifact(response, sessionId, relativePath) {
-  const filePath = resolveArtifactPath(repoRoot, sessionId, relativePath);
-  if (!existsSync(filePath)) return sendJson(response, 404, {error: 'Artifact not found'});
-  response.writeHead(200, {
-    'Content-Type': artifactContentType(filePath),
-    'Cache-Control': 'private, max-age=60',
-  });
-  createReadStream(filePath).pipe(response);
-}
 
 async function serveProductionApp(response, pathname) {
   const requested = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
@@ -460,6 +472,9 @@ async function serveProductionApp(response, pathname) {
 
 function shutdown() {
   stopAgent('shutdown');
-  server.close(() => process.exit(0));
+  void Promise.allSettled([
+    closeMediaCache(),
+    new Promise((resolve) => server.close(resolve)),
+  ]).then(() => process.exit(0));
   setTimeout(() => process.exit(0), 1_000).unref();
 }

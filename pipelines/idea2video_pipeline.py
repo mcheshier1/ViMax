@@ -21,6 +21,11 @@ def _pipeline_print(quiet: bool, message: str) -> None:
     if not quiet:
         print(message)
 
+def _file_signature(path: str) -> Dict[str, int]:
+    stat = os.stat(path)
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 
 class Idea2VideoPipeline(ModelScopedArtifacts):
     def __init__(
@@ -237,34 +242,63 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
         stop_after: str = DEFAULT_RENDER_PHASE,
         revision_notes: Dict[str, str] | None = None,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        only_shots: Optional[List[str]] = None,
     ) -> RenderOutcome:
         stop_after = normalize_phase(stop_after)
         self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
 
+        selected_by_scene: Dict[int, List[int]] | None = None
+        if only_shots is not None:
+            selected_by_scene = {}
+            for qualified in only_shots:
+                scene, separator, local_id = str(qualified).partition("/")
+                if not separator or not scene.startswith("scene_"):
+                    raise ValueError(f"Invalid qualified shot identity: {qualified!r}")
+                try:
+                    scene_idx = int(scene[6:])
+                    shot_idx = int(local_id)
+                except ValueError as error:
+                    raise ValueError(f"Invalid qualified shot identity: {qualified!r}") from error
+                selected_by_scene.setdefault(scene_idx, []).append(shot_idx)
+
         story = await self.develop_story(idea=idea, user_requirement=user_requirement, quiet=quiet)
-
         characters = await self.extract_characters(story=story, quiet=quiet)
-
         character_portraits_registry = await self.generate_character_portraits(
             characters=characters,
             character_portraits_registry=None,
             style=style,
         )
 
-        # Style review happens on the portraits, before the rest of the sequence is
-        # rendered from them.
         if stop_after == "portraits":
             stills = self.portrait_stills(character_portraits_registry)
             _pipeline_print(quiet, f"🖼️ Character portraits ready for style review ({len(stills)} images).")
             return self.render_outcome("portraits", style, stills=stills, awaiting="stills")
 
         scene_scripts = await self.write_script_based_on_story(story=story, user_requirement=user_requirement, quiet=quiet)
-
-        all_video_paths = []
+        all_video_paths: List[str] = []
         stills: List[str] = []
+        complete_scenes = 0
+        video_budget: Dict[str, str] = {}
 
         for idx, scene_script in enumerate(scene_scripts):
             scene_working_dir = os.path.join(self.working_dir, f"scene_{idx}")
+            scene_film = os.path.join(scene_working_dir, "final_video.mp4")
+            scene_scope = None if selected_by_scene is None else selected_by_scene.get(idx)
+            selected = selected_by_scene is None or scene_scope is not None
+
+            if stop_after == "video" and not selected:
+                if os.path.isfile(scene_film):
+                    all_video_paths.append(scene_film)
+                    complete_scenes += 1
+                    _pipeline_print(quiet, f"🚀 Reusing completed film for unselected scene {idx}.")
+                else:
+                    _emit_scene_progress(progress, "scene_deferred", f"Scene {idx} was not selected and has no completed film", idx)
+                    all_video_paths.append("")
+                continue
+
+            if not selected:
+                continue
+
             os.makedirs(scene_working_dir, exist_ok=True)
             script2video_pipeline = Script2VideoPipeline(
                 chat_model=self.chat_model,
@@ -281,8 +315,8 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
                 quiet=quiet,
                 stop_after=stop_after,
                 progress=progress,
-                # Redo notes are keyed scene-qualified where the review is; each scene's
-                # pipeline looks its own shots up by number.
+                only_shots=scene_scope,
+                video_budget=video_budget,
                 revision_notes={
                     slot.split("/", 1)[1]: note
                     for slot, note in (self.revision_notes or {}).items()
@@ -292,17 +326,77 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
             stills.extend(outcome.stills)
             if stop_after == "stills":
                 continue
-            all_video_paths.append(outcome.final_video_path)
+            if outcome.final_video_path and os.path.isfile(outcome.final_video_path):
+                all_video_paths.append(outcome.final_video_path)
+                complete_scenes += 1
+            else:
+                all_video_paths.append("")
+                _emit_scene_progress(
+                    progress,
+                    "scene_partial",
+                    f"Scene {idx} has generated progress but no completed film yet",
+                    idx,
+                )
 
         if stop_after == "stills":
             _pipeline_print(quiet, f"🖼️ Keyframes ready for review across {len(scene_scripts)} scene(s) ({len(stills)} images).")
             return self.render_outcome("stills", style, stills=stills, awaiting="video")
 
         final_video_path = os.path.join(self.working_dir, "final_video.mp4")
-        if os.path.exists(final_video_path):
-            _pipeline_print(quiet, f"🚀 Skipped concatenating videos, already exists.")
-        else:
-            _pipeline_print(quiet, f"🎬 Starting concatenating videos...")
-            concatenate_video_files(all_video_paths, final_video_path)
-            _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
+        assembly_metadata_path = final_video_path + ".inputs.json"
+        if (
+            not scene_scripts
+            or complete_scenes != len(scene_scripts)
+            or len(all_video_paths) != len(scene_scripts)
+            or not all(all_video_paths)
+        ):
+            for path in (final_video_path, assembly_metadata_path):
+                if os.path.isfile(path):
+                    os.remove(path)
+            _emit_scene_progress(
+                progress,
+                "render_partial",
+                f"{complete_scenes} of {len(scene_scripts)} scene films are complete; continuing without concatenation",
+                None,
+            )
+            return self.render_outcome("video", style, final_video_path="")
+
+        assembly_inputs = {
+            "version": 1,
+            "scene_films": [
+                {
+                    "scene_idx": idx,
+                    "path": os.path.relpath(path, self.working_dir),
+                    **_file_signature(path),
+                }
+                for idx, path in enumerate(all_video_paths)
+            ],
+        }
+        cache_matches = False
+        if os.path.isfile(final_video_path):
+            try:
+                with open(assembly_metadata_path, "r", encoding="utf-8") as metadata_file:
+                    cache_matches = json.load(metadata_file) == assembly_inputs
+            except (OSError, ValueError, TypeError):
+                pass
+        if os.path.isfile(final_video_path) and not cache_matches:
+            os.remove(final_video_path)
+        if not cache_matches and os.path.isfile(assembly_metadata_path):
+            os.remove(assembly_metadata_path)
+
+        if os.path.isfile(final_video_path):
+            _pipeline_print(quiet, f"🚀 Reusing final film; ordered scene inputs are unchanged.")
+            return self.render_outcome("video", style, final_video_path=final_video_path)
+
+        _pipeline_print(quiet, f"🎬 Starting concatenating videos...")
+        concatenate_video_files(all_video_paths, final_video_path)
+        with open(assembly_metadata_path, "w", encoding="utf-8") as metadata_file:
+            json.dump(assembly_inputs, metadata_file, ensure_ascii=False, indent=2)
+        _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
         return self.render_outcome("video", style, final_video_path=final_video_path)
+
+
+def _emit_scene_progress(progress, stage: str, message: str, scene_idx: int | None) -> None:
+    if progress is not None:
+        metadata = {} if scene_idx is None else {"scene_idx": scene_idx}
+        progress(stage, message, metadata)

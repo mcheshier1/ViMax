@@ -18,6 +18,9 @@ from .video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from .video_generator_veo_google_api import VideoGeneratorVeoGoogleAPI
 from .video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
+from .video_generator_agnes_api import VideoGeneratorAgnesAPI
+from .video_generator_ltx_api import VideoGeneratorLTXAPI
+
 
 __all__ = [
     "ImageGenerator",
@@ -32,6 +35,8 @@ __all__ = [
     "VideoGeneratorOmniYunwuAPI",
     "VideoGeneratorOminiYunwuAPI",
     "VideoGeneratorOpenRouterAPI",
+    "VideoGeneratorAgnesAPI",
+    "VideoGeneratorLTXAPI",
     "VideoGeneratorVeoGoogleAPI",
     "VideoGeneratorVeoYunwuAPI",
 ]

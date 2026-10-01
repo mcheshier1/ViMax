@@ -45,6 +45,8 @@ class VideoGeneratorOpenRouterAPI:
         http_referer: str = "",
         app_title: str = "ViMax",
         clip_seconds: int | None = None,
+        resolution: str | None = None,
+        generate_audio: bool | None = None,
     ):
         self.api_key = api_key
         self.model = model
@@ -52,6 +54,8 @@ class VideoGeneratorOpenRouterAPI:
         self.http_referer = http_referer
         self.app_title = app_title
         self._clip_seconds = clip_seconds
+        self._resolution = resolution
+        self._generate_audio = generate_audio
 
     @property
     def clip_seconds(self) -> int:
@@ -83,8 +87,8 @@ class VideoGeneratorOpenRouterAPI:
         query_timeout_seconds = _env_float("VIMAX_VIDEO_QUERY_TIMEOUT_SECONDS", 600.0)
         poll_interval_seconds = _env_float("VIMAX_VIDEO_POLL_INTERVAL_SECONDS", 10.0)
         duration = self.clip_seconds
-        resolution = os.environ.get("VIMAX_OPENROUTER_VIDEO_RESOLUTION", "720p")
-        generate_audio = _env_bool("VIMAX_OPENROUTER_GENERATE_AUDIO", True)
+        resolution = self._resolution or os.environ.get("VIMAX_OPENROUTER_VIDEO_RESOLUTION", "720p")
+        generate_audio = self._generate_audio if self._generate_audio is not None else _env_bool("VIMAX_OPENROUTER_GENERATE_AUDIO", True)
 
         payload = {
             "model": self.model,

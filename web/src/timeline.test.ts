@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {activeRedraw, askedRenderFinished, blockingSlots, canRedo, characterChips, clipCostLine, failedRedraw, filmPosition, missingKeyframes, missingSlots, moveTarget, needsReview, planDirty, planInconsistencies, redoOneText, redoPhase, redoRequestText, rejections, renderActivity, renderClipText, renderRequestText, renderStatusLine, rowNeedsAttention, slotName, slotsInFilmOrder, stageCounts, stageTitle, slotTitle, toggleCharacter} from './timeline';
+import {activeRedraw, askedRenderFinished, blockingSlots, canRedo, characterChips, clipCostLine, failedRedraw, filmPosition, missingKeyframes, missingSlots, moveTarget, needsReview, planDirty, planInconsistencies, redoOneText, redoPhase, redoRequestText, redoableRejections, rejections, renderActivity, renderClipText, renderRequestText, renderStatusLine, rowNeedsAttention, slotName, slotsInFilmOrder, stageCounts, stageTitle, slotTitle, toggleCharacter} from './timeline';
 import type {AcceptanceSlot, AcceptanceStage, AcceptanceState} from './types';
 
 describe('where a shot plays', () => {
@@ -155,6 +155,33 @@ describe('turning rejections into a re-render', () => {
       {title: 'Shot 6', reason: 'her dress is blue here but pink everywhere else', shot: '5', stage: 'keyframes'},
       {title: 'Shot 7', reason: '', shot: '6', stage: 'keyframes'},
     ]);
+  });
+
+  it('keeps session rejections visible but excludes them and empty keys from bulk redraws', () => {
+    const stages: AcceptanceStage[] = [
+      stage({stage: 'portraits', scope: 'session', slots: [
+        {shot: null, state: 'rejected', artifacts: ['portrait.png'], reason: 'wrong face'},
+      ]}),
+      stage({stage: 'keyframes', slots: [
+        {shot: '2', state: 'rejected', artifacts: ['shots/2/first_frame.png'], reason: 'wrong room'},
+      ]}),
+      stage({stage: 'clips', slots: [
+        {shot: '4', state: 'rejected', artifacts: ['shots/4/video.mp4'], reason: 'wrong motion'},
+      ]}),
+      stage({stage: 'final_video', scope: 'session', slots: [
+        {shot: null, state: 'rejected', artifacts: ['final_video.mp4'], reason: 'bad ending'},
+      ]}),
+    ];
+    const rejected = rejections(stages);
+    const redoable = redoableRejections(rejected);
+
+    expect(rejected).toHaveLength(4);
+    expect(redoable.map((item) => item.shot)).toEqual(['2', '4']);
+    expect(redoRequestText(rejected)).toContain('redo_shots=["2", "4"]');
+    expect(redoRequestText(rejected)).not.toContain('wrong face');
+    expect(redoRequestText(rejections([stage({stage: 'portraits', scope: 'session', slots: [
+      {shot: null, state: 'rejected', artifacts: ['portrait.png'], reason: 'wrong face'},
+    ]})]))).toBe('');
   });
 
   it('quotes the reasons verbatim in the instruction', () => {
@@ -394,11 +421,38 @@ describe('a render that failed', () => {
     expect(failedRedraw([failed, {status: 'rendered'}])).toBeNull();
   });
 
+  it('keeps a newer redraw failure visible after a later redraw start', () => {
+    const olderFailure = {status: 'error', phase: 'stills', redone_shots: ['2'], error: 'older failure'};
+    const newerFailure = {status: 'error', phase: 'video', redone_shots: ['3'], error: 'newer failure'};
+    const laterRedraw = {status: 'rendering', phase: 'video', redone_shots: ['3']};
+
+    expect(failedRedraw([olderFailure, laterRedraw, newerFailure])).toEqual({stage: 'clips', slots: ['3'], reason: 'newer failure'});
+  });
+
   it('reports a failure that cleared nothing, and never invents one', () => {
-    expect(failedRedraw([{status: 'error', error_type: 'dependency_missing'}])?.slots).toEqual([]);
+    expect(failedRedraw([{status: 'error', error_type: 'dependency_missing'}])).toBeNull();
     expect(failedRedraw([{status: 'rendering', phase: 'stills'}])).toBeNull();
     expect(failedRedraw([])).toBeNull();
     expect(failedRedraw(undefined)).toBeNull();
+  });
+
+  it('clears prior failed and active redraw state at dependency and new-render boundaries', () => {
+    const oldFailure = {status: 'error', phase: 'stills', redone_shots: ['2'], error: 'previous failure'};
+    const oldRedraw = {status: 'rendering', phase: 'stills', redone_shots: ['2']};
+    const blocked = {timestamp: '2026-09-23T17:40:00.800Z', status: 'dependency_missing', error_type: 'dependency_missing'};
+
+    expect(failedRedraw([oldFailure, blocked])).toBeNull();
+    expect(activeRedraw([oldRedraw, blocked])).toBeNull();
+    expect(askedRenderFinished([blocked], Date.parse('2026-09-23T17:40:00.500Z'))).toBe(true);
+    expect(failedRedraw([oldFailure, {status: 'rendering', phase: 'stills', render_started: true}])).toBeNull();
+    expect(activeRedraw([oldRedraw, {status: 'rendering', phase: 'stills', render_started: true}])).toBeNull();
+  });
+
+  it('compares render event timestamps at full click precision', () => {
+    const askedAt = Date.parse('2026-09-23T17:40:00.500Z');
+
+    expect(askedRenderFinished([{timestamp: '2026-09-23T17:40:00.800Z', status: 'rendered'}], askedAt)).toBe(true);
+    expect(askedRenderFinished([{timestamp: '2026-09-23T17:40:00.200Z', status: 'rendered'}], askedAt)).toBe(false);
   });
 
   it('ends the waiting a click asked for when that render finishes', () => {
