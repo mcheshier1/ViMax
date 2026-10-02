@@ -718,7 +718,7 @@ class RenderToolGateTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=_Generator(IMAGE_MODEL)), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=_Generator(VIDEO_MODEL)), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", _PhaseOutcomePipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", _PhaseOutcomePipeline):
                 result = await adapter.vimax_render_video({"stop_after": "stills"})
 
             self.assertTrue(result.ok)
@@ -737,7 +737,7 @@ class RenderToolGateTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=_Generator(IMAGE_MODEL)), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=_Generator(VIDEO_MODEL)), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", _PhaseOutcomePipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", _PhaseOutcomePipeline):
                 result = await adapter.vimax_render_video({"stop_after": "stills"})
 
             self.assertFalse(result.ok)

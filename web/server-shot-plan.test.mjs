@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
@@ -61,6 +62,67 @@ async function fixture() {
 const read = (root) => readShotPlan(root, SESSION_ID, ROOT, '7');
 const update = (root, input) => updateShotPlan(root, {sessionId: SESSION_ID, root: ROOT, slot: '7', ...input});
 
+async function withContinuityFilm(working) {
+  await writeFile(path.join(working, 'frame_continuity.json'), JSON.stringify({mode: 'chained_keyframes'}));
+  await writeFile(path.join(working, ROOT, 'camera_tree.json'), JSON.stringify([
+    {idx: 0, active_shot_idxs: [4, 7]},
+    {idx: 2, active_shot_idxs: [2, 0]},
+  ]));
+  const shots = {};
+  for (const slot of ['4', '7', '2', '0', '3']) {
+    const shotDir = path.join(working, ROOT, 'shots', slot);
+    await mkdir(shotDir, {recursive: true});
+    if (slot !== '7') {
+      await writeFile(path.join(shotDir, 'shot_description.json'), JSON.stringify({
+        idx: Number(slot), ff_desc: `first ${slot}`, lf_desc: `last ${slot}`,
+        ff_vis_char_idxs: [0], lf_vis_char_idxs: [0], audio_desc: '',
+      }));
+    }
+    const frames = path.join(shotDir, 'qwen_qwen-image-3');
+    const clips = path.join(shotDir, 'kwaivgi_kling-video-o1');
+    await mkdir(frames, {recursive: true});
+    await mkdir(clips, {recursive: true});
+    await writeFile(path.join(frames, 'first_frame.png'), `first-${slot}`);
+    await writeFile(path.join(frames, 'last_frame.png'), `last-${slot}`);
+    await writeFile(path.join(clips, 'video.mp4'), `clip-${slot}`);
+    const lock = async (relative) => {
+      const bytes = await readFile(path.join(working, relative));
+      return {
+        path: relative,
+        size: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    };
+    shots[slot] = {
+      keyframes: {accepted_at: 'reviewed', artifacts: await Promise.all([
+        lock(`${ROOT}/shots/${slot}/qwen_qwen-image-3/first_frame.png`),
+        lock(`${ROOT}/shots/${slot}/qwen_qwen-image-3/last_frame.png`),
+      ])},
+      clips: {accepted_at: 'reviewed', artifacts: [await lock(`${ROOT}/shots/${slot}/kwaivgi_kling-video-o1/video.mp4`)]},
+    };
+  }
+  const finalVideo = path.join(working, ROOT, 'final_video.mp4');
+  await writeFile(finalVideo, 'film');
+  const bytes = await readFile(finalVideo);
+  await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({
+    [ROOT]: {
+      shots,
+      final_video: {
+        accepted_at: 'reviewed',
+        artifacts: [{
+          path: `${ROOT}/final_video.mp4`,
+          size: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        }],
+      },
+    },
+  }));
+}
+
+const timelineSlot = (acceptance, stage, shot) => (
+  acceptance.stages.find((entry) => entry.stage === stage).slots.find((entry) => entry.shot === shot)
+);
+
 describe('shot plans', () => {
   it('reads a shot with the characters it can choose from and the prompt it was drawn from', async () => {
     const {root} = await fixture();
@@ -97,6 +159,66 @@ describe('shot plans', () => {
     expect((await refused({})).message).toMatch(/Nothing to save/);
     expect((await readShotPlan(root, SESSION_ID, ROOT, '99').catch((error) => error)).message).toMatch(/Unknown shot: 99/);
     await expect(readShotPlan(root, 'unknown-session', ROOT, '7')).resolves.toBeNull();
+  });
+});
+
+describe('continuous keyframe approvals', () => {
+  it('stales playback successors after a last-frame plan edit and lets an explicit review accept only its target', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+
+    await updateShotPlan(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '4',
+      lfDesc: 'The doorway closes behind her.',
+    });
+
+    let acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '3').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('rendered');
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
+
+    const store = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(store.shots['7'].keyframes).toMatchObject({
+      accepted_at: 'reviewed',
+      invalidated_at: expect.any(String),
+    });
+    expect(store.shots['7'].clips.invalidated_at).toEqual(expect.any(String));
+    expect(store.final_video).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+    expect(await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'first_frame.png'), 'utf8'))
+      .toBe('first-7');
+    expect(await readFile(path.join(working, ROOT, 'shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
+      .toBe('clip-7');
+
+    acceptance = await updateRenderAcceptance(root, {
+      sessionId: SESSION_ID, root: ROOT, stage: 'keyframes', shot: '7', accepted: true,
+    });
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+  });
+
+  it('invalidates the successor chain after a structural removal without erasing dependent evidence', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+
+    const acceptance = await removeShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '7'});
+
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('accepted');
+    const store = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(store.shots['2'].keyframes).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+    expect(store.shots['7'].keyframes).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+    expect(await readFile(path.join(working, ROOT, 'shots', '2', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
+      .toBe('clip-2');
+    expect(await readFile(path.join(working, ROOT, '.removed_shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
+      .toBe('clip-7');
   });
 });
 

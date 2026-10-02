@@ -76,6 +76,8 @@ export type AcceptanceTotals = {
   acceptedKeyframes: number;
   keyframes: number;
   clips: number;
+  /** Required frame artifact types for each shot, in generation order. */
+  requiredFrameTypes: Array<'first_frame' | 'last_frame'>;
   /** Rejected slots across the whole payload. */
   rejected: number;
   clipSeconds: number;
@@ -261,14 +263,20 @@ export type Message = {
   role: 'user' | 'assistant' | 'activity' | 'error';
   text: string;
   createdAt?: string;
+  turnId?: string;
   tool?: string;
   status?: 'running' | 'done' | 'error';
   stage?: string;
+  delivery?: 'sending' | 'queued' | 'running' | 'done' | 'cancelled' | 'error';
+  deliveryError?: string;
 };
+
+export type AgentQueueMessage = {id: string; text: string};
 
 export type AgentEvent = {
   type?: string;
   turn_id?: string;
+  messageId?: string;
   delta?: string;
   message?: string;
   phase?: string;
@@ -277,6 +285,10 @@ export type AgentEvent = {
   line?: string;
   assistant?: string;
   activeSessionId?: string;
+  busy?: boolean;
+  active?: AgentQueueMessage | null;
+  pending?: AgentQueueMessage[];
+  cancelledIds?: string[];
   sessions?: SessionSummary[];
   tool?: {id?: string; name?: string; requested_name?: string};
   progress?: {stage?: string; message?: string; metadata?: Record<string, unknown>};
@@ -301,4 +313,6 @@ export type ChatState = {
   busy: boolean;
   turnId: string;
   promptTokens: number;
+  queueSupported: boolean;
+  activeMessageId: string;
 };

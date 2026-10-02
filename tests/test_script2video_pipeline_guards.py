@@ -803,5 +803,184 @@ class CharacterPortraitsGeneratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("the back portrait of Claude", str(back.exception))
 
 
+class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
+    def _shot(self, idx, cam_idx):
+        return ShotDescription(
+            idx=idx, is_last=False, cam_idx=cam_idx, visual_desc=f"shot {idx}",
+            variation_type="small", variation_reason="", ff_desc=f"first {idx}",
+            ff_vis_char_idxs=[], lf_desc=f"last {idx}", lf_vis_char_idxs=[],
+            motion_desc="move", audio_desc="none",
+        )
+
+    async def test_playback_order_copies_same_camera_bytes_and_reframes_from_previous_last(self):
+        class BracketVideo:
+            async def supports_last_frame(self):
+                return True
+
+        class ControlledImages:
+            reference_limit = 3
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            images = ControlledImages()
+            pipeline = Script2VideoPipeline(object(), images, BracketVideo(), tmp)
+            pipeline.revision_notes = {}
+            shots = [self._shot(0, 0), self._shot(15, 0), self._shot(2, 2)]
+            pipeline.frame_events = {
+                idx: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}
+                for idx in (15, 0, 2)
+            }
+
+            async def root_frames(**kwargs):
+                idx = kwargs["camera"].active_shot_idxs[0]
+                for kind, content in (("first_frame", b"root-start"), ("last_frame", b"root-end")):
+                    path = Path(pipeline.frame_path(idx, kind))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+
+            pipeline.generate_frames_for_single_camera = root_frames
+            await pipeline.generate_chained_frames(
+                camera_tree=[Camera(idx=0, active_shot_idxs=[15, 0]), Camera(idx=2, active_shot_idxs=[2])],
+                shot_descriptions=shots,
+                characters=[],
+                character_portraits_registry={},
+            )
+
+            self.assertEqual(Path(pipeline.frame_path(0, "first_frame")).read_bytes(), b"root-end")
+            self.assertEqual(
+                images.calls[1]["reference_image_paths"],
+                [pipeline.frame_path(0, "last_frame")],
+            )
+            self.assertEqual(images.calls[0]["reference_image_paths"], [pipeline.frame_path(0, "first_frame")])
+            self.assertTrue(all(len(call["reference_image_paths"]) <= 3 for call in images.calls))
+            selector = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())
+            self.assertEqual(
+                selector["continuity_source"],
+                {
+                    "shot_idx": 0,
+                    "frame_type": "last_frame",
+                    "sha256": pipeline._sha256_file(pipeline.frame_path(0, "last_frame")),
+                    "mode": "reframe",
+                },
+            )
+
+    async def test_scoped_missing_predecessor_and_first_only_provider_fail_before_generation(self):
+        class FirstOnlyVideo:
+            async def supports_last_frame(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = Script2VideoPipeline(object(), object(), FirstOnlyVideo(), tmp)
+            with self.assertRaisesRegex(RuntimeError, "bracketing"):
+                await pipeline.generate_chained_frames(
+                    camera_tree=[],
+                    shot_descriptions=[],
+                    characters=[],
+                    character_portraits_registry={},
+                )
+            pipeline.video_generator = type(
+                "BracketVideo", (), {"supports_last_frame": lambda self: asyncio.sleep(0, result=True)}
+            )()
+            shots = [self._shot(15, 0), self._shot(2, 2)]
+            with self.assertRaisesRegex(RuntimeError, "predecessor shot 15.*only_shots"):
+                await pipeline.generate_chained_frames(
+                    camera_tree=[Camera(idx=0, active_shot_idxs=[15]), Camera(idx=2, active_shot_idxs=[2])],
+                    shot_descriptions=shots,
+                    characters=[],
+                    character_portraits_registry={},
+                    only_shots=[2],
+                )
+
+    async def test_scoped_redraw_preserves_future_media_and_rejects_invalidated_predecessor(self):
+        class Images:
+            reference_limit = 3
+
+            async def generate_single_image(self, **kwargs):
+                return Image.new("RGB", (2, 2), "blue")
+
+        class Video:
+            async def supports_last_frame(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            root = project / "script2video"
+            pipeline = Script2VideoPipeline(object(), Images(), Video(), str(root))
+            pipeline.revision_notes = {}
+            shots = [self._shot(0, 0), self._shot(15, 0), self._shot(2, 2)]
+            cameras = [Camera(idx=0, active_shot_idxs=[0, 15]), Camera(idx=2, active_shot_idxs=[2])]
+            preserved = {}
+            for idx in (0, 2):
+                for kind in ("first_frame", "last_frame"):
+                    path = Path(pipeline.frame_path(idx, kind))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("RGB", (2, 2), "red").save(path)
+                    preserved[path] = path.read_bytes()
+            await pipeline.generate_chained_frames(
+                camera_tree=cameras, shot_descriptions=shots, characters=[],
+                character_portraits_registry={}, only_shots=[15],
+            )
+            self.assertEqual(
+                Path(pipeline.frame_path(15, "first_frame")).read_bytes(),
+                preserved[Path(pipeline.frame_path(0, "last_frame"))],
+            )
+            self.assertNotEqual(
+                Path(pipeline.frame_path(15, "last_frame")).read_bytes(),
+                Path(pipeline.frame_path(15, "first_frame")).read_bytes(),
+            )
+            for path, original in preserved.items():
+                self.assertEqual(path.read_bytes(), original)
+            (project / "render_acceptance.json").write_text(json.dumps({
+                "script2video": {"shots": {"15": {"keyframes": {"invalidated_at": "changed"}}}},
+            }))
+            with self.assertRaisesRegex(RuntimeError, "invalidated keyframes"):
+                await pipeline.generate_chained_frames(
+                    camera_tree=cameras, shot_descriptions=shots, characters=[],
+                    character_portraits_registry={}, only_shots=[2],
+                )
+
+    async def test_offscreen_name_does_not_override_declared_frame_visibility(self):
+        class Images:
+            async def generate_single_image(self, **kwargs):
+                return Image.new("RGB", (2, 2), "blue")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = Script2VideoPipeline(object(), Images(), object(), tmp)
+            characters = [
+                CharacterInScene(idx=idx, identifier_in_scene=name, is_visible=True,
+                                 static_features="approved identity", dynamic_features="same clothes")
+                for idx, name in [(0, "Claude"), (2, "DeepSeek")]
+            ]
+            source = self._shot(0, 0)
+            source.lf_vis_char_idxs = [0]
+            target = self._shot(2, 2)
+            target.ff_desc = "Claude sits alone. DeepSeek has not entered."
+            target.ff_vis_char_idxs = [0]
+            target.lf_vis_char_idxs = [0, 2]
+            registry = {}
+            for character in characters:
+                portrait = Path(tmp) / f"{character.identifier_in_scene}.png"
+                Image.new("RGB", (2, 2), "white").save(portrait)
+                registry[character.identifier_in_scene] = {"front": {"path": str(portrait), "description": "portrait"}}
+            source_path = Path(pipeline.frame_path(0, "last_frame"))
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (2, 2), "red").save(source_path)
+            pipeline.frame_events = {2: {"first_frame": asyncio.Event()}}
+            await pipeline._generate_chained_image(
+                target, source, str(source_path), characters, registry, frame_type="first_frame",
+            )
+            selector = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())
+            self.assertEqual(
+                [pair[0] for pair in selector["reference_image_path_and_text_pairs"]],
+                [str(source_path), registry["Claude"]["front"]["path"]],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

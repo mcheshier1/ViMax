@@ -36,6 +36,37 @@ async function fixture() {
 }
 
 describe('original media delivery', () => {
+  it('names final-film downloads after the project while preserving inline range playback', async () => {
+    const {url, root, directory} = await fixture();
+    await mkdir(path.join(root, '.vimax'));
+    await writeFile(path.join(root, '.vimax', 'sessions.json'), JSON.stringify({
+      sessions: {'media-session': {session_id: 'media-session', project_name: 'Claude’s café'}},
+    }));
+    await writeFile(path.join(directory, 'final_video.mp4'), '0123456789');
+    const response = await fetch(`${url}?path=final_video.mp4`, {headers: {Range: 'bytes=2-4'}});
+    expect(response.status).toBe(206);
+    expect(response.headers.get('content-disposition')).toBe('inline; filename="Claude_s caf_.mp4"; filename*=UTF-8\'\'Claude%E2%80%99s%20caf%C3%A9.mp4');
+    expect(await response.text()).toBe('234');
+    const head = await fetch(`${url}?path=final_video.mp4`, {method: 'HEAD'});
+    expect(head.headers.get('content-disposition')).toBe(response.headers.get('content-disposition'));
+    expect(await head.text()).toBe('');
+  });
+
+  it('makes unsafe project-title characters safe and falls back to the session when unnamed', async () => {
+    const {url, root, directory} = await fixture();
+    await writeFile(path.join(directory, 'final_video.mp4'), '0123456789');
+    const unnamed = await fetch(`${url}?path=final_video.mp4`);
+    expect(unnamed.headers.get('content-disposition')).toBe('inline; filename="media-session.mp4"; filename*=UTF-8\'\'media-session.mp4');
+    await unnamed.arrayBuffer();
+    await mkdir(path.join(root, '.vimax'));
+    await writeFile(path.join(root, '.vimax', 'sessions.json'), JSON.stringify({
+      sessions: {'media-session': {session_id: 'media-session', project_name: 'Film/"title"\r\n'}},
+    }));
+    const unsafe = await fetch(`${url}?path=final_video.mp4`);
+    expect(unsafe.headers.get('content-disposition')).toBe('inline; filename="Film--title-.mp4"; filename*=UTF-8\'\'Film--title-.mp4');
+    expect(await unsafe.text()).toBe('0123456789');
+  });
+
   it('serves suffix and open ranges without sending bytes outside the requested interval', async () => {
     const {url} = await fixture();
     const suffix = await fetch(url, {headers: {Range: 'bytes=-3'}});

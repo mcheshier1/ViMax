@@ -56,6 +56,13 @@ export async function updateAcceptance(payload: AcceptanceUpdateRequest) {
   return request<RenderAcceptance>('/api/acceptance', {method: 'PUT', body: JSON.stringify(payload)});
 }
 
+export type AssembleRequest = {sessionId: string; root: string; revision?: string};
+export type AssembleResponse = {path: string; reused: boolean; shotCount: number};
+
+export async function assembleFilm(payload: AssembleRequest) {
+  return request<AssembleResponse>('/api/assemble', {method: 'POST', body: JSON.stringify(payload)});
+}
+
 export async function uploadWorkspaceFile(sessionId: string, file: File) {
   const url = `/api/uploads?session=${encodeURIComponent(sessionId)}&name=${encodeURIComponent(file.name)}`;
   const response = await fetch(url, {
@@ -152,8 +159,8 @@ export async function startAgent(options: {sessionId?: string; newSession?: bool
   return request<{ok: boolean}>('/api/agent/start', {method: 'POST', body: JSON.stringify(options)});
 }
 
-export async function sendMessage(text: string, sessionId: string) {
-  return request<{ok: boolean}>('/api/messages', {method: 'POST', body: JSON.stringify({text, sessionId})});
+export async function sendMessage(payload: {text: string; sessionId: string; messageId: string; displayText: string}) {
+  return request<{ok: boolean; messageId: string; queued: boolean}>('/api/messages', {method: 'POST', body: JSON.stringify(payload)});
 }
 
 export async function stopAgent() {

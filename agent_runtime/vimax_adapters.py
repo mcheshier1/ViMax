@@ -10,41 +10,23 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from langchain.chat_models import init_chat_model
-from langchain_openai import OpenAIEmbeddings
-from tenacity import RetryError
 
-from interfaces import CharacterInScene
-from pipelines.continuity_review import (
-    build_evidence,
-    film_order,
-    normalize_review,
-    run_checks,
-    write_review,
-)
-from agents.event_extractor import EventExtractor
-from agents.global_information_planner import GlobalInformationPlanner
-from agents.novel_compressor import NovelCompressor
-from agents.scene_extractor import SceneExtractor
-from pipelines.novel2movie_pipeline import Novel2MoviePipeline
-from pipelines.idea2video_pipeline import Idea2VideoPipeline
 from pipelines.render_contract import DEFAULT_RENDER_PHASE, RENDER_PHASES, normalize_phase
-from pipelines.script2video_pipeline import Script2VideoPipeline
-from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
-from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
-from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
-from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
-from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
-from tools.video_generator_agnes_api import VideoGeneratorAgnesAPI
-from tools.video_generator_ltx_api import VideoGeneratorLTXAPI
 
 from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_generate_audio, video_model, video_provider, video_resolution
 from .models import ToolResult
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
 from utils.project_lock import ProjectBusyError, project_write_lock
+
+if TYPE_CHECKING:
+    from interfaces import CharacterInScene
+    from pipelines.novel2movie_pipeline import Novel2MoviePipeline
+    from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
+    from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
+    from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
 
 
 class _UnavailableGenerator:
@@ -256,6 +238,9 @@ class ViMaxAdapters:
         self._update_session_metadata(session_id, idea="", user_requirement="", style=style)
 
         try:
+            from pipelines.idea2video_pipeline import Idea2VideoPipeline
+            from pipelines.script2video_pipeline import Script2VideoPipeline
+
             self.session_index.update_stage(session_id, "narrative_planning", "Generating structured text artifacts")
             if runtime:
                 runtime.emit_progress("Starting narrative planning", stage="starting", metadata={"session_id": session_id})
@@ -401,6 +386,23 @@ class ViMaxAdapters:
         except Exception as exc:
             self.session_index.update_stage(session_id, "error", f"Revision failed: {exc}")
             raise
+        revision_target_path = target_path.relative_to(working_dir).as_posix()
+        revision_plan = _revisioned_shot_plan(revision_target_path)
+        if revision_plan is not None and _continuity_enabled(working_dir):
+            root, slot = revision_plan
+            reason = f"Shot {slot} plan changed; regenerate and review its keyframes and clip."
+            _mark_continuity_records(working_dir, root, [slot], reason)
+            try:
+                old_plan = json.loads(before)
+            except json.JSONDecodeError:
+                old_plan = None
+            new_plan = json.loads(revised)
+            ending_changed = (
+                not isinstance(old_plan, dict) or not isinstance(new_plan, dict)
+                or any(old_plan.get(key) != new_plan.get(key) for key in ("lf_desc", "lf_vis_char_idxs"))
+            )
+            if ending_changed:
+                _invalidate_continuity_dependents(working_dir, root, [slot])
 
         stale = _stale_keys_for_revision(target_path.relative_to(working_dir).as_posix())
         if stale:
@@ -551,6 +553,9 @@ class ViMaxAdapters:
         })
         removed: list[str] = []
         try:
+            from pipelines.idea2video_pipeline import Idea2VideoPipeline
+            from pipelines.script2video_pipeline import Script2VideoPipeline
+
             chat_model = _build_chat_model()
             image_generator = _build_image_generator()
             video_generator = _build_video_generator()
@@ -583,6 +588,9 @@ class ViMaxAdapters:
             tally: dict[str, int] = {}
             revision_notes = _revision_notes_for(working_dir, render_mode, redo)
             if redo:
+                keyframe_redraws = [slot for slot, stage in redo["slots"].items() if stage == "keyframes"]
+                if keyframe_redraws:
+                    _invalidate_continuity_dependents(working_dir, render_mode, keyframe_redraws)
                 removed = _clear_redo_targets(working_dir, render_mode, redo["slots"])
                 _mark_slots_redone(working_dir, render_mode, redo["slots"], revision_notes)
             if runtime:
@@ -704,6 +712,8 @@ class ViMaxAdapters:
                 f"No script found for {render_mode}, so the timeline cannot be checked against it.",
                 {"error_type": "missing_script", "session_id": session_id, "render_mode": render_mode},
             )
+        from pipelines.continuity_review import build_evidence, film_order, normalize_review, run_checks, write_review
+
         camera_tree = _read_json_list(root_dir / "camera_tree.json")
         active_shots = film_order(camera_tree)
         if not active_shots:
@@ -1057,6 +1067,8 @@ def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, s
 
 
 def _build_chat_model() -> Any:
+    from langchain.chat_models import init_chat_model
+
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for narrative planning")
@@ -1072,6 +1084,9 @@ def _build_chat_model() -> Any:
 
 
 def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
+    from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
+    from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
+
     api_key = image_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_IMAGE_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml image/llm api_key is required for image generation")
@@ -1091,12 +1106,20 @@ def _build_video_generator():
     provider = video_provider()
     common = {"api_key": api_key, "model": model, "base_url": base_url, "clip_seconds": video_clip_seconds()}
     if provider == "openrouter":
+        from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
+
         return VideoGeneratorOpenRouterAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
     if provider == "yunwu":
+        from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
+
         return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
     if provider == "agnes":
+        from tools.video_generator_agnes_api import VideoGeneratorAgnesAPI
+
         return VideoGeneratorAgnesAPI(**common, resolution=video_resolution())
     if provider == "ltx":
+        from tools.video_generator_ltx_api import VideoGeneratorLTXAPI
+
         return VideoGeneratorLTXAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
     raise RuntimeError(f"Unsupported video provider '{provider}' for base URL: {base_url}")
 
@@ -1107,6 +1130,8 @@ class _IdentityRewriter:
 
 
 def _build_embedding_model() -> Any:
+    from langchain_openai import OpenAIEmbeddings
+
     api_key = embedding_api_key()
     base_url = embedding_base_url()
     provider = embedding_model_provider().strip().lower()
@@ -1118,6 +1143,8 @@ def _build_embedding_model() -> Any:
 
 
 def _build_reranker() -> RerankerBgeSiliconapi:
+    from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
+
     api_key = reranker_api_key()
     base_url = reranker_base_url()
     if not api_key or not base_url:
@@ -1126,6 +1153,12 @@ def _build_reranker() -> RerankerBgeSiliconapi:
 
 
 def _build_novel_pipeline(working_dir: Path) -> Novel2MoviePipeline:
+    from agents.event_extractor import EventExtractor
+    from agents.global_information_planner import GlobalInformationPlanner
+    from agents.novel_compressor import NovelCompressor
+    from agents.scene_extractor import SceneExtractor
+    from pipelines.novel2movie_pipeline import Novel2MoviePipeline
+
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for novel planning")
@@ -1147,6 +1180,13 @@ def _build_novel_pipeline(working_dir: Path) -> Novel2MoviePipeline:
 
 
 def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_generator: Any, video_generator: Any) -> Novel2MoviePipeline:
+    from agents.event_extractor import EventExtractor
+    from agents.global_information_planner import GlobalInformationPlanner
+    from agents.novel_compressor import NovelCompressor
+    from agents.scene_extractor import SceneExtractor
+    from pipelines.novel2movie_pipeline import Novel2MoviePipeline
+    from pipelines.script2video_pipeline import Script2VideoPipeline
+
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for novel rendering")
@@ -1168,6 +1208,8 @@ def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_gener
 
 
 def _unwrap_retry_error(exc: Exception) -> Exception:
+    from tenacity import RetryError
+
     if isinstance(exc, RetryError):
         try:
             return exc.last_attempt.exception() or exc
@@ -1469,6 +1511,7 @@ def _write_characters_if_missing(path: Path, characters: list[CharacterInScene])
 
 
 def _load_characters(path: Path) -> list[CharacterInScene]:
+    from interfaces import CharacterInScene
     return [CharacterInScene.model_validate(item) for item in json.loads(path.read_text(encoding="utf-8"))]
 
 
@@ -1765,6 +1808,173 @@ def _read_acceptance(working_dir: Path) -> dict[str, Any]:
         return {}
     return payload if isinstance(payload, dict) else {}
 
+FRAME_CONTINUITY_FILENAME = "frame_continuity.json"
+
+
+def _continuity_enabled(working_dir: Path) -> bool:
+    try:
+        settings = json.loads((working_dir / FRAME_CONTINUITY_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(settings, dict) and settings.get("mode") == "chained_keyframes"
+
+
+def _continuity_playback_order(root_dir: Path) -> list[str]:
+    """The active film order: numeric camera order, then each camera's stored shot order."""
+    scene_dirs = sorted(
+        (shots_dir.parent for shots_dir in root_dir.glob("scene_*/shots")),
+        key=lambda scene: _shot_sort_key(scene.name.split("_", 1)[1]),
+    )
+    containers = (
+        [(scene.name, scene / "shots", scene / "camera_tree.json") for scene in scene_dirs]
+        if scene_dirs else [("", root_dir / "shots", root_dir / "camera_tree.json")]
+    )
+
+    order: list[str] = []
+    for scene, _shots_dir, tree_path in containers:
+        try:
+            cameras = json.loads(tree_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(cameras, list):
+            continue
+        for camera in sorted(
+            (camera for camera in cameras if isinstance(camera, dict)),
+            key=lambda camera: _shot_sort_key(str(camera.get("idx", ""))),
+        ):
+            active = camera.get("active_shot_idxs")
+            if not isinstance(active, list):
+                continue
+            for shot in active:
+                slot = f"{scene}/{shot}" if scene else str(shot)
+                if slot not in order:
+                    order.append(slot)
+    return order
+
+
+def _invalidate_continuity_dependents(
+    working_dir: Path,
+    root: str,
+    changed_slots: list[str] | tuple[str, ...] | set[str] | dict[str, Any] | str | int,
+) -> list[str]:
+    """Invalidate accepted downstream chain records without moving their media.
+
+    ``changed_slots`` names keyframe-bearing slots whose ending has changed. Playback
+    order comes exclusively from the active camera trees, never from shot numbers.
+    """
+    if not _continuity_enabled(working_dir):
+        return []
+    if isinstance(changed_slots, dict):
+        changed = {str(slot) for slot in changed_slots}
+    elif isinstance(changed_slots, (str, int)):
+        changed = {str(changed_slots)}
+    else:
+        changed = {str(slot) for slot in changed_slots}
+    order = _continuity_playback_order(working_dir / root)
+    sources = {slot: index for index, slot in enumerate(order) if slot in changed}
+    first_source = min(sources.values(), default=len(order))
+    dependents = [
+        slot for index, slot in enumerate(order)
+        if index > first_source and slot not in changed
+    ]
+
+    path = _acceptance_path(working_dir)
+    store = _read_acceptance(working_dir)
+    root_store = store.get(root) if isinstance(store.get(root), dict) else {}
+    shots_store = root_store.get("shots") if isinstance(root_store.get("shots"), dict) else {}
+    now = datetime.now().isoformat(timespec="seconds")
+    changed_any = False
+    for index, slot in enumerate(order):
+        if slot not in dependents:
+            continue
+        shot_store = shots_store.get(slot) if isinstance(shots_store.get(slot), dict) else {}
+        source = next((candidate for candidate in reversed(order[:index]) if candidate in changed), "")
+        reason = (
+            f"Shot {source} has a changed ending; re-review this shot's keyframes and clip "
+            "to confirm the continuous handoff."
+            if source else "An earlier keyframe ending changed; re-review this shot's keyframes and clip."
+        )
+        for stage in ("keyframes", "clips"):
+            record = shot_store.get(stage)
+            if not isinstance(record, dict):
+                continue
+            shot_store[stage] = {**record, "invalidated_at": now, "invalidation_reason": reason}
+            changed_any = True
+        if shot_store:
+            shots_store[slot] = shot_store
+
+    final_record = root_store.get("final_video")
+    if isinstance(final_record, dict) and changed:
+        root_store["final_video"] = {
+            **final_record,
+            "invalidated_at": now,
+            "invalidation_reason": "A keyframe ending changed in the continuous film; rebuild and review the final assembly.",
+        }
+        changed_any = True
+
+    if changed_any:
+        root_store["shots"] = shots_store
+        store[root] = root_store
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(store, ensure_ascii=False, indent=4), encoding="utf-8")
+        temporary.replace(path)
+    return dependents
+
+
+def _mark_continuity_records(working_dir: Path, root: str, slots: list[str], reason: str) -> None:
+    """Preserve reviewed records while requiring a fresh review after a plan revision."""
+    if not _continuity_enabled(working_dir):
+        return
+    path = _acceptance_path(working_dir)
+    store = _read_acceptance(working_dir)
+    root_store = store.get(root) if isinstance(store.get(root), dict) else {}
+    shots_store = root_store.get("shots") if isinstance(root_store.get("shots"), dict) else {}
+    now = datetime.now().isoformat(timespec="seconds")
+    changed = False
+    for slot in slots:
+        shot_store = shots_store.get(slot) if isinstance(shots_store.get(slot), dict) else {}
+        for stage in ("keyframes", "clips"):
+            record = shot_store.get(stage)
+            if not isinstance(record, dict):
+                continue
+            shot_store[stage] = {**record, "invalidated_at": now, "invalidation_reason": reason}
+            changed = True
+        if shot_store:
+            shots_store[slot] = shot_store
+    final_record = root_store.get("final_video")
+    if isinstance(final_record, dict):
+        root_store["final_video"] = {
+            **final_record,
+            "invalidated_at": now,
+            "invalidation_reason": "A shot plan changed in the continuous film; rebuild and review the final assembly.",
+        }
+        changed = True
+    if changed:
+        root_store["shots"] = shots_store
+        store[root] = root_store
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(store, ensure_ascii=False, indent=4), encoding="utf-8")
+        temporary.replace(path)
+
+
+def _revisioned_shot_plan(relative_path: str) -> tuple[str, str] | None:
+    parts = Path(relative_path).parts
+    if (
+        len(parts) == 4 and parts[0] in {"script2video", "idea2video"}
+        and parts[1] == "shots" and parts[3] == "shot_description.json"
+    ):
+        return parts[0], parts[2]
+    if (
+        len(parts) == 5 and parts[0] == "idea2video" and parts[1].startswith("scene_")
+        and parts[2] == "shots" and parts[4] == "shot_description.json"
+    ):
+        return parts[0], f"{parts[1]}/{parts[3]}"
+    return None
+
+
+
 
 def _lock_matches(working_dir: Path, record: Any) -> bool:
     """Whether a lock still describes the artifacts on disk."""
@@ -1860,16 +2070,16 @@ def _shot_stage_paths(shot_dir: Path, stage: str) -> list[Path]:
 def _slot_state(working_dir: Path, slot: dict[str, Any]) -> str:
     """planned | rendered | accepted | rejected | stale — from disk, never from the file alone.
 
-    A rejection outranks everything: the human said this artifact is wrong, so no phase
-    may treat it as reviewed, and the recorded reason is what the redo has to answer.
+    An explicit continuity invalidation keeps its reason and prior decision as evidence but
+    requires a fresh review, even when the accepted bytes still match.
     """
     record = slot.get("record") or {}
+    if isinstance(record, dict) and record.get("invalidated_at"):
+        return "stale"
     if isinstance(record, dict) and record.get("rejected_at"):
         return "rejected"
     if not slot["paths"]:
         return "planned"
-    # A record without an acceptance — a rejection that was just redrawn, say — leaves the
-    # new artifacts unreviewed: redrawing something is not accepting it.
     if not isinstance(record, dict) or not record.get("accepted_at"):
         return "rendered"
     return "accepted" if _lock_matches(working_dir, record) else "stale"
@@ -2263,6 +2473,7 @@ def _mark_slots_redone(working_dir: Path, root: str, targets: dict[str, str], no
     root_store = store.get(root) if isinstance(store.get(root), dict) else {}
     shots_store = root_store.get("shots") if isinstance(root_store.get("shots"), dict) else {}
     now = datetime.now().isoformat(timespec="seconds")
+    continuity_enabled = _continuity_enabled(working_dir)
     for slot, stage in sorted(targets.items()):
         shot_store = shots_store.get(slot) if isinstance(shots_store.get(slot), dict) else {}
         stage_record = shot_store.get(stage) if isinstance(shot_store.get(stage), dict) else {}
@@ -2270,7 +2481,26 @@ def _mark_slots_redone(working_dir: Path, root: str, targets: dict[str, str], no
             "redone_at": now,
             "reason": str(stage_record.get("reason") or notes.get(slot) or "").strip(),
         }
+        if continuity_enabled:
+            invalidation_reason = f"Shot {slot} was redrawn; review its regenerated {', '.join(REDO_INVALIDATES[stage])}."
+            for invalidated_stage in REDO_INVALIDATES[stage]:
+                if invalidated_stage == stage:
+                    continue
+                record = shot_store.get(invalidated_stage)
+                if isinstance(record, dict):
+                    shot_store[invalidated_stage] = {
+                        **record,
+                        "invalidated_at": now,
+                        "invalidation_reason": invalidation_reason,
+                    }
         shots_store[slot] = shot_store
+    final_record = root_store.get("final_video")
+    if continuity_enabled and isinstance(final_record, dict) and targets:
+        root_store["final_video"] = {
+            **final_record,
+            "invalidated_at": now,
+            "invalidation_reason": "A shot was redrawn in the continuous film; rebuild and review the final assembly.",
+        }
     root_store["shots"] = shots_store
     store[root] = root_store
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -36,7 +36,8 @@ export async function readClipSettings(repoRoot, renderedWith = '') {
   // The configured model is what the next clip is rendered with; the manifest's record is
   // what the clips on disk were rendered with, and it is all there is when no config can be
   // read. The configured value wins, because a model change re-renders the clips.
-  return {seconds, model: configured || String(renderedWith || '').trim()};
+  const resolution = typeof section.resolution === 'string' ? section.resolution.trim() : '';
+  return {seconds, model: configured || String(renderedWith || '').trim(), resolution};
 }
 
 function effectiveClipSeconds(payload) {

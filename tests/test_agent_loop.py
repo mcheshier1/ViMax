@@ -116,6 +116,39 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(seen.index("tool_progress"), seen.index("tool_result"))
 
 
+    async def test_final_tool_progress_is_drained_before_result_and_next_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+
+            async def quick_tool(args, runtime):
+                runtime.emit_progress(f"{args['slot']}: starting", stage="starting")
+                runtime.emit_progress(f"{args['slot']}: completed", stage="completed")
+                return ToolResult("quick_tool", True, args["slot"])
+
+            registry = ToolRegistry([ToolSpec(
+                "quick_tool", "Quick tool", quick_tool,
+                schema={"slot": ToolArgumentSchema(str, required=True)},
+            )])
+            llm = FakeLLM([
+                AssistantMessage(tool_calls=[
+                    ToolCall(name="quick_tool", arguments={"slot": "first"}),
+                    ToolCall(name="quick_tool", arguments={"slot": "second"}),
+                ]),
+                AssistantMessage(text="finished"),
+            ])
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry),
+                             registry, ToolExecutor(registry, index), llm)
+            events = [event async for event in loop.stream_events("start")]
+            observed = [
+                event["progress"]["message"] if event["type"] == "tool_progress"
+                else event["tool_result"]["content"]
+                for event in events if event["type"] in {"tool_progress", "tool_result"}
+            ]
+            self.assertEqual(observed, [
+                "first: starting", "first: completed", "first",
+                "second: starting", "second: completed", "second",
+            ])
+
     async def test_preflight_compact_summarizes_old_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)

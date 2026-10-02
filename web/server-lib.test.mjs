@@ -1,4 +1,4 @@
-import {mkdtemp, mkdir, readFile, stat, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rename, stat, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
@@ -40,6 +40,64 @@ describe('web bridge state', () => {
     })}\n`);
     const history = await readSessionHistory(root, 'session-1');
     expect(history.map((message) => message.role)).toEqual(['user', 'assistant']);
+  });
+
+  it('retains the last 120 matching messages with original ordering and generated IDs', async () => {
+    const root = await fixture();
+    const logPath = path.join(root, '.vimax', 'logs', 'loop_history.jsonl');
+    const rows = [];
+    for (let turn = 0; turn <= 60; turn += 1) {
+      rows.push(JSON.stringify({
+        session_id: 'session-1',
+        turn_id: `turn-${turn}`,
+        raw_user_input: `prompt ${turn}`,
+        final_assistant_text: `answer ${turn}`,
+      }));
+    }
+    rows.splice(10, 0, '{malformed json', JSON.stringify({
+      session_id: 'another-session', turn_id: 'ignored', raw_user_input: 'ignore me',
+    }));
+    rows.push(JSON.stringify({
+      session_id: 'session-1',
+      raw_user_input: 'prompt 61',
+      tool_rounds: [{tool_results: [{name: 'render', ok: true}]}],
+      final_assistant_text: 'answer 61',
+    }));
+    await writeFile(logPath, `${rows.join('\n')}\n`);
+
+    const history = await readSessionHistory(root, 'session-1');
+    expect(history).toHaveLength(120);
+    expect(history[0]).toMatchObject({id: 'turn-2-assistant', role: 'assistant', text: 'answer 2'});
+    expect(history.slice(-3).map((message) => message.id)).toEqual([
+      'turn-122-user', 'turn-122-tool-123', 'turn-122-assistant',
+    ]);
+    expect(history.map((message) => message.text)).not.toContain('ignore me');
+  });
+
+  it('reuses unchanged history and invalidates cached projections on replacement, append, or removal', async () => {
+    const root = await fixture();
+    const logPath = path.join(root, '.vimax', 'logs', 'loop_history.jsonl');
+    const initial = `${JSON.stringify({session_id: 'session-1', turn_id: 'turn-old', raw_user_input: 'first'})}\n`;
+    await writeFile(logPath, initial);
+    const first = await readSessionHistory(root, 'session-1');
+    first[0].text = 'caller mutation';
+    expect((await readSessionHistory(root, 'session-1'))[0].text).toBe('first');
+
+    const replacementPath = `${logPath}.replacement`;
+    await writeFile(replacementPath, `${JSON.stringify({session_id: 'session-1', turn_id: 'turn-new', raw_user_input: 'other'})}\n`);
+    await rename(replacementPath, logPath);
+    expect((await readSessionHistory(root, 'session-1'))[0].id).toBe('turn-new-user');
+    await writeFile(logPath, `${JSON.stringify({session_id: 'session-1', turn_id: 'turn-now', raw_user_input: 'other'})}\n`);
+    expect((await readSessionHistory(root, 'session-1'))[0].id).toBe('turn-now-user');
+
+    await writeFile(logPath, `{not complete\n${JSON.stringify({
+      session_id: 'session-1', turn_id: 'turn-appended', raw_user_input: 'later',
+    })}\n`, {flag: 'a'});
+    expect((await readSessionHistory(root, 'session-1')).map((message) => message.id)).toEqual([
+      'turn-now-user', 'turn-appended-user',
+    ]);
+    await import('node:fs/promises').then(({rm}) => rm(logPath));
+    expect(await readSessionHistory(root, 'session-1')).toEqual([]);
   });
 
   it('hides workspace upload metadata from restored user messages', async () => {

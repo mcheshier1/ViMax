@@ -1,12 +1,14 @@
 import {createReadStream, existsSync} from 'node:fs';
+import {randomUUID} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
-import {artifactContentType, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
+import {artifactContentType, assembleFilm, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
 import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
+import {createAgentMessageQueue} from './agent-message-queue.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -20,6 +22,8 @@ const uploadMaxBytes = Number.isFinite(configuredUploadLimit) && configuredUploa
 const subscribers = new Set();
 let agentProcess = null;
 let activeSessionId = '';
+const agentQueue = createAgentMessageQueue();
+const turnMessageIds = new Map();
 
 let vite = null;
 
@@ -95,7 +99,9 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, state);
     }
     if (url.pathname === '/api/history' && request.method === 'GET') {
-      return sendJson(response, 200, {messages: await readSessionHistory(repoRoot, url.searchParams.get('session') || '')});
+      const sessionId = url.searchParams.get('session') || '';
+      const messages = await readSessionHistory(repoRoot, sessionId);
+      return sendJson(response, 200, {messages: reconcileHistoryMessageIds(messages)});
     }
     if (url.pathname === '/api/artifacts' && request.method === 'GET') {
       return sendJson(response, 200, {artifacts: await listSessionArtifacts(repoRoot, url.searchParams.get('session') || '')});
@@ -184,6 +190,20 @@ const server = createServer(async (request, response) => {
         return sendJson(response, error.statusCode || 400, {error: error.message});
       }
     }
+    if (url.pathname === '/api/assemble' && request.method === 'POST') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      try {
+        const result = await assembleFilm(repoRoot, body);
+        return result ? sendJson(response, 200, result) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 500, {error: error.message});
+      }
+    }
     if (url.pathname === '/api/acceptance' && request.method === 'GET') {
       const acceptance = await readRenderAcceptance(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
       if (!acceptance) return sendJson(response, 404, {error: 'Project not found'});
@@ -240,14 +260,26 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/api/messages' && request.method === 'POST') {
       const body = await readJsonBody(request);
-      const text = String(body.text || '').trim();
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      const text = typeof body.text === 'string' ? body.text.trim() : '';
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
       if (!text) return sendJson(response, 400, {error: 'Message text is required'});
       if (!sessionId) return sendJson(response, 400, {error: 'Session id is required'});
       if (sessionId !== activeSessionId) return sendJson(response, 409, {error: 'The requested project is no longer active'});
-      if (!agentProcess?.stdin.writable) return sendJson(response, 409, {error: 'Agent is not running'});
-      agentProcess.stdin.write(`${text}\n`);
-      return sendJson(response, 202, {ok: true});
+      const child = agentProcess;
+      if (!child?.stdin.writable) return sendJson(response, 409, {error: 'Agent is not running'});
+      const messageId = typeof body.messageId === 'string' && body.messageId.trim() ? body.messageId : randomUUID();
+      const displayText = typeof body.displayText === 'string' ? body.displayText : text;
+      const queuedMessage = {id: messageId, text: displayText, input: text};
+      const enqueueResult = agentQueue.enqueue(sessionId, queuedMessage);
+      if (!enqueueResult.accepted) return sendJson(response, 409, {error: 'The requested project is no longer active'});
+      if (enqueueResult.started && !dispatchAgentMessage(child)) {
+        return sendJson(response, 503, {error: 'Unable to send message to agent'});
+      }
+      broadcastQueueSnapshot();
+      return sendJson(response, 202, {ok: true, messageId, queued: enqueueResult.queued});
     }
     if (url.pathname === '/api/agent/stop' && request.method === 'POST') {
       stopAgent('user');
@@ -297,6 +329,7 @@ async function startAgent({newSession, sessionId, projectName = '', style = '', 
       ? ['--session', sessionId]
       : [];
   activeSessionId = sessionId;
+  agentQueue.reset(sessionId);
   // Inject ViMax agent defaults unless the user already overrode them in the
   // environment. Keeps the agent's request within the model context window:
   // VIMAX_CONTEXT_WINDOW_TOKENS raises the auto-compaction trigger to ~810k
@@ -312,61 +345,147 @@ async function startAgent({newSession, sessionId, projectName = '', style = '', 
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   agentProcess = child;
-  // A brand-new project can carry its user requirement up front: the CLI has no
-  // flag for it, so it becomes the agent's first turn (the session record picks
-  // it up when narrative planning runs).
-  if (newSession && userRequirement) child.stdin.write(`${userRequirement}\n`);
   let childStdoutBuffer = '';
-  broadcast({type: 'bridge_status', status: 'starting', message: newSession ? 'Creating workspace' : 'Opening workspace'});
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
     if (agentProcess !== child) return;
     childStdoutBuffer += String(chunk);
     const lines = childStdoutBuffer.split(/\r?\n/);
     childStdoutBuffer = lines.pop() || '';
-    for (const line of lines) consumeAgentLine(line);
+    for (const line of lines) consumeAgentLine(child, line);
   });
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (chunk) => {
     if (agentProcess !== child) return;
     for (const line of String(chunk).split(/\r?\n/)) {
-      if (line.trim()) broadcast({type: 'terminal', stream: 'stderr', line});
+      if (line.trim()) broadcast({type: 'terminal', stream: 'stderr', line, activeSessionId});
     }
   });
-  child.on('error', (error) => {
-    if (agentProcess !== child) return;
-    broadcast({type: 'error', message: `Agent process error: ${error.message}`});
-  });
+  child.stdin.on('error', (error) => handleAgentFailure(child, error));
+  child.on('error', (error) => handleAgentFailure(child, error));
   child.on('exit', (code, signal) => {
     if (agentProcess !== child) return;
     agentProcess = null;
+    broadcast(agentQueue.cancel());
     broadcast({
       type: 'bridge_status',
       status: code === 0 || signal === 'SIGTERM' ? 'stopped' : 'error',
       message: signal ? `Agent stopped by ${signal}` : `Agent exited with code ${code ?? 0}`,
+      activeSessionId,
     });
   });
+  broadcast({type: 'bridge_status', status: 'starting', message: newSession ? 'Creating workspace' : 'Opening workspace', activeSessionId});
+
+  // A brand-new project can carry its user requirement up front: the CLI has no
+  // flag for it, so it becomes the agent's first turn (the session record picks
+  // it up when narrative planning runs).
+  if (newSession && userRequirement) {
+    const requirement = {id: randomUUID(), text: userRequirement, input: userRequirement};
+    agentQueue.enqueue(activeSessionId, requirement);
+    if (dispatchAgentMessage(child)) broadcastQueueSnapshot();
+  } else {
+    broadcastQueueSnapshot();
+  }
+
   setTimeout(async () => {
     if (agentProcess !== child) return;
-    const state = await readSessionState(repoRoot);
-    activeSessionId = state.activeSessionId || sessionId || activeSessionId;
-    broadcast({type: 'sessions_changed', ...state, activeSessionId});
-    broadcast({type: 'bridge_status', status: 'ready', message: 'Agent ready'});
+    try {
+      const state = await readSessionState(repoRoot);
+      if (agentProcess !== child) return;
+      const nextSessionId = state.activeSessionId || sessionId || activeSessionId;
+      changeAgentSession(nextSessionId);
+      broadcast({type: 'sessions_changed', ...state, activeSessionId});
+      broadcast({type: 'bridge_status', status: 'ready', message: 'Agent ready', activeSessionId});
+    } catch (error) {
+      if (agentProcess === child) broadcast({type: 'error', message: `Unable to read session state: ${error.message}`, activeSessionId});
+    }
   }, 350);
 }
 
-function consumeAgentLine(line) {
-  if (!line.trim()) return;
+function consumeAgentLine(child, line) {
+  if (agentProcess !== child || !line.trim()) return;
   try {
     const event = JSON.parse(line);
-    if (event.type === 'session') activeSessionId = event.session?.active_session_id || activeSessionId;
+    if (event.type === 'session') {
+      const nextSessionId = event.session?.active_session_id || activeSessionId;
+      changeAgentSession(nextSessionId);
+    }
+    const requestSessionId = agentQueue.activeMessage?.sessionId;
+    const queueResult = agentQueue.consumeEvent(event);
+    if (queueResult.messageId) event.messageId = queueResult.messageId;
+    if (event.type === 'turn' && queueResult.messageId && event.turn_id) {
+      turnMessageIds.set(event.turn_id, queueResult.messageId);
+      if (turnMessageIds.size > 1_000) turnMessageIds.delete(turnMessageIds.keys().next().value);
+    }
+    event.activeSessionId = event.type === 'session'
+      ? activeSessionId
+      : queueResult.sessionId || requestSessionId || activeSessionId;
     broadcast(event);
     if (event.type === 'session') {
-      readSessionState(repoRoot).then((state) => broadcast({type: 'sessions_changed', ...state}));
+      broadcastQueueSnapshot();
+      readSessionState(repoRoot).then((state) => {
+        if (agentProcess === child) broadcast({type: 'sessions_changed', ...state, activeSessionId});
+      }).catch((error) => {
+        if (agentProcess === child) broadcast({type: 'error', message: `Unable to read session state: ${error.message}`, activeSessionId});
+      });
+    }
+    if (queueResult.completed) {
+      if (queueResult.started && !dispatchAgentMessage(child)) return;
+      broadcastQueueSnapshot();
     }
   } catch {
-    broadcast({type: 'terminal', stream: 'stdout', line});
+    broadcast({type: 'terminal', stream: 'stdout', line, activeSessionId});
   }
+}
+
+function changeAgentSession(sessionId) {
+  if (sessionId === activeSessionId) return;
+  const cancelled = agentQueue.cancelPending();
+  if (cancelled.cancelledIds?.length) broadcast(cancelled);
+  activeSessionId = sessionId;
+  broadcast(agentQueue.setSessionId(sessionId));
+}
+
+function dispatchAgentMessage(child) {
+  if (agentProcess !== child) return false;
+  const message = agentQueue.activeMessage;
+  if (!message) return false;
+  if (!child.stdin.writable) {
+    handleAgentFailure(child, new Error('Agent stdin is not writable'));
+    return false;
+  }
+  try {
+    child.stdin.write(`${message.input}\n`, (error) => {
+      if (error) handleAgentFailure(child, error);
+    });
+    return true;
+  } catch (error) {
+    handleAgentFailure(child, error);
+    return false;
+  }
+}
+
+function handleAgentFailure(child, error) {
+  if (agentProcess !== child) return;
+  agentProcess = null;
+  broadcast(agentQueue.cancel());
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // The process may already have exited while its stream reported an error.
+  }
+  const message = `Agent process error: ${error?.message || String(error)}`;
+  broadcast({type: 'error', message, activeSessionId});
+  broadcast({type: 'bridge_status', status: 'error', message, activeSessionId});
+}
+
+function reconcileHistoryMessageIds(messages) {
+  return messages.map((message) => {
+    if (message.role !== 'user' || !message.id.endsWith('-user')) return message;
+    const turnId = message.id.slice(0, -5);
+    const messageId = turnMessageIds.get(turnId);
+    return {...message, id: messageId || message.id, turnId};
+  });
 }
 
 function openEventStream(request, response) {
@@ -376,7 +495,9 @@ function openEventStream(request, response) {
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  response.write(`data: ${JSON.stringify({type: 'bridge_status', status: agentProcess ? 'ready' : 'idle', message: agentProcess ? 'Agent connected' : 'Agent idle'})}\n\n`);
+  const running = Boolean(agentProcess);
+  response.write(`data: ${JSON.stringify({type: 'bridge_status', status: running ? 'ready' : 'idle', message: running ? 'Agent connected' : 'Agent idle', activeSessionId})}\n\n`);
+  response.write(`data: ${JSON.stringify(agentQueue.snapshot())}\n\n`);
   subscribers.add(response);
   const heartbeat = setInterval(() => response.write(': keepalive\n\n'), 15_000);
   request.on('close', () => {
@@ -385,23 +506,33 @@ function openEventStream(request, response) {
   });
 }
 
+function broadcastQueueSnapshot() {
+  broadcast(agentQueue.snapshot());
+}
+
 function broadcast(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const subscriber of subscribers) subscriber.write(payload);
 }
 
 function stopAgent(reason) {
-  if (!agentProcess) return;
   const child = agentProcess;
-  agentProcess = null;
-  child.kill('SIGTERM');
+  if (child) agentProcess = null;
+  broadcast(agentQueue.cancel());
+  if (!child) return;
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // The process may already have exited.
+  }
   const message = reason === 'switch'
     ? 'Switching workspace'
     : reason === 'config'
       ? 'Configuration updated'
       : 'Generation stopped';
-  broadcast({type: 'bridge_status', status: 'stopped', message});
+  broadcast({type: 'bridge_status', status: 'stopped', message, activeSessionId});
 }
+
 
 function agentCommand() {
   if (process.env.VIMAX_AGENT_COMMAND) {

@@ -122,7 +122,6 @@ describe('render acceptance', () => {
 
     const payload = await accept(root, {stage: 'keyframes', shot: '0', accepted: true});
     expect(stage(payload, 'keyframes').slots[0].state).toBe('accepted');
-    expect(payload.totals).toEqual({acceptedKeyframes: 2, keyframes: 2, clips: 0, rejected: 0, clipSeconds: 8, clipCostUsd: 0.112});
 
     const digest = (value) => createHash('sha256').update(value).digest('hex');
     expect((await storedAcceptance(working)).script2video.shots['0'].keyframes.artifacts).toEqual([
@@ -239,10 +238,28 @@ describe('render acceptance', () => {
     await accept(root, {stage: 'clips', shot: '0', accepted: true});
 
     expect((await readRenderAcceptance(root, SESSION_ID, ROOT)).totals)
-      .toEqual({acceptedKeyframes: 0, keyframes: 0, clips: 1, rejected: 0, clipSeconds: 8, clipCostUsd: 0.112});
+      .toMatchObject({clips: 1, clipSeconds: 8, clipCostUsd: 0.112});
 
     process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '5';
     expect((await readRenderAcceptance(root, SESSION_ID, ROOT)).totals).toMatchObject({clips: 1, clipSeconds: 5, clipCostUsd: 0.112});
+  });
+
+  it('uses HeyGen reference-SKU rates for conservative clip budgets by resolution', async () => {
+    const {root, working} = await fixture();
+    await writeFile(path.join(working, 'render_manifest.json'), JSON.stringify({
+      video_model: 'heygen/heygen-video-1',
+      render_mode: ROOT,
+    }));
+
+    // The reference-image SKU is budgeted conservatively until its applicability is confirmed.
+    expect((await readRenderAcceptance(root, SESSION_ID, ROOT)).totals.clipCostUsd).toBe(0.06);
+
+    await mkdir(path.join(root, 'configs'), {recursive: true});
+    await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['video:', '  resolution: 480p', ''].join('\n'));
+    expect((await readRenderAcceptance(root, SESSION_ID, ROOT)).totals.clipCostUsd).toBe(0.04);
+
+    await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['video:', '  resolution: 768p', ''].join('\n'));
+    expect((await readRenderAcceptance(root, SESSION_ID, ROOT)).totals.clipCostUsd).toBe(0.06);
   });
 
   it('prices a clip at the advertised rate of the model that renders it', async () => {

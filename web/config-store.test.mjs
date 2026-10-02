@@ -33,7 +33,7 @@ describe('agent config store', () => {
     // clip of a sequence to 5 seconds while its dialogue needed 8, so the file wins.
     process.env.VIMAX_OPENROUTER_VIDEO_DURATION = '5';
     try {
-      expect(await readClipSettings(root)).toEqual({seconds: 8, model: 'some/video-model'});
+      expect(await readClipSettings(root)).toEqual({seconds: 8, model: 'some/video-model', resolution: ''});
     } finally {
       delete process.env.VIMAX_OPENROUTER_VIDEO_DURATION;
     }

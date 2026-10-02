@@ -1,13 +1,27 @@
 import {createHash, randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
-import {lstat, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile} from 'node:fs/promises';
+import {lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {readClipSettings} from './config-store.mjs';
 import {withProjectWriteLock} from './project-lock.mjs';
+import {assembleClips} from './film-assembly.mjs';
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
 const TEXT_EXTENSIONS = new Set(['.txt', '.md', '.json']);
+
+const historyCache = new Map();
+const historyReads = new Map();
+const MAX_CACHED_HISTORIES = 16;
+
+function copyHistoryMessages(messages) {
+  return messages.map((message) => ({...message}));
+}
+
+function sameHistoryFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
 
 // All memoization is scoped to one read. A later request must see external writers,
 // including same-size replacements whose approval checksum no longer matches.
@@ -74,49 +88,122 @@ export async function deleteSession(repoRoot, sessionId) {
 export async function readSessionHistory(repoRoot, sessionId) {
   assertSessionId(sessionId);
   const logPath = path.join(repoRoot, '.vimax', 'logs', 'loop_history.jsonl');
-  try {
-    const lines = (await readFile(logPath, 'utf8')).split(/\r?\n/).filter(Boolean);
-    const messages = [];
-    for (const line of lines) {
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (record.session_id !== sessionId || !record.raw_user_input) continue;
-      const turnId = String(record.turn_id || `turn-${messages.length}`);
-      messages.push({
-        id: `${turnId}-user`,
-        role: 'user',
-        text: displayUserInput(record.raw_user_input),
-        createdAt: String(record.created_at || record.timestamp || ''),
-      });
-      for (const round of Array.isArray(record.tool_rounds) ? record.tool_rounds : []) {
-        for (const result of Array.isArray(round.tool_results) ? round.tool_results : []) {
-          messages.push({
-            id: `${turnId}-tool-${messages.length}`,
-            role: 'activity',
-            text: historyToolResultText(result),
-            tool: String(result.name || 'tool'),
-            status: result.ok === false ? 'error' : 'done',
-            stage: result.ok === false ? 'failed' : 'completed',
+  const cacheKey = `${logPath}\0${sessionId}`;
+  const pending = historyReads.get(cacheKey);
+  if (pending) return copyHistoryMessages(await pending);
+
+  const read = (async () => {
+    let before;
+    try {
+      before = await stat(logPath, {bigint: true});
+    } catch {
+      historyCache.delete(cacheKey);
+      return [];
+    }
+    const cached = historyCache.get(cacheKey);
+    if (cached && sameHistoryFile(cached.metadata, before)) {
+      historyCache.delete(cacheKey);
+      historyCache.set(cacheKey, cached);
+      return cached.messages;
+    }
+
+    try {
+      const messages = [];
+      let messageCount = 0;
+      const appendMessage = (message) => {
+        messages.push(message);
+        messageCount += 1;
+        if (messages.length > 120) messages.shift();
+      };
+      const consumeLine = (line) => {
+        if (!line) return;
+        let record;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (record.session_id !== sessionId || !record.raw_user_input) return;
+        const turnId = String(record.turn_id || `turn-${messageCount}`);
+        appendMessage({
+          id: `${turnId}-user`,
+          role: 'user',
+          text: displayUserInput(record.raw_user_input),
+          createdAt: String(record.created_at || record.timestamp || ''),
+        });
+        for (const round of Array.isArray(record.tool_rounds) ? record.tool_rounds : []) {
+          for (const result of Array.isArray(round.tool_results) ? round.tool_results : []) {
+            appendMessage({
+              id: `${turnId}-tool-${messageCount}`,
+              role: 'activity',
+              text: historyToolResultText(result),
+              tool: String(result.name || 'tool'),
+              status: result.ok === false ? 'error' : 'done',
+              stage: result.ok === false ? 'failed' : 'completed',
+              createdAt: String(record.created_at || record.timestamp || ''),
+            });
+          }
+        }
+        if (record.final_assistant_text) {
+          appendMessage({
+            id: `${turnId}-assistant`,
+            role: record.status === 'failed' ? 'error' : 'assistant',
+            text: String(record.final_assistant_text),
             createdAt: String(record.created_at || record.timestamp || ''),
           });
         }
+      };
+      const input = createReadStream(logPath, {encoding: 'utf8'});
+      const lineParts = [];
+      const consumeChunk = (chunk) => {
+        let start = 0;
+        while (true) {
+          const newline = chunk.indexOf('\n', start);
+          if (newline === -1) {
+            if (start < chunk.length) lineParts.push(chunk.slice(start));
+            return;
+          }
+          let line = chunk.slice(start, newline);
+          if (lineParts.length) {
+            lineParts.push(line);
+            line = lineParts.join('');
+            lineParts.length = 0;
+          }
+          if (line.endsWith('\r')) line = line.slice(0, -1);
+          consumeLine(line);
+          start = newline + 1;
+        }
+      };
+      try {
+        for await (const chunk of input) consumeChunk(chunk);
+        if (lineParts.length) consumeLine(lineParts.join(''));
+      } finally {
+        input.destroy();
       }
-      if (record.final_assistant_text) {
-        messages.push({
-          id: `${turnId}-assistant`,
-          role: record.status === 'failed' ? 'error' : 'assistant',
-          text: String(record.final_assistant_text),
-          createdAt: String(record.created_at || record.timestamp || ''),
-        });
+      let after;
+      try {
+        after = await stat(logPath, {bigint: true});
+      } catch {
+        return messages;
       }
+      if (sameHistoryFile(before, after)) {
+        historyCache.delete(cacheKey);
+        historyCache.set(cacheKey, {metadata: after, messages});
+        if (historyCache.size > MAX_CACHED_HISTORIES) {
+          historyCache.delete(historyCache.keys().next().value);
+        }
+      }
+      return messages;
+    } catch {
+      historyCache.delete(cacheKey);
+      return [];
     }
-    return messages.slice(-120);
-  } catch {
-    return [];
+  })();
+  historyReads.set(cacheKey, read);
+  try {
+    return copyHistoryMessages(await read);
+  } finally {
+    if (historyReads.get(cacheKey) === read) historyReads.delete(cacheKey);
   }
 }
 
@@ -615,9 +702,14 @@ const CLIP_USD_PER_SECOND_BY_MODEL = {
   'google/veo-3.1-lite': 0.05,
 };
 
-function clipUsdPerSecond(model) {
+function clipUsdPerSecond(model, resolution) {
+  const normalizedModel = String(model || '').trim();
+  if (normalizedModel === 'heygen/heygen-video-1') {
+    // Budget with the higher reference-duration SKU while its applicability remains unconfirmed.
+    return resolution === '480p' ? 0.04 : 0.06;
+  }
   const rates = Object.values(CLIP_USD_PER_SECOND_BY_MODEL);
-  return CLIP_USD_PER_SECOND_BY_MODEL[String(model || '').trim()] ?? Math.max(...rates);
+  return CLIP_USD_PER_SECOND_BY_MODEL[normalizedModel] ?? Math.max(...rates);
 }
 
 /**
@@ -654,6 +746,108 @@ export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
     collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, context, referenced),
   ]);
   return {acceptance, plans, removed, continuity, artifacts};
+}
+
+/** Stitch the accepted active clips for a film, without involving the render agent. */
+export async function assembleFilm(repoRoot, input = {}) {
+  if (!isPlainObject(input) || typeof input.sessionId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,95}$/.test(input.sessionId)
+    || typeof input.root !== 'string' || !input.root.trim()
+    || (input.revision !== undefined && typeof input.revision !== 'string')) {
+    throw acceptanceError('sessionId and root are required and must be valid; revision must be a string when supplied');
+  }
+  const sessionId = input.sessionId;
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    const root = await resolveRenderRoot(repoRoot, workingDir, input.root);
+    if (input.revision !== undefined) {
+      const progress = await readFilmProgress(repoRoot, sessionId, root);
+      if (progress?.revision !== input.revision) throw conflictError('Film changed since it was loaded; refresh and try assembling again');
+    }
+    const context = createFilmReadContext();
+    const discovery = await collectAcceptanceState(workingDir, root, context);
+    const order = discovery.order;
+    if (!order.length) throw conflictError('There are no active shots to assemble');
+    if (new Set(order).size !== order.length) throw conflictError('The camera tree contains duplicate active shots');
+    const slots = new Map(discovery.shots.map((shot) => [shot.shot, shot]));
+    const clips = [];
+    const canonicalWorkingDir = await realpath(workingDir);
+    for (const shot of order) {
+      const found = slots.get(shot);
+      if (!found || found.clips.length !== 1) throw conflictError(`Shot ${shot} is missing its current video clip`);
+      const store = await readAcceptanceFile(workingDir, context);
+      const shotRecord = store[root]?.shots?.[shot]?.clips;
+      if (await slotState(workingDir, shotRecord, found.clips, context) !== 'accepted') {
+        throw conflictError(`Shot ${shot} does not have a current accepted clip`);
+      }
+      const clipPath = await realpath(path.resolve(workingDir, found.clips[0]));
+      if (!clipPath.startsWith(`${canonicalWorkingDir}${path.sep}`)) throw conflictError(`Shot ${shot} clip escapes the project`);
+      clips.push(clipPath);
+    }
+    // Every active tree slot must correspond to a real shot container; scenes are assembled
+    // in numeric scene order by filmOrder rather than flattened or alphabetically guessed.
+    const signature = createHash('sha256');
+    signature.update('vimax-local-assembly-v1\0');
+    const inputHashes = [];
+    for (let i = 0; i < order.length; i += 1) {
+      const hash = await sha256File(clips[i]);
+      inputHashes.push(hash);
+      signature.update(order[i]); signature.update('\0');
+      signature.update(hash); signature.update('\0');
+    }
+    const key = signature.digest('hex');
+    const finalPath = path.join(workingDir, root, 'final_video.mp4');
+    const cachePath = `${finalPath}.assembly.json`;
+    const cache = await readJsonOptional(cachePath).catch(() => undefined);
+    if (cache?.key === key && typeof cache.outputHash === 'string' && await isRegularFile(finalPath)
+      && await sha256File(finalPath) === cache.outputHash) {
+      return {path: relativeArtifactPath(workingDir, finalPath), reused: true, shotCount: order.length};
+    }
+
+    const temporaryPath = path.join(path.dirname(finalPath), `.final_video.${process.pid}.${randomUUID()}.tmp.mp4`);
+    const oldFinalExists = await isRegularFile(finalPath);
+    try {
+      await assembleClips(clips, temporaryPath).catch((cause) => {
+        const error = new Error(`Local FFmpeg assembly failed: ${cause.message}`, {cause});
+        error.statusCode = 500;
+        throw error;
+      });
+      const verifiedContext = createFilmReadContext();
+      const verified = await collectAcceptanceState(workingDir, root, verifiedContext);
+      if (JSON.stringify(verified.order) !== JSON.stringify(order)) throw conflictError('Film playback order changed during assembly');
+      const verifiedStore = await readAcceptanceFile(workingDir, verifiedContext);
+      const after = createHash('sha256').update('vimax-local-assembly-v1\0');
+      for (let index = 0; index < order.length; index += 1) {
+        const found = verified.shots.find((shot) => shot.shot === order[index]);
+        if (!found || found.clips.length !== 1
+          || await slotState(workingDir, verifiedStore[root]?.shots?.[order[index]]?.clips, found.clips, verifiedContext) !== 'accepted') {
+          throw conflictError(`Shot ${order[index]} is no longer accepted`);
+        }
+        const hash = await sha256File(clips[index]);
+        if (hash !== inputHashes[index]) throw conflictError('An input clip changed during assembly');
+        after.update(order[index]); after.update('\0'); after.update(hash); after.update('\0');
+      }
+      if (after.digest('hex') !== key) throw conflictError('Input clips changed during assembly');
+      const outputHash = await sha256File(temporaryPath);
+      await withMutationTransaction(async (transaction) => {
+        await transaction.remove(finalPath);
+        await transaction.move(temporaryPath, finalPath);
+        if (oldFinalExists && cache?.key !== key) {
+          const rootStore = isPlainObject(verifiedStore[root]) ? verifiedStore[root] : {};
+          if (isPlainObject(rootStore.final_video)) {
+            rootStore.final_video = {...rootStore.final_video, invalidated_at: isoSeconds(), invalidation_reason: 'The assembled clip inputs changed; review the new final film.'};
+            verifiedStore[root] = rootStore;
+            await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(verifiedStore, null, 2)}\n`);
+          }
+        }
+        await transaction.write(cachePath, `${JSON.stringify({key, outputHash, shots: order})}\n`);
+      });
+      return {path: relativeArtifactPath(workingDir, finalPath), reused: false, shotCount: order.length};
+    } finally {
+      await rm(temporaryPath, {force: true}).catch(() => {});
+    }
+  });
 }
 
 const PROGRESS_READ_BYTES = 256 * 1024;
@@ -857,7 +1051,8 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
       clips,
       rejected,
       clipSeconds: clipSettings.seconds,
-      clipCostUsd: clipUsdPerSecond(clipSettings.model),
+      clipCostUsd: clipUsdPerSecond(clipSettings.model, clipSettings.resolution),
+      requiredFrameTypes: clipSettings.model === 'heygen/heygen-video-1' ? ['first_frame'] : ['first_frame', 'last_frame'],
     },
   };
 }
@@ -871,6 +1066,12 @@ function filmClipSettings(repoRoot, workingDir, context) {
 /** The payload slot: its state, plus the note against it, whether or not it was redrawn. */
 function slotPayload(shot, state, artifacts, record) {
   const slot = {shot, state, artifacts};
+  if (isPlainObject(record) && typeof record.invalidated_at === 'string' && record.invalidated_at !== '') {
+    slot.invalidatedAt = record.invalidated_at;
+    if (typeof record.invalidation_reason === 'string' && record.invalidation_reason) {
+      slot.invalidationReason = record.invalidation_reason;
+    }
+  }
   if (state === 'rejected') {
     slot.rejectedAt = String(record.rejected_at);
     if (typeof record.reason === 'string') slot.reason = record.reason;
@@ -893,11 +1094,11 @@ function stageState(slots) {
 
 /** planned (nothing on disk) | rendered (artifacts, no lock) | accepted | rejected | stale. */
 async function slotState(workingDir, record, paths, context) {
-  // A stored rejection outranks every other reading: the human's note is the point.
+  if (isPlainObject(record) && typeof record.invalidated_at === 'string' && record.invalidated_at !== '') return 'stale';
+  // A stored rejection outranks every other reading unless a later continuity change
+  // explicitly invalidated the record.
   if (isRejected(record)) return 'rejected';
   if (!paths.length) return 'planned';
-  // A record without an acceptance — a rejection that was just redrawn, say — leaves the
-  // new artifacts unreviewed: redrawing something is not accepting it.
   if (!isPlainObject(record) || typeof record.accepted_at !== 'string' || record.accepted_at === '') return 'rendered';
   return (await acceptanceLockMatches(workingDir, record, context)) ? 'accepted' : 'stale';
 }
@@ -1123,6 +1324,12 @@ function isPlainObject(value) {
 function acceptanceError(message) {
   const error = new Error(message);
   error.statusCode = 400;
+  return error;
+}
+
+function conflictError(message) {
+  const error = acceptanceError(message);
+  error.statusCode = 409;
   return error;
 }
 
@@ -1652,9 +1859,14 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
   const location = shotLocation(workingDir, root, slot);
   const target = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
   const current = JSON.parse(await readFile(target, 'utf8'));
+  const sourceEndingChanged = ['lf_desc', 'lf_vis_char_idxs'].some(
+    (key) => Object.hasOwn(edits, key) && JSON.stringify(current[key]) !== JSON.stringify(edits[key]),
+  );
   await withMutationTransaction(async (transaction) => {
     await transaction.write(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {
+      continuitySourceSlots: sourceEndingChanged ? [slot] : [],
+    });
   });
   return shotPlanPayload(workingDir, root, slot);
 }
@@ -1683,6 +1895,7 @@ async function moveShotUnlocked(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
+  const orderBefore = await filmOrder(workingDir, root);
   const location = shotLocation(workingDir, root, slot);
   const direction = String(body.direction ?? '');
   if (direction && !['earlier', 'later'].includes(direction)) throw acceptanceError(`Unknown direction: ${direction}`);
@@ -1739,7 +1952,7 @@ async function moveShotUnlocked(repoRoot, input = {}) {
     await transaction.write(location.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
     await transaction.write(planPath, `${JSON.stringify(changedPlan, null, 4)}\n`);
     if (Array.isArray(storyboard)) await transaction.write(location.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], leaving);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], leaving, {orderBefore});
     await normalizeTimelineEnding(transaction, workingDir, root);
   });
 
@@ -1766,6 +1979,7 @@ async function removeShotUnlocked(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
+  const orderBefore = await filmOrder(workingDir, root);
   const location = shotLocation(workingDir, root, slot);
   let cameras;
   try { cameras = JSON.parse(await readFile(location.treePath, 'utf8')); }
@@ -1807,7 +2021,7 @@ async function removeShotUnlocked(repoRoot, input = {}) {
     }
     await transaction.write(location.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
     if (plan.is_last) await transaction.write(path.join(to, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify({...plan, is_last: false}, null, 4)}\n`);
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {orderBefore});
     await normalizeTimelineEnding(transaction, workingDir, root);
   });
   return acceptancePayload(repoRoot, workingDir, root);
@@ -1833,6 +2047,7 @@ async function restoreShotUnlocked(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
+  const orderBefore = await filmOrder(workingDir, root);
   const location = shotLocation(workingDir, root, slot);
   const kept = path.join(location.container, REMOVED_SHOTS_DIR, location.local);
   const live = location.shotDir;
@@ -1875,7 +2090,7 @@ async function restoreShotUnlocked(repoRoot, input = {}) {
     if (brief) await transaction.write(location.storyboardPath, `${JSON.stringify(nextStoryboard, null, 4)}\n`);
     await transaction.remove(path.join(live, 'placement.json'));
     if (brief) await transaction.remove(path.join(live, 'brief.json'));
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {orderBefore});
     await normalizeTimelineEnding(transaction, workingDir, root);
   });
   return acceptancePayload(repoRoot, workingDir, root);
@@ -1901,6 +2116,7 @@ async function createShotUnlocked(repoRoot, input = {}) {
   if (!record) return null;
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
+  const orderBefore = await filmOrder(workingDir, root);
   const after = String(body.after ?? '');
   const afterLocation = shotLocation(workingDir, root, after);
   const brief = String(body.brief ?? '').trim();
@@ -1971,7 +2187,7 @@ async function createShotUnlocked(repoRoot, input = {}) {
     await transaction.write(path.join(shotDir, SHOT_DESCRIPTION_FILENAME), `${JSON.stringify(created, null, 4)}\n`);
     await transaction.write(afterLocation.treePath, `${JSON.stringify(cameras, null, 4)}\n`);
     await transaction.write(afterLocation.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot]);
+    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {orderBefore});
     await normalizeTimelineEnding(transaction, workingDir, root);
   });
   return {
@@ -1980,11 +2196,69 @@ async function createShotUnlocked(repoRoot, input = {}) {
   };
 }
 
-async function invalidateTimelineOutputs(transaction, workingDir, root, shots, clearShotAcceptance = true) {
+async function invalidateTimelineOutputs(
+  transaction,
+  workingDir,
+  root,
+  shots,
+  clearShotAcceptance = true,
+  {orderBefore, continuitySourceSlots = []} = {},
+) {
+  const continuityEnabled = await frameContinuityEnabled(workingDir);
   const store = await readAcceptanceFile(workingDir);
   const before = JSON.stringify(store);
-  removeAcceptance(store, root, null, 'final_video');
-  if (clearShotAcceptance) {
+  const rootStore = isPlainObject(store[root]) ? store[root] : {};
+  const shotStore = isPlainObject(rootStore.shots) ? rootStore.shots : {};
+  const now = isoSeconds();
+
+  if (continuityEnabled) {
+    let invalidatedSlots = [];
+    let playbackOrder = [];
+    if (Array.isArray(orderBefore)) {
+      playbackOrder = await filmOrder(workingDir, root);
+      const changedSuffix = timelineOrderChangedSuffix(orderBefore, playbackOrder);
+      invalidatedSlots = [
+        ...changedSuffix,
+        ...(changedSuffix.length || clearShotAcceptance ? shots : []),
+      ];
+    } else if (continuitySourceSlots.length) {
+      playbackOrder = await filmOrder(workingDir, root);
+      invalidatedSlots = continuitySuccessors(
+        playbackOrder,
+        continuitySourceSlots,
+        new Set(shots.map(String)),
+      );
+    }
+    const uniqueSlots = [...new Set(invalidatedSlots.map(String))];
+    for (const slot of uniqueSlots) {
+      const record = shotStore[slot];
+      if (!isPlainObject(record)) continue;
+      const reason = Array.isArray(orderBefore)
+        ? 'The shot or film playback order changed; re-review this shot’s keyframes and clip for the continuous handoff.'
+        : continuityInvalidationReason(playbackOrder, slot, continuitySourceSlots);
+      for (const stage of ['keyframes', 'clips']) {
+        if (isPlainObject(record[stage])) {
+          record[stage] = {...record[stage], invalidated_at: now, invalidation_reason: reason};
+        }
+      }
+      shotStore[slot] = record;
+    }
+
+    const finalRecord = rootStore.final_video;
+    if (isPlainObject(finalRecord)) {
+      rootStore.final_video = {
+        ...finalRecord,
+        invalidated_at: now,
+        invalidation_reason: 'The continuous timeline changed; rebuild and review the final assembly.',
+      };
+    }
+    if (Object.keys(shotStore).length) rootStore.shots = shotStore;
+    if (Object.keys(rootStore).length) store[root] = rootStore;
+  } else {
+    removeAcceptance(store, root, null, 'final_video');
+  }
+
+  if (clearShotAcceptance && !(continuityEnabled && Array.isArray(orderBefore))) {
     for (const slot of shots) {
       removeAcceptance(store, root, slot, 'keyframes');
       removeAcceptance(store, root, slot, 'clips');
@@ -2001,6 +2275,41 @@ async function invalidateTimelineOutputs(transaction, workingDir, root, shots, c
     if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
   }
   for (const film of films) await transaction.remove(film);
+}
+
+async function frameContinuityEnabled(workingDir) {
+  try {
+    const settings = await readJsonOptional(path.join(workingDir, 'frame_continuity.json'));
+    return isPlainObject(settings) && settings.mode === 'chained_keyframes';
+  } catch {
+    return false;
+  }
+}
+
+function timelineOrderChangedSuffix(before, after) {
+  let firstChanged = 0;
+  while (firstChanged < before.length && firstChanged < after.length && before[firstChanged] === after[firstChanged]) {
+    firstChanged += 1;
+  }
+  return after.slice(firstChanged);
+}
+
+function continuitySuccessors(order, changedSlots, excluded = new Set()) {
+  const changed = new Set(changedSlots.map(String));
+  const firstChanged = order.reduce(
+    (first, slot, index) => changed.has(slot) ? Math.min(first, index) : first,
+    order.length,
+  );
+  return order.slice(firstChanged + 1).filter((slot) => !changed.has(slot) && !excluded.has(slot));
+}
+
+function continuityInvalidationReason(order, slot, changedSlots) {
+  const at = order.indexOf(slot);
+  const changed = new Set(changedSlots.map(String));
+  const source = order.slice(0, at).reverse().find((candidate) => changed.has(candidate));
+  return source
+    ? `Shot ${source}’s last keyframe changed; re-review this shot’s keyframes and clip for the continuous handoff.`
+    : 'An earlier keyframe ending changed; re-review this shot’s keyframes and clip.';
 }
 
 async function normalizeTimelineEnding(transaction, workingDir, root) {

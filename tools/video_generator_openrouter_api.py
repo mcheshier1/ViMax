@@ -297,7 +297,7 @@ def _enforce_capabilities(payload: dict[str, Any], capabilities: dict[str, Any] 
 
     if "generate_audio" in payload and not capabilities.get("generate_audio"):
         payload.pop("generate_audio")
-        trimmed.append(f"{model} does not advertise audio output; letting the provider default apply.")
+        trimmed.append(f"{model} does not support the generate_audio option; using the provider's default audio behavior.")
 
     for field, support_key in _VALIDATED_FIELDS:
         allowed_values = capabilities.get(support_key)
@@ -313,7 +313,7 @@ def _enforce_capabilities(payload: dict[str, Any], capabilities: dict[str, Any] 
 def _absolute_url(base_url: str, url: str) -> str:
     if url.startswith("http://") or url.startswith("https://"):
         return url
-    return urljoin(f"{base_url.rstrip('/')}/", url.lstrip("/"))
+    return urljoin(f"{base_url.rstrip('/')}/", url)
 
 
 def _needs_authorization(url: str) -> bool:

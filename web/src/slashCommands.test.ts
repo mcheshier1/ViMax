@@ -6,9 +6,10 @@ describe('slash command matching', () => {
     expect(matchingSlashCommands('/co')[0]).toMatchObject({matchedPrefix: '/co', unmatchedSuffix: 'mpact'});
   });
 
-  it('only opens for idle slash input', () => {
+  it('keeps queued slash commands available only when the bridge can queue safely', () => {
     expect(shouldShowSlashCommands('/', false)).toBe(true);
     expect(shouldShowSlashCommands('/co', true)).toBe(false);
+    expect(shouldShowSlashCommands('/co', true, true)).toBe(true);
     expect(shouldShowSlashCommands('hello', false)).toBe(false);
   });
 });

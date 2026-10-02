@@ -24,6 +24,6 @@ export function matchingSlashCommands(input: string): SlashCommandMatch[] {
     }));
 }
 
-export function shouldShowSlashCommands(input: string, busy: boolean) {
-  return !busy && input.startsWith('/');
+export function shouldShowSlashCommands(input: string, busy: boolean, queueSupported = false) {
+  return (!busy || queueSupported) && input.startsWith('/');
 }

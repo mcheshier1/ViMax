@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import json
+import hashlib
 import logging
 import asyncio
 import time
@@ -283,8 +284,14 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         # for their own turn rather than drawn because a phase run was the easier way to ask.
         only_set = {int(idx) for idx in only_shots} if only_shots is not None else None
         self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
+        chained_keyframes = self._frame_continuity_config().get("mode") == "chained_keyframes"
         _emit_render_progress(progress, "render_start", "Starting script2video render", {"stop_after": stop_after})
         self.frame_bracketing = await self._brackets_clips()
+        if chained_keyframes and not self.frame_bracketing:
+            raise RuntimeError(
+                "Chained keyframes require a video provider that supports last-frame bracketing; "
+                "select a bracketing-capable provider or disable chained_keyframes."
+            )
         if characters is None:
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
             characters = await self.extract_characters(script=script, quiet=quiet)
@@ -358,28 +365,34 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
 
         priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
-        # Warm the image model's catalogue before any references are assembled: the reference
-        # limit comes from it, and the first frame of a run would otherwise be built as if the
-        # model took any number of them — one over the limit fails with nothing to learn from.
-        prepare = getattr(self.image_generator, "prepare", None)
-        if prepare is not None:
-            await prepare()
-        _emit_render_progress(progress, "frames_start", "Generating frames for cameras", {"camera_count": len(camera_tree), "shot_count": len(shot_descriptions)})
-        tasks = [
-            self.generate_frames_for_single_camera(
-                camera=camera,
+        if chained_keyframes:
+            await self.generate_chained_frames(
+                camera_tree=camera_tree,
                 shot_descriptions=shot_descriptions,
                 characters=characters,
                 character_portraits_registry=character_portraits_registry,
-                priority_shot_idxs=priority_shot_idxs,
-                progress=progress,
                 only_shots=only_shots,
+                progress=progress,
             )
-            for camera in sorted(camera_tree, key=lambda item: item.idx)
-            # A camera holding none of the named shots has nothing to draw: its cached frames
-            # still serve as references, and redrawing them is not what was asked for.
-            if only_set is None or only_set & set(camera.active_shot_idxs)
-        ]
+            tasks = []
+        else:
+            # Read provider limits before the legacy selector assembles references.
+            prepare = getattr(self.image_generator, "prepare", None)
+            if prepare is not None:
+                await prepare()
+            tasks = [
+                self.generate_frames_for_single_camera(
+                    camera=camera,
+                    shot_descriptions=shot_descriptions,
+                    characters=characters,
+                    character_portraits_registry=character_portraits_registry,
+                    priority_shot_idxs=priority_shot_idxs,
+                    progress=progress,
+                    only_shots=only_shots,
+                )
+                for camera in sorted(camera_tree, key=lambda item: item.idx)
+                if only_set is None or only_set & set(camera.active_shot_idxs)
+            ]
 
         if stop_after == "stills":
             await asyncio.gather(*tasks)
@@ -526,6 +539,312 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             for shot_idx in camera.active_shot_idxs
             if shot_idx in by_idx
         ]
+    def _continuity_project_dir(self) -> str:
+        render_dir = os.path.abspath(self.working_dir)
+        if os.path.basename(render_dir).startswith("scene_"):
+            render_dir = os.path.dirname(render_dir)
+            if os.path.basename(render_dir).startswith("event_"):
+                render_dir = os.path.dirname(os.path.dirname(render_dir))
+        return os.path.dirname(render_dir)
+
+    def _frame_continuity_config(self) -> Dict[str, Any]:
+        path = os.path.join(self._continuity_project_dir(), "frame_continuity.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Cannot read frame continuity configuration {path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Frame continuity configuration {path} must contain a JSON object")
+        return config
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _record_continuity_source(self, shot_idx: int, source_idx: int, source_path: str, mode: str) -> None:
+        selector_path = self.selector_output_path(shot_idx, "first_frame")
+        try:
+            with open(selector_path, "r", encoding="utf-8") as handle:
+                selector = json.load(handle)
+            if not isinstance(selector, dict):
+                selector = {}
+        except (OSError, ValueError):
+            selector = {}
+        selector["continuity_source"] = {
+            "shot_idx": source_idx,
+            "frame_type": "last_frame",
+            "sha256": self._sha256_file(source_path),
+            "mode": mode,
+        }
+        os.makedirs(os.path.dirname(selector_path), exist_ok=True)
+        with open(selector_path, "w", encoding="utf-8") as handle:
+            json.dump(selector, handle, ensure_ascii=False, indent=4)
+
+    async def generate_chained_frames(
+        self,
+        *,
+        camera_tree: List[Camera],
+        shot_descriptions: List[ShotDescription],
+        characters: List[CharacterInScene],
+        character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
+        only_shots: Optional[List[int]] = None,
+        progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+    ) -> None:
+        """Generate keyframes sequentially in playback order, carrying each cut forward."""
+        if not await self._brackets_clips():
+            raise RuntimeError(
+                "Chained keyframes require a video provider that supports last-frame bracketing; "
+                "select a bracketing-capable provider or disable chained_keyframes."
+            )
+        self.frame_bracketing = True
+        ordered = self._ordered_active_shots(camera_tree, shot_descriptions)
+        if not ordered:
+            return
+        by_idx = {shot.idx: shot for shot in ordered}
+        camera_by_shot = {
+            shot_idx: camera
+            for camera in sorted(camera_tree, key=lambda item: item.idx)
+            for shot_idx in camera.active_shot_idxs
+            if shot_idx in by_idx
+        }
+        wanted = {int(idx) for idx in only_shots} if only_shots is not None else None
+        stop_position = len(ordered) - 1
+        if wanted is not None:
+            if not wanted:
+                return
+            unknown = wanted - by_idx.keys()
+            if unknown:
+                raise RuntimeError(f"Unknown chained shot(s): {sorted(unknown)}")
+            positions = [position for position, shot in enumerate(ordered) if shot.idx in wanted]
+            stop_position = positions[-1]
+            excluded_between = [
+                ordered[position].idx for position in range(positions[0], stop_position + 1)
+                if ordered[position].idx not in wanted
+            ]
+            if excluded_between:
+                raise RuntimeError(
+                    f"Chained scope crosses excluded dependent shots {excluded_between}; "
+                    "include those predecessors explicitly in only_shots before rendering."
+                )
+            project_dir = self._continuity_project_dir()
+            acceptance_path = os.path.join(project_dir, "render_acceptance.json")
+            try:
+                with open(acceptance_path, "r", encoding="utf-8") as handle:
+                    acceptance = json.load(handle)
+            except FileNotFoundError:
+                acceptance = {}
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Cannot read chained frame approvals: {exc}") from exc
+            relative = os.path.relpath(self.working_dir, project_dir).split(os.sep)
+            root_store = acceptance.get(relative[0], {})
+            shot_store = root_store.get("shots", {})
+            prefix = "/".join(relative[1:])
+            for position in range(stop_position + 1):
+                shot = ordered[position]
+                if shot.idx in wanted:
+                    continue
+                slot = f"{prefix}/{shot.idx}" if prefix else str(shot.idx)
+                record = shot_store.get(slot, {}).get("keyframes", {})
+                if record.get("invalidated_at"):
+                    raise RuntimeError(
+                        f"Cannot render scoped shot(s) {sorted(wanted)}: excluded predecessor shot {slot} "
+                        "has invalidated keyframes; include it explicitly in only_shots."
+                    )
+        for shot in ordered:
+            for kind in ("first_frame", "last_frame"):
+                self.frame_events.setdefault(shot.idx, {}).setdefault(kind, asyncio.Event())
+                if os.path.isfile(self.frame_path(shot.idx, kind)):
+                    self.frame_events[shot.idx][kind].set()
+        prepare = getattr(self.image_generator, "prepare", None)
+        if prepare is not None:
+            await prepare()
+
+        first_shot = ordered[0]
+        if wanted is not None and first_shot.idx not in wanted:
+            if not all(os.path.isfile(self.frame_path(first_shot.idx, kind)) for kind in ("first_frame", "last_frame")):
+                raise RuntimeError(
+                    f"Cannot render scoped shot(s) {sorted(wanted)}: required predecessor shot "
+                    f"{first_shot.idx} keyframes are missing; include that predecessor in only_shots."
+                )
+        else:
+            camera = camera_by_shot[first_shot.idx]
+            root_camera = Camera(idx=camera.idx, active_shot_idxs=[first_shot.idx])
+            await self.generate_frames_for_single_camera(
+                camera=root_camera,
+                shot_descriptions=shot_descriptions,
+                characters=characters,
+                character_portraits_registry=character_portraits_registry,
+                priority_shot_idxs=[],
+                progress=progress,
+                only_shots=[first_shot.idx],
+            )
+
+        previous = first_shot
+        for position in range(1, stop_position + 1):
+            shot = ordered[position]
+            previous_last = self.frame_path(previous.idx, "last_frame")
+            if not os.path.isfile(previous_last):
+                if wanted is not None and previous.idx not in wanted:
+                    raise RuntimeError(
+                        f"Cannot render scoped shot {shot.idx}: required predecessor shot {previous.idx} "
+                        f"last frame is missing; include that predecessor in only_shots."
+                    )
+                raise RuntimeError(f"Cannot render shot {shot.idx}: predecessor shot {previous.idx} last frame is missing.")
+            same_camera = camera_by_shot[shot.idx].idx == camera_by_shot[previous.idx].idx
+            expected_mode = "reuse" if same_camera else "reframe"
+            expected_hash = self._sha256_file(previous_last)
+            if wanted is not None and shot.idx not in wanted:
+                skipped_first = self.frame_path(shot.idx, "first_frame")
+                try:
+                    with open(self.selector_output_path(shot.idx, "first_frame"), "r", encoding="utf-8") as handle:
+                        skipped_source = json.load(handle).get("continuity_source")
+                except (OSError, ValueError, AttributeError):
+                    skipped_source = None
+                if (
+                    not os.path.isfile(skipped_first)
+                    or not isinstance(skipped_source, dict)
+                    or skipped_source.get("shot_idx") != previous.idx
+                    or skipped_source.get("frame_type") != "last_frame"
+                    or skipped_source.get("sha256") != expected_hash
+                    or skipped_source.get("mode") != expected_mode
+                    or (same_camera and self._sha256_file(skipped_first) != expected_hash)
+                ):
+                    raise RuntimeError(
+                        f"Cannot render scoped shot(s) {sorted(wanted)}: excluded predecessor shot {shot.idx} "
+                        f"has missing or stale chained keyframes; include it in only_shots."
+                    )
+                previous = shot
+                continue
+            first_path = self.frame_path(shot.idx, "first_frame")
+            redrawn = self._is_redrawn(shot.idx)
+            try:
+                with open(self.selector_output_path(shot.idx, "first_frame"), "r", encoding="utf-8") as handle:
+                    continuity = json.load(handle).get("continuity_source")
+            except (OSError, ValueError, AttributeError):
+                continuity = None
+            valid_existing = (
+                os.path.isfile(first_path)
+                and isinstance(continuity, dict)
+                and continuity.get("shot_idx") == previous.idx
+                and continuity.get("frame_type") == "last_frame"
+                and continuity.get("sha256") == expected_hash
+                and continuity.get("mode") == expected_mode
+                and (not same_camera or self._sha256_file(first_path) == expected_hash)
+            )
+            if os.path.isfile(first_path) and not redrawn and not valid_existing:
+                raise RuntimeError(
+                    f"Existing first frame for shot {shot.idx} has no matching continuity provenance from "
+                    f"predecessor shot {previous.idx}; explicitly redraw shot {shot.idx} to replace it."
+                )
+            if redrawn:
+                for path in (first_path, self.frame_path(shot.idx, "last_frame"),
+                             self.selector_output_path(shot.idx, "first_frame"),
+                             self.selector_output_path(shot.idx, "last_frame")):
+                    if os.path.isfile(path):
+                        os.remove(path)
+                self.frame_events[shot.idx]["first_frame"].clear()
+                self.frame_events[shot.idx]["last_frame"].clear()
+
+            if not os.path.isfile(first_path):
+                os.makedirs(os.path.dirname(first_path), exist_ok=True)
+                if same_camera:
+                    shutil.copyfile(previous_last, first_path)
+                    self._record_continuity_source(shot.idx, previous.idx, previous_last, "reuse")
+                else:
+                    await self._generate_chained_image(
+                        shot, previous, previous_last, characters, character_portraits_registry,
+                        progress, frame_type="first_frame",
+                    )
+            self.frame_events[shot.idx]["first_frame"].set()
+            await self._generate_chained_image(
+                shot, shot, first_path, characters, character_portraits_registry,
+                progress, frame_type="last_frame",
+            )
+            previous = shot
+
+    async def _generate_chained_image(
+        self,
+        shot: ShotDescription,
+        source_shot: ShotDescription,
+        source_path: str,
+        characters: List[CharacterInScene],
+        character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
+        progress=None,
+        *,
+        frame_type: Literal["first_frame", "last_frame"],
+    ) -> None:
+        source_type = "last_frame" if frame_type == "first_frame" else "first_frame"
+        source = {
+            "shot_idx": source_shot.idx,
+            "frame_type": source_type,
+            "sha256": self._sha256_file(source_path),
+        }
+        frame_path = self.frame_path(shot.idx, frame_type)
+        if os.path.isfile(frame_path):
+            selector = self.load_selector_output(shot.idx, frame_type) or {}
+            if selector.get("source_frame") != source:
+                raise RuntimeError(
+                    f"Existing {frame_type} for shot {shot.idx} has stale source state; "
+                    "explicitly redraw its keyframes before rendering."
+                )
+            self.frame_events[shot.idx][frame_type].set()
+            return
+        visible_indices = set(shot.ff_vis_char_idxs if frame_type == "first_frame" else shot.lf_vis_char_idxs)
+        visible = [character for character in characters if character.is_visible and character.idx in visible_indices]
+        source_visible = set(source_shot.lf_vis_char_idxs if source_type == "last_frame" else source_shot.ff_vis_char_idxs)
+        newcomers = visible_indices - source_visible
+        ranked = sorted(visible, key=lambda character: (character.idx not in newcomers, character.idx))
+        limit = self.reference_image_limit()
+        if limit is not None and limit < 1:
+            raise RuntimeError("Chained keyframes require an image model that accepts a scene reference.")
+        budget = (limit - 1) if limit is not None else 2
+        pairs = [(source_path, "Mandatory scene state: preserve the existing room geometry, camera-relative positions, identities, clothing, props and lighting.")]
+        for character in ranked:
+            front = (character_portraits_registry.get(character.identifier_in_scene) or {}).get("front")
+            if front and len(pairs) - 1 < budget:
+                pairs.append((front["path"], f"{character.identifier_in_scene}: approved front portrait. {self._portrait_reference_text(character, front)}"))
+        description = shot.ff_desc if frame_type == "first_frame" else shot.lf_desc
+        direction = (
+            "Reframe the immediately preceding ending at the SAME INSTANT for the new camera; do not advance the action."
+            if frame_type == "first_frame" else
+            "Use this shot's own first frame as the exact starting state. Keep the camera fixed and change only the specified end-state action."
+        )
+        prompt = (
+            f"{direction} Image 0 is the mandatory scene reference, not a loose inspiration. "
+            "Keep all unchanged people, faces, clothes, furniture, held objects and lighting identical to it. "
+            "Portrait references define identity only, never their studio background. "
+            f"Required frame: {description}"
+        )
+        prompt = "\n".join(f"Image {index}: {text}" for index, (_, text) in enumerate(pairs)) + "\n\n" + prompt
+        selector = {
+            "reference_image_path_and_text_pairs": pairs,
+            "text_prompt": prompt,
+            "sent_prompt": prompt,
+            "source_frame": source,
+        }
+        if frame_type == "first_frame":
+            selector["continuity_source"] = {**source, "mode": "reframe"}
+        selector_path = self.selector_output_path(shot.idx, frame_type)
+        os.makedirs(os.path.dirname(selector_path), exist_ok=True)
+        with open(selector_path, "w", encoding="utf-8") as handle:
+            json.dump(selector, handle, ensure_ascii=False, indent=4)
+        image = await self._generate_frame_image(
+            shot_idx=shot.idx, frame_type=frame_type, prompt=prompt,
+            reference_image_paths=[path for path, _ in pairs],
+        )
+        os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+        image.save(frame_path)
+        self.frame_events[shot.idx][frame_type].set()
+        _emit_render_progress(progress, "frame_done", f"Generated chained {frame_type} for shot {shot.idx}", {"shot_idx": shot.idx, "frame_type": frame_type, "path": frame_path})
+
+
 
 
 
@@ -1040,13 +1359,18 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             front, back = registry_item.get("front"), registry_item.get("back")
             if not front or front["path"] in {path for path, _ in pairs}:
                 continue
-            posed = [item["path"] for view, item in registry_item.items() if view != "back"]
-            if any(path in {candidate for candidate, _ in pairs} for path in posed):
-                continue
-            replacement = (back or {}).get("path")
-            if replacement is not None and replacement in {path for path, _ in pairs}:
-                # A face matters more than the view: the description still sets the pose.
-                pairs = [(path, text) if path != replacement else (front["path"], self._portrait_reference_text(character, front)) for path, text in pairs]
+            sent = {path for path, _ in pairs}
+            # A face matters more than the view: the description still sets the pose.
+            # A side portrait is not much of a face either. It was treated as good
+            # enough to leave alone, and given Claude's side portrait for a standing
+            # man the image model bound the heavyset profile to a body that was not
+            # his -- a second Claude in the frame, next to the real one. Side is
+            # swapped for front exactly as back is; only the front portrait settles
+            # who a character is.
+            side = next((item["path"] for view, item in registry_item.items() if view == "side"), None)
+            weak = next((path for path in (side, (back or {}).get("path")) if path in sent), None)
+            if weak is not None:
+                pairs = [(path, text) if path != weak else (front["path"], self._portrait_reference_text(character, front)) for path, text in pairs]
             elif limit is None or len(pairs) < limit:
                 pairs.append((front["path"], self._portrait_reference_text(character, front)))
             else:

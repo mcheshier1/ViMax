@@ -194,6 +194,34 @@ class MainAgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(next(iter(turn_ids)).startswith("turn-"))
         self.assertIn("Compacted context", events[2]["delta"])
 
+    async def test_failed_repl_request_completes_its_own_turn_before_next_request(self):
+        for fail_before_turn in (False, True):
+            with self.subTest(fail_before_turn=fail_before_turn):
+                class FailingFirstRuntime(FakeRuntime):
+                    async def stream_events(self, user_input):
+                        if user_input == "first":
+                            self.inputs.append(user_input)
+                            if not fail_before_turn:
+                                yield {"type": "turn", "turn_id": "failed-turn"}
+                            raise RuntimeError("local failure")
+                        async for event in super().stream_events(user_input):
+                            yield event
+
+                code, stdout, stderr, runtime = await self.run_cli(
+                    ["--jsonl", "--stdin-repl"], runtime=FailingFirstRuntime(),
+                    stdin_text="first\nsecond\n",
+                )
+                events = [json.loads(line) for line in stdout.splitlines()]
+                turns = [event["turn_id"] for event in events if event["type"] == "turn"]
+                completions = [event["turn_id"] for event in events if event["type"] == "done"]
+                self.assertEqual(completions, turns)
+                self.assertEqual(len(turns), 2)
+                self.assertEqual(events[1]["type"], "error")
+                self.assertEqual(events[1]["turn_id"], turns[0])
+                self.assertEqual(runtime.inputs, ["first", "second"])
+                self.assertEqual(code, 0)
+                self.assertEqual(stderr, "")
+
     async def test_plain_mode_prints_progress_terminal_and_session(self):
         code, stdout, stderr, _ = await self.run_cli(["--once", "hello"])
         self.assertEqual(code, 0)

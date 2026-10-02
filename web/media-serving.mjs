@@ -5,7 +5,7 @@ import {spawn} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {pipeline} from 'node:stream/promises';
-import {artifactContentType, resolveArtifactPath} from './server-lib.mjs';
+import {artifactContentType, readSessionState, resolveArtifactPath} from './server-lib.mjs';
 
 const thumbnailFormats = new Map([
   ['.png', 'png_pipe'], ['.jpg', 'jpeg_pipe'], ['.jpeg', 'jpeg_pipe'],
@@ -113,6 +113,12 @@ async function deliverFile(request, response, source, contentType) {
       'Cache-Control': 'private, max-age=0, must-revalidate',
       'X-Content-Type-Options': 'nosniff',
     };
+    if (source.downloadName) {
+      const name = source.downloadName;
+      const fallback = name.replace(/[^\x20-\x7e]/g, '_');
+      const encoded = encodeURIComponent(name).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+      headers['Content-Disposition'] = `inline; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+    }
     const incoming = request.headers;
     if ((incoming['if-match'] && !matchesTag(incoming['if-match'], etag)) ||
         (!incoming['if-match'] && incoming['if-unmodified-since'] &&
@@ -156,6 +162,13 @@ async function deliverFile(request, response, source, contentType) {
 
 export async function serveArtifact(request, response, repoRoot, sessionId, relativePath) {
   const source = await openArtifact(repoRoot, sessionId, relativePath);
+  let name = path.basename(source.filePath);
+  if (name === 'final_video.mp4') {
+    const state = await readSessionState(repoRoot);
+    const title = state.sessions.find((session) => session.sessionId === sessionId)?.projectName.trim() || sessionId;
+    name = `${title}.mp4`;
+  }
+  source.downloadName = name.toWellFormed().replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, '-').replace(/[. ]+$/g, '');
   return deliverFile(request, response, source, artifactContentType(source.filePath));
 }
 

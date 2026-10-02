@@ -140,13 +140,18 @@ async def amain(argv: list[str] | None = None) -> int:
             print_event({"type": "done", "turn_id": turn_id, "assistant": message, "tool_results": []}, jsonl=args.jsonl)
             print_event({"type": "session", "turn_id": turn_id, "session": runtime.session_index.snapshot()}, jsonl=args.jsonl)
             continue
+        turn_id = ""
         try:
             async for event in runtime.stream_events(user_input):
+                if event.get("type") == "turn":
+                    turn_id = str(event.get("turn_id") or event.get("turn", {}).get("id") or "")
                 print_event(event, jsonl=args.jsonl)
         except Exception as exc:
             # Keep the REPL alive: one failed turn must not kill the process
             # (and with it the TUI driving us over stdio).
-            turn_id = f"turn-{uuid4().hex[:12]}"
+            if not turn_id:
+                turn_id = f"turn-{uuid4().hex[:12]}"
+                print_event({"type": "turn", "turn_id": turn_id, "turn": {"id": turn_id}}, jsonl=args.jsonl)
             print_event({"type": "error", "turn_id": turn_id, "message": f"turn failed: {exc}"}, jsonl=args.jsonl)
             print_event({"type": "done", "turn_id": turn_id, "assistant": "", "tool_results": []}, jsonl=args.jsonl)
     return 0

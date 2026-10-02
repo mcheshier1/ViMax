@@ -180,10 +180,17 @@ class AgentLoop:
 
                 task = asyncio.create_task(self.tool_executor.execute(call, control, progress_callback=on_progress))
                 while not task.done():
+                    progress_task = asyncio.create_task(progress_queue.get())
                     try:
-                        yield await asyncio.wait_for(progress_queue.get(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        continue
+                        ready, _ = await asyncio.wait(
+                            (task, progress_task), return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if progress_task in ready:
+                            yield progress_task.result()
+                    finally:
+                        if not progress_task.done():
+                            progress_task.cancel()
+                        await asyncio.gather(progress_task, return_exceptions=True)
                 while not progress_queue.empty():
                     yield progress_queue.get_nowait()
                 record = await task

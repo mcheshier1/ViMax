@@ -1,15 +1,64 @@
 import type {AgentEvent, ChatState, Message} from './types';
 
 export function createChatState(messages: Message[] = []): ChatState {
-  return {messages, busy: false, turnId: '', promptTokens: 0};
+  return {messages, busy: false, turnId: '', promptTokens: 0, queueSupported: false, activeMessageId: ''};
 }
 
-export function appendLocalUser(state: ChatState, text: string): ChatState {
+export function appendLocalUser(state: ChatState, text: string, id = `local-user-${Date.now()}-${state.messages.length}`): ChatState {
   return {
     ...state,
-    busy: true,
-    messages: [...state.messages, {id: `local-user-${Date.now()}`, role: 'user', text}],
+    messages: upsertUserMessage(state.messages, id, text, 'sending'),
   };
+}
+
+export function setUserDelivery(state: ChatState, id: string, delivery: NonNullable<Message['delivery']>, deliveryError?: string): ChatState {
+  return {
+    ...state,
+    messages: state.messages.map((message) => message.id === id
+      ? {...message, delivery, deliveryError}
+      : message),
+  };
+}
+
+export function applyAgentQueueSnapshot(state: ChatState, event: AgentEvent): ChatState {
+  const active = event.active || null;
+  const pending = event.pending || [];
+  const cancelledIds = new Set(event.cancelledIds || []);
+  const messages = [...state.messages];
+  const updateDelivery = (id: string, delivery: NonNullable<Message['delivery']>) => {
+    const index = messages.findIndex((message) => message.id === id);
+    if (index >= 0) messages[index] = {...messages[index], delivery, deliveryError: undefined};
+  };
+  const addOrUpdate = (item: {id: string; text: string}, delivery: 'running' | 'queued') => {
+    const existing = messages.findIndex((message) => message.id === item.id);
+    if (existing < 0) {
+      messages.push({id: item.id, role: 'user', text: item.text, delivery});
+    } else {
+      messages[existing] = {...messages[existing], role: 'user', text: messages[existing].text || item.text, delivery, deliveryError: undefined};
+    }
+  };
+
+  if (state.activeMessageId && state.activeMessageId !== active?.id && !cancelledIds.has(state.activeMessageId)) {
+    updateDelivery(state.activeMessageId, 'done');
+  }
+  if (active) addOrUpdate(active, 'running');
+  for (const item of pending) addOrUpdate(item, 'queued');
+  for (const id of cancelledIds) updateDelivery(id, 'cancelled');
+  return {
+    ...state,
+    messages,
+    busy: Boolean(event.busy),
+    queueSupported: true,
+    activeMessageId: active?.id || '',
+  };
+}
+
+function upsertUserMessage(messages: Message[], id: string, text: string, delivery: NonNullable<Message['delivery']>) {
+  const index = messages.findIndex((message) => message.id === id);
+  if (index < 0) return [...messages, {id, role: 'user' as const, text, delivery}];
+  return messages.map((message) => message.id === id
+    ? {...message, role: 'user' as const, text: message.text || text, delivery}
+    : message);
 }
 
 export function composeAgentPrompt(text: string, workspaceUploads: string[] = []) {
@@ -22,8 +71,11 @@ export function composeAgentPrompt(text: string, workspaceUploads: string[] = []
 export function applyAgentEvent(state: ChatState, event: AgentEvent): ChatState {
   const turnId = event.turn_id || state.turnId || `turn-${Date.now()}`;
   switch (event.type) {
-    case 'turn':
-      return {...state, busy: true, turnId};
+    case 'turn': {
+      const activeMessageId = event.messageId || state.activeMessageId;
+      const next = activeMessageId ? setUserDelivery(state, activeMessageId, 'running') : state;
+      return {...next, busy: true, turnId, activeMessageId};
+    }
     case 'prompt_trace': {
       const tokens = event.prompt_trace?.totals?.total_tokens
         ?? event.prompt_trace?.totals?.total_estimated_tokens
@@ -80,7 +132,7 @@ export function applyAgentEvent(state: ChatState, event: AgentEvent): ChatState 
     case 'error':
       return {
         ...state,
-        busy: false,
+        busy: state.queueSupported ? state.busy : false,
         messages: [...state.messages, {id: `error-${turnId}-${Date.now()}`, role: 'error', text: event.message || 'Unknown agent error'}],
       };
     case 'done': {
@@ -88,7 +140,16 @@ export function applyAgentEvent(state: ChatState, event: AgentEvent): ChatState 
       const messages = !hasAssistant && event.assistant
         ? [...state.messages, {id: `assistant-${turnId}`, role: 'assistant' as const, text: event.assistant}]
         : state.messages;
-      return {...state, messages, busy: false};
+      const messageId = event.messageId || state.activeMessageId;
+      const completed = messageId
+        ? setUserDelivery({...state, messages}, messageId, 'done')
+        : {...state, messages};
+      const hasQueued = completed.messages.some((message) => message.role === 'user' && message.delivery === 'queued');
+      return {
+        ...completed,
+        busy: state.queueSupported ? hasQueued : false,
+        activeMessageId: state.activeMessageId === messageId ? '' : state.activeMessageId,
+      };
     }
     case 'bridge_status':
       if (event.status !== 'error' && event.status !== 'stopped') return state;

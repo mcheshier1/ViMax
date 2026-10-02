@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
-from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
+from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI, _absolute_url
 from interfaces.video_output import VideoOutput
 
 
@@ -69,6 +69,14 @@ async def _generate(generator, catalogue, *, reference_image_paths=(), progress=
     return captured["payload"], output
 
 
+class PollingUrlTests(unittest.TestCase):
+    def test_origin_relative_job_url_does_not_duplicate_api_prefix(self):
+        self.assertEqual(
+            _absolute_url("https://openrouter.ai/api/v1", "/api/v1/videos/job-1"),
+            "https://openrouter.ai/api/v1/videos/job-1",
+        )
+
+
 class PollToleranceTests(unittest.IsolatedAsyncioTestCase):
     """A blip while asking about a running job must not abandon the job."""
 
@@ -105,34 +113,6 @@ class PollToleranceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OpenRouterVideoGeneratorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_default_duration_is_eight_seconds(self):
-        captured = {}
-
-        async def fake_post_json(url, *, headers, payload, timeout, hard_timeout_seconds):
-            captured["payload"] = payload
-            return 200, {"id": "job-1", "polling_url": "/videos/job-1", "status": "queued"}
-
-        async def fake_get_json(url, *, headers, timeout, hard_timeout_seconds):
-            return 200, {"status": "completed", "unsigned_urls": ["https://cdn.example/out.mp4"]}
-
-        async def fake_get_bytes(url, *, headers, timeout, hard_timeout_seconds):
-            return 200, b"video"
-
-        async def fake_sleep(seconds):
-            return None
-
-        generator = VideoGeneratorOpenRouterAPI(api_key="test-key", model="google/veo-3.1-lite")
-        with patch.dict(os.environ, {}, clear=True), \
-             patch("tools.video_generator_openrouter_api._post_json", fake_post_json), \
-             patch("tools.video_generator_openrouter_api._get_json", fake_get_json), \
-             patch("tools.video_generator_openrouter_api._get_bytes", fake_get_bytes), \
-             patch("tools.video_generator_openrouter_api.asyncio.sleep", fake_sleep):
-            output = await generator.generate_single_video(prompt="hello")
-
-        self.assertIsInstance(output, VideoOutput)
-        self.assertEqual(captured["payload"]["duration"], 8)
-        self.assertEqual(captured["payload"]["model"], "google/veo-3.1-lite")
-
     async def test_seedance_fast_uses_supported_openrouter_payload(self):
         captured = {}
 

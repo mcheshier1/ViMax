@@ -13,6 +13,7 @@ wheels/
 .working_dir/
 .vimax/
 .test/
+.pipeline_backup/
 
 # Local environment files
 .env

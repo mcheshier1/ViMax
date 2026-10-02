@@ -341,6 +341,85 @@ class AcceptanceGateTests(unittest.TestCase):
             refusal = _acceptance_refusal(working, "script2video", "video")
             self.assertIn("stale", [item["state"] for item in refusal["unaccepted"]])
 
+
+    def test_continuity_redraw_invalidates_playback_successors_without_touching_unrelated_slots(self):
+        from agent_runtime.vimax_adapters import (
+            _acceptance_slots,
+            _invalidate_continuity_dependents,
+            _mark_slots_redone,
+            _slot_state,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, _ = self._session(tmp)
+            root = working / "script2video"
+            # Playback is 1 then 0; slot 2 is planned and accepted but inactive.
+            (root / "camera_tree.json").write_text(json.dumps([
+                {"idx": 0, "active_shot_idxs": [1]},
+                {"idx": 2, "active_shot_idxs": [0]},
+            ]), encoding="utf-8")
+            inactive = root / "shots" / "2"
+            inactive.mkdir(parents=True)
+            (inactive / "shot_description.json").write_text("{}", encoding="utf-8")
+            (inactive / "qwen_qwen-image-3").mkdir()
+            (inactive / "qwen_qwen-image-3" / "first_frame.png").write_bytes(b"frame")
+
+            records = {"shots": {}}
+            for shot in ("0", "1", "2"):
+                shot_dir = root / "shots" / shot
+                model_dir = shot_dir / "kwaivgi_kling-video-o1"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                clip = model_dir / "video.mp4"
+                clip.write_bytes(f"clip-{shot}".encode())
+                records["shots"][shot] = {
+                    "keyframes": {"accepted_at": "reviewed", "artifacts": [_lock(working, f"script2video/shots/{shot}/qwen_qwen-image-3/first_frame.png")]},
+                    "clips": {"accepted_at": "reviewed", "artifacts": [_lock(working, f"script2video/shots/{shot}/kwaivgi_kling-video-o1/video.mp4")]},
+                }
+            records["final_video"] = {
+                "accepted_at": "reviewed",
+                "artifacts": [_lock(working, "script2video/final_video.mp4")],
+            }
+            (working / "render_acceptance.json").write_text(json.dumps({"script2video": records}), encoding="utf-8")
+            (working / "frame_continuity.json").write_text(json.dumps({"mode": "chained_keyframes"}), encoding="utf-8")
+
+            self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["1"]), ["0"])
+            slots = _acceptance_slots(working, "script2video")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "stale")
+            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["1"]), "accepted")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["2"]), "accepted")
+            self.assertEqual(_slot_state(working, slots["final_video"]["final_video"]), "stale")
+            invalidated = json.loads((working / "render_acceptance.json").read_text(encoding="utf-8"))["script2video"]
+            self.assertIn("continuous handoff", invalidated["shots"]["0"]["keyframes"]["invalidation_reason"])
+            self.assertEqual(invalidated["final_video"]["accepted_at"], "reviewed")
+            self.assertTrue((root / "final_video.mp4").exists())
+            self.assertTrue((root / "shots" / "0" / "kwaivgi_kling-video-o1" / "video.mp4").exists())
+            self.assertTrue((root / "shots" / "0" / "qwen_qwen-image-3" / "first_frame.png").exists())
+
+            _mark_slots_redone(working, "script2video", {"1": "keyframes"}, {})
+            slots = _acceptance_slots(working, "script2video")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["1"]), "rendered")
+            self.assertEqual(_slot_state(working, slots["clips"]["1"]), "stale")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "stale")
+            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
+            _mark_slots_redone(working, "script2video", {"0": "keyframes"}, {})
+            slots = _acceptance_slots(working, "script2video")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "rendered")
+            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
+
+    def test_continuity_invalidation_is_disabled_without_the_root_setting(self):
+        from agent_runtime.vimax_adapters import _acceptance_slots, _invalidate_continuity_dependents, _slot_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, _ = self._session(tmp)
+            (working / "script2video" / "camera_tree.json").write_text(
+                json.dumps([{"idx": 0, "active_shot_idxs": [1, 0]}]), encoding="utf-8",
+            )
+            self._accept(working, 0, hashlib.sha256(b"frame").hexdigest())
+
+            self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["1"]), [])
+            state = _slot_state(working, _acceptance_slots(working, "script2video")["keyframes"]["0"])
+            self.assertEqual(state, "accepted")
     def test_a_rejected_slot_blocks_and_carries_its_reason(self):
         from agent_runtime.vimax_adapters import _acceptance_refusal, _slot_state, _acceptance_slots
 
@@ -916,7 +995,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._write_render_status", side_effect=written), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 await adapter.vimax_render_video({"stop_after": "stills", "render_mode": "script2video", "redo_rejected": True})
 
             # The first row is written as the render starts, which is when a reader needs it.
@@ -936,7 +1015,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "stills", "render_mode": "script2video", "redo_rejected": True})
 
             self.assertTrue(result.ok, result.content)
@@ -959,7 +1038,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 # Rendering video needs accepted keyframes, which this session does not have.
                 result = await adapter.vimax_render_video({"stop_after": "video", "render_mode": "script2video", "redo_shots": ["1"]})
 
@@ -988,7 +1067,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "portraits", "render_mode": "script2video", "redo_rejected": True})
 
             self.assertTrue(result.ok, result.content)
@@ -1010,7 +1089,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FailingRedrawPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FailingRedrawPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "stills", "render_mode": "script2video", "redo_rejected": True})
 
             self.assertFalse(result.ok)
@@ -1041,8 +1120,8 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline), \
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", RecordingScriptPipeline):
                 # Even the escape hatch that moves a sequence may not be used for a redraw.
                 result = await adapter.vimax_render_video({"stop_after": "stills", "render_mode": "idea2video", "allow_model_change": True, "redo_shots": ["scene_0/0"]})
 
@@ -1057,7 +1136,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "stills", "render_mode": "script2video", "redo_shots": [7]})
 
             self.assertFalse(result.ok)
@@ -1077,7 +1156,7 @@ class AcceptanceGateToolTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 refused = await adapter.vimax_render_video({"stop_after": "video", "render_mode": "script2video"})
                 overridden = await adapter.vimax_render_video({"stop_after": "video", "render_mode": "script2video", "allow_unlocked": True})
 
@@ -1143,8 +1222,8 @@ class RenderModeDispatchTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", RecordingScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "portraits", "render_mode": "script2video"})
 
             self.assertTrue(result.ok, result.content)
@@ -1188,7 +1267,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             "VIMAX_LLM_BASE_URL": "https://example.invalid/v1",
             "VIMAX_LLM_REQUEST_TIMEOUT_SECONDS": "12",
             "VIMAX_NARRATIVE_MAX_TOKENS": "1234",
-        }), patch("agent_runtime.vimax_adapters.init_chat_model", fake):
+        }), patch("langchain.chat_models.init_chat_model", fake):
             from agent_runtime.vimax_adapters import _build_chat_model
 
             _build_chat_model()
@@ -1205,8 +1284,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat", "user_requirement": "short", "style": "anime"})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1225,7 +1304,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = ViMaxAdapters(Path(tmp), index)
             script = "A red ball rolls across a white table."
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"script": script, "user_requirement": "one shot"})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1243,8 +1322,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             events = []
             runtime = ToolRuntimeContext("vimax_narrative_planning", "vimax_narrative_planning", turn_id="turn-test", progress_callback=events.append)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"}, runtime)
             self.assertTrue(result.ok)
             stages = [event["progress"]["stage"] for event in events if event.get("type") == "tool_progress"]
@@ -1260,8 +1339,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FailingScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FailingScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
             self.assertFalse(result.ok)
             self.assertEqual(result.metadata["error_type"], "recoverable_planning_step_failed")
@@ -1277,7 +1356,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch.dict("os.environ", {"VIMAX_NARRATIVE_STEP_TIMEOUT_SECONDS": "0.01"}), \
                  patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", HangingIdeaPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", HangingIdeaPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
             self.assertFalse(result.ok)
             self.assertEqual(result.metadata["error_type"], "recoverable_planning_step_failed")
@@ -1293,7 +1372,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             record = index.create(idea="moon cat", user_requirement="short", style="anime")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1306,7 +1385,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             record = index.create(idea="moon cat", user_requirement="short", style="anime")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"session_id": record["session_id"]})
             self.assertTrue(result.ok)
             self.assertEqual(index.get(record["session_id"])["style"], "anime")
@@ -1316,8 +1395,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 first = await adapter.vimax_narrative_planning({"idea": "moon cat"})
                 second = await adapter.vimax_narrative_planning({"idea": "ocean robot"})
             self.assertNotEqual(json.loads(first.content)["session_id"], json.loads(second.content)["session_id"])
@@ -1328,8 +1407,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             empty = index.create(project_name="00")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1345,8 +1424,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             old = index.create(idea="old cat")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FakeIdeaPipeline), \
-                 patch("agent_runtime.vimax_adapters.Script2VideoPipeline", FakeScriptPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"session_id": old["session_id"], "idea": "new robot"})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1532,7 +1611,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRenderIdeaPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FailRenderIdeaPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
             self.assertFalse(result.ok)
             self.assertEqual(result.metadata["error_type"], "render_failed")
@@ -1562,7 +1641,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRender403IdeaPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FailRender403IdeaPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
             self.assertFalse(result.ok)
             self.assertFalse(result.metadata["retryable"])
@@ -1589,7 +1668,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRenderContentFilterIdeaPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FailRenderContentFilterIdeaPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
 
             self.assertFalse(result.ok)
@@ -1614,7 +1693,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", FailRenderMissingReferenceIdeaPipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FailRenderMissingReferenceIdeaPipeline):
                 result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
 
             self.assertFalse(result.ok)
@@ -1643,7 +1722,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
             adapter = ViMaxAdapters(Path(tmp), index)
             stdout = io.StringIO()
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()),                  patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", NoisyRenderIdeaPipeline),                  contextlib.redirect_stdout(stdout):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", NoisyRenderIdeaPipeline),                  contextlib.redirect_stdout(stdout):
                 result = await adapter.vimax_render_video({"stop_after": "video", "allow_unlocked": True})
             self.assertTrue(result.ok)
             self.assertNotIn("NOISE_FROM_RENDER_PIPELINE", stdout.getvalue())
@@ -1700,7 +1779,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._enforce_render_sequence", return_value=None), \
-                 patch("agent_runtime.vimax_adapters.Idea2VideoPipeline", RecordingIdeaScopePipeline):
+                 patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", RecordingIdeaScopePipeline):
                 result = await adapter.vimax_render_video({
                     "stop_after": "video",
                     "render_mode": "idea2video",

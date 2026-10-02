@@ -32,12 +32,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {deleteSession, getAgentConfig, getHistory, getSessions, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
 import {ArtifactsView, ScriptView} from './ArtifactViews';
-import {applyAgentEvent, appendLocalUser, composeAgentPrompt, createChatState, humanize} from './events';
+import {applyAgentEvent, applyAgentQueueSnapshot, appendLocalUser, composeAgentPrompt, createChatState, humanize, setUserDelivery} from './events';
 import {describeArtifacts, describeInvalidation, describeStyleMismatch, diffProjectFields, toProjectFields, type InvalidationConfirmation, type ProjectFields} from './projectMetadata';
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
 import type {AgentConfig, AgentEvent, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
-import {videoProviderPreset} from './videoPresets';
+import {VIDEO_PROVIDER_PRESETS, isHeygenVideoModel, validHeygenVideoSettings, videoModelSelection, videoProviderPreset} from './videoPresets';
 import {TimelineView} from './TimelineView';
 import {useFilmSession, type FilmSelection} from './filmSession';
 import './workbench-shell.css';
@@ -63,6 +63,7 @@ export default function App() {
   const [uploads, setUploads] = useState<Record<string, WorkspaceUpload[]>>({});
   const [uploadingSession, setUploadingSession] = useState('');
   const [sendingSession, setSendingSession] = useState('');
+  const [queueBridgeReady, setQueueBridgeReady] = useState(false);
   const [historyLoading, setHistoryLoading] = useState('');
   const [theme, setTheme] = useState<Theme>(() => resolveTheme(document.documentElement.dataset.theme, false));
   const [loadError, setLoadError] = useState('');
@@ -86,6 +87,9 @@ export default function App() {
   const loadedHistory = useRef(new Set<string>());
   const historyRequests = useRef(new Map<string, Promise<void>>());
   const pendingHistoryEvents = useRef(new Map<string, AgentEvent[]>());
+  const queueSnapshots = useRef(new Map<string, AgentEvent>());
+  const busySessions = useRef(new Set<string>());
+  const bridgeLifecycleObserved = useRef(false);
   const film = useFilmSession(selectedSessionId);
   const filmRef = useRef(film);
   filmRef.current = film;
@@ -94,10 +98,12 @@ export default function App() {
   const draft = drafts[selectedSessionId] || '';
   const workspaceUploads = uploads[selectedSessionId] || EMPTY_UPLOADS;
   const uploadingFiles = uploadingSession === selectedSessionId && Boolean(selectedSessionId);
-  const busy = chat.busy || sendingSession === selectedSessionId && Boolean(selectedSessionId);
+  const sending = Boolean(sendingSession);
+  const busy = chat.busy;
+  const queuedCount = chat.messages.filter((message) => message.role === 'user' && message.delivery === 'queued').length;
   const selectedSession = sessions.find((session) => session.sessionId === selectedSessionId);
   const slashMatches = useMemo(() => matchingSlashCommands(draft), [draft]);
-  const showSlashCommands = shouldShowSlashCommands(draft, busy);
+  const showSlashCommands = shouldShowSlashCommands(draft, busy, chat.queueSupported);
   const contextPercent = Math.min(100, Math.round((chat.promptTokens / CONTEXT_TARGET) * 100));
 
   const updateChat = useCallback((sessionId: string, update: (current: ChatState) => ChatState) => {
@@ -157,13 +163,21 @@ export default function App() {
     setHistoryLoading(sessionId);
     const request = getHistory(sessionId).then((history) => {
       const events = pendingHistoryEvents.current.get(sessionId) || [];
-      const recordedTurns = new Set(history.messages.filter((message) => message.role === 'user' && message.id.endsWith('-user')).map((message) => message.id.slice(0, -5)));
+      const recordedTurns = new Set(history.messages.filter((message) => message.role === 'user').flatMap((message) => [
+        ...(message.turnId ? [message.turnId] : []),
+        ...(message.id.endsWith('-user') ? [message.id.slice(0, -5)] : []),
+      ]));
+      const recordedMessageIds = new Set(history.messages.filter((message) => message.role === 'user').map((message) => message.id));
       let bufferedTurn = '';
       let restored = createChatState(history.messages);
       for (const event of events) {
         bufferedTurn = event.turn_id || bufferedTurn;
-        if (!bufferedTurn || !recordedTurns.has(bufferedTurn)) restored = applyAgentEvent(restored, event);
+        const recorded = (bufferedTurn && recordedTurns.has(bufferedTurn))
+          || (event.messageId && recordedMessageIds.has(event.messageId));
+        if (!recorded) restored = applyAgentEvent(restored, event);
       }
+      const snapshot = queueSnapshots.current.get(sessionId);
+      if (snapshot) restored = applyAgentQueueSnapshot(restored, snapshot);
       updateChat(sessionId, () => restored);
       loadedHistory.current.add(sessionId);
       pendingHistoryEvents.current.delete(sessionId);
@@ -189,17 +203,41 @@ export default function App() {
       setSessions(event.sessions || []);
       return;
     }
+    if (event.type === 'agent_queue') {
+      setQueueBridgeReady(true);
+      const sessionId = event.activeSessionId || '';
+      if (!sessionId) return;
+      bridgeLifecycleObserved.current = true;
+      queueSnapshots.current.set(sessionId, event);
+      if (event.busy) busySessions.current.add(sessionId);
+      else busySessions.current.delete(sessionId);
+      if (event.busy) agentRunningRef.current = true;
+      agentSessionRef.current = sessionId;
+      updateChat(sessionId, (current) => applyAgentQueueSnapshot(current, event));
+      if (selectedSessionIdRef.current === sessionId) filmRef.current.wake();
+      return;
+    }
     if (event.type === 'session') {
-      const sessionId = event.session?.active_session_id || event.session?.session?.session_id || '';
+      const sessionId = event.activeSessionId || event.session?.active_session_id || event.session?.session?.session_id || '';
       if (sessionId) agentSessionRef.current = sessionId;
       void refreshSessions().catch(() => {});
     }
+    const explicitSessionId = event.activeSessionId || event.session?.active_session_id || event.session?.session?.session_id || '';
     if (event.type === 'bridge_status') {
+      bridgeLifecycleObserved.current = true;
+      if (explicitSessionId) agentSessionRef.current = explicitSessionId;
       if (event.status === 'ready' || event.status === 'starting') agentRunningRef.current = true;
-      if (event.status === 'stopped' || event.status === 'error') agentRunningRef.current = false;
+      if (event.status === 'idle' || event.status === 'stopped' || event.status === 'error') agentRunningRef.current = false;
     }
-    const sessionId = agentSessionRef.current;
+    const sessionId = explicitSessionId || agentSessionRef.current;
     if (!sessionId) return;
+    if (event.type === 'turn') busySessions.current.add(sessionId);
+    if (event.type === 'done') {
+      const snapshot = queueSnapshots.current.get(sessionId);
+      if (snapshot?.busy || snapshot?.pending?.length) busySessions.current.add(sessionId);
+      else busySessions.current.delete(sessionId);
+    }
+    if (event.type === 'bridge_status' && (event.status === 'stopped' || event.status === 'error')) busySessions.current.delete(sessionId);
     if (!loadedHistory.current.has(sessionId)) {
       const events = pendingHistoryEvents.current.get(sessionId) || [];
       events.push(event);
@@ -207,7 +245,20 @@ export default function App() {
     }
     updateChat(sessionId, (current) => applyAgentEvent(current, event));
     if (selectedSessionIdRef.current === sessionId && ['tool_start', 'tool_progress', 'tool_result', 'done', 'session'].includes(event.type || '')) filmRef.current.wake();
-  }, () => undefined), [refreshSessions, updateChat]);
+  }, (connected) => {
+    if (connected) return;
+    setQueueBridgeReady(false);
+    queueSnapshots.current.clear();
+    setChats((current) => {
+      let next: Record<string, ChatState> | undefined;
+      for (const [sessionId, state] of Object.entries(current)) {
+        if (!state.queueSupported) continue;
+        next ||= {...current};
+        next[sessionId] = {...state, queueSupported: false};
+      }
+      return next || current;
+    });
+  }), [refreshSessions, updateChat]);
 
   useEffect(() => {
     let cancelled = false;
@@ -227,7 +278,7 @@ export default function App() {
   }, [refreshSessions]);
 
   useEffect(() => {
-    if (!film.progress) return;
+    if (!film.progress || bridgeLifecycleObserved.current) return;
     agentSessionRef.current = film.progress.activeSessionId;
     agentRunningRef.current = film.progress.agentRunning;
   }, [film.progress]);
@@ -325,21 +376,40 @@ export default function App() {
   }
 
   /** Timeline instructions already name their scope. Only the composer adds its chosen context. */
-  async function askAgent(text: string, attachments: string[] = [], restartAgent = false, scope?: AssistantScope) {
+  async function askAgent(
+    text: string,
+    attachments: string[] = [],
+    restartAgent = false,
+    scope?: AssistantScope,
+    options: {messageId?: string; sessionId?: string; chosenShot?: FilmSelection | null} = {},
+  ) {
     if (!text.trim()) return;
+    if (!queueBridgeReady) throw new Error('Wait for the queue-enabled bridge to connect. An older web server needs an idle restart.');
     if (sendingRef.current) throw new Error('Wait for the current message to finish sending');
-    const sessionId = selectedSessionId;
+    const sessionId = options.sessionId || selectedSessionId;
     if (!sessionId) throw new Error('Create or select a project before sending a message');
     if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before sending');
-    const chosenShot = scope === 'shot' ? selection : null;
+    const chosenShot = scope === 'shot' ? options.chosenShot ?? selection : null;
     if (scope === 'shot' && !chosenShot) throw new Error('Select a shot in Film or choose Whole film');
+    const messageId = options.messageId || crypto.randomUUID();
     const root = chosenShot?.root || film.data?.acceptance.root || '';
     sendingRef.current = true;
     setSendingSession(sessionId);
     try {
       await ensureHistory(sessionId);
       if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before sending');
-      if (!agentRunningRef.current || agentSessionRef.current !== sessionId || restartAgent) {
+      const queuedSnapshot = queueSnapshots.current.get(sessionId);
+      const currentChat = chats[sessionId] || EMPTY_CHAT;
+      const queueSupported = queueSnapshots.current.has(sessionId) || currentChat.queueSupported;
+      const serverBusy = currentChat.busy || busySessions.current.has(sessionId) || queuedSnapshot?.busy === true;
+      const activeSessionId = agentSessionRef.current;
+      const activeQueue = activeSessionId ? queueSnapshots.current.get(activeSessionId) : undefined;
+      const activeChat = activeSessionId ? chats[activeSessionId] : undefined;
+      if (activeSessionId && activeSessionId !== sessionId && (busySessions.current.has(activeSessionId) || activeQueue?.busy || activeChat?.busy)) {
+        throw new Error('Another project is still running. Wait for it to finish before switching the agent to this project.');
+      }
+      if (serverBusy && !queueSupported) throw new Error('This running bridge does not support safe message queueing yet');
+      if (!serverBusy && (!agentRunningRef.current || agentSessionRef.current !== sessionId || restartAgent)) {
         await startAgent({sessionId});
         agentSessionRef.current = sessionId;
         agentRunningRef.current = true;
@@ -348,11 +418,25 @@ export default function App() {
       const context = scope && !text.trimStart().startsWith('/')
         ? ` Film context: ${JSON.stringify({session: sessionId, root, scope: scope === 'shot' ? 'selected-shot' : 'whole-film', ...(chosenShot ? {slot: chosenShot.slot, label: chosenShot.label} : {})})}. ${chosenShot ? 'Limit changes to this selected shot unless I explicitly request broader changes.' : 'This request concerns the whole film.'}`
         : '';
-      updateChat(sessionId, (current) => appendLocalUser(current, text));
-      await sendMessage(composeAgentPrompt(text + context, attachments), sessionId);
+      updateChat(sessionId, (current) => appendLocalUser(current, text, messageId));
+      const response = await sendMessage({
+        text: composeAgentPrompt(text + context, attachments),
+        sessionId,
+        messageId,
+        displayText: text,
+      });
+      updateChat(sessionId, (current) => {
+        const message = current.messages.find((item) => item.id === messageId);
+        if (message?.delivery !== 'sending') return current;
+        return setUserDelivery(current, messageId, response.queued ? 'queued' : 'running');
+      });
       filmRef.current.wake();
     } catch (error) {
-      updateChat(sessionId, (current) => ({...current, busy: false}));
+      updateChat(sessionId, (current) => {
+        const message = current.messages.find((item) => item.id === messageId);
+        if (message?.delivery !== 'sending') return current;
+        return setUserDelivery(current, messageId, 'error', error instanceof Error ? error.message : String(error));
+      });
       throw error;
     } finally {
       sendingRef.current = false;
@@ -362,15 +446,25 @@ export default function App() {
 
   async function submit() {
     const text = draft.trim();
-    if (!text || busy || uploadingFiles) return;
     const sessionId = selectedSessionId;
+    const submittedDraft = drafts[sessionId] || '';
+    const submittedUploads = workspaceUploads;
+    const attachmentPaths = submittedUploads.map((file) => file.path);
+    const scope = assistantScope;
+    const chosenShot = scope === 'shot' ? selection : null;
+    if (!queueBridgeReady || !text || !sessionId || sending || uploadingFiles || scope === 'shot' && !chosenShot) return;
+    if (busy && !chat.queueSupported) return;
+    const messageId = crypto.randomUUID();
     setLoadError('');
     try {
-      await askAgent(text, workspaceUploads.map((file) => file.path), false, assistantScope);
-      setDrafts((current) => current[sessionId] === text || current[sessionId]?.trim() === text ? {...current, [sessionId]: ''} : current);
-      setUploads((current) => ({...current, [sessionId]: []}));
+      await askAgent(text, attachmentPaths, false, scope, {messageId, sessionId, chosenShot});
+      setDrafts((current) => current[sessionId] === submittedDraft ? {...current, [sessionId]: ''} : current);
+      setUploads((current) => ({
+        ...current,
+        [sessionId]: (current[sessionId] || []).filter((file) => !submittedUploads.includes(file)),
+      }));
     } catch (error) {
-      updateChat(sessionId, (current) => applyAgentEvent(current, {type: 'error', message: error instanceof Error ? error.message : String(error)}));
+      setLoadError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -404,6 +498,7 @@ export default function App() {
     try {
       await stopAgent();
       agentRunningRef.current = false;
+      busySessions.current.delete(agentSessionRef.current);
       updateChat(agentSessionRef.current, (current) => applyAgentEvent(current, {type: 'bridge_status', status: 'stopped'}));
       filmRef.current.wake();
     } catch (error) {
@@ -504,20 +599,33 @@ export default function App() {
             </div>
             <div className="composer-zone">
               {showSlashCommands && <SlashCommandMenu matches={slashMatches} contextPercent={contextPercent} onSelect={(command) => {setDraft(command); textareaRef.current?.focus();}} />}
+              {!queueBridgeReady && <div className="assistant-queue-note is-unavailable" role="status">
+                <strong>Waiting for the queue-enabled bridge</strong>
+                <span>If this persists after reconnecting, restart the web server once the current request finishes. Your draft stays editable.</span>
+              </div>}
+              {busy && queueBridgeReady && <div className={`assistant-queue-note ${chat.queueSupported ? '' : 'is-unavailable'}`} role="status" aria-live="polite">
+                {chat.queueSupported
+                  ? <><strong>{queuedCount ? `${queuedCount} message${queuedCount === 1 ? '' : 's'} queued` : 'Agent working'}</strong><span>Queued messages are answered in order after the current request finishes.</span></>
+                  : <><strong>Safe queueing is not available yet</strong><span>This bridge has not confirmed queue support. Keep editing and wait for its queue snapshot before sending.</span></>}
+              </div>}
+              {queuedCount > 0 && !busy && <div className="assistant-queue-note" role="status"><strong>{queuedCount} queued</strong><span>Answers wait until the current request finishes.</span></div>}
               <div className={`composer ${busy ? 'is-busy' : ''}`}>
                 <textarea ref={textareaRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
                   if (event.key === 'Tab' && slashMatches[0]) {event.preventDefault(); setDraft(slashMatches[0].name); return;}
                   if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {event.preventDefault(); void submit();}
-                }} placeholder={assistantScope === 'shot' ? 'What should change in this shot?' : 'Describe an idea or a film-wide change'} aria-label="Message ViMax" disabled={!selectedSessionId || busy} rows={2} />
+                }} placeholder={assistantScope === 'shot' ? 'What should change in this shot?' : 'Describe an idea or a film-wide change'} aria-label="Message ViMax" disabled={!selectedSessionId} rows={2} />
                 {(workspaceUploads.length > 0 || uploadingFiles) && <div className="composer-attachments" aria-live="polite">
                   {workspaceUploads.map((file) => <span className="composer-attachment" key={file.path} title={file.path}><FileText size={13} /><span>{file.name}</span><button type="button" onClick={() => setUploads((current) => ({...current, [selectedSessionId]: (current[selectedSessionId] || []).filter((item) => item.path !== file.path)}))} aria-label={`Remove ${file.name} from this message`}><X size={12} /></button></span>)}
                   {uploadingFiles && <span className="composer-uploading">Uploading…</span>}
                 </div>}
                 <div className="composer-controls">
                   <input ref={fileInputRef} className="composer-file-input" type="file" multiple onChange={(event) => void uploadFiles(event.currentTarget.files)} tabIndex={-1} />
-                  <button type="button" className="composer-add" onClick={() => fileInputRef.current?.click()} disabled={!selectedSessionId || Boolean(uploadingSession) || busy} aria-label="Upload files to workspace" title="Upload reference files"><Plus size={19} /></button>
+                  <button type="button" className="composer-add" onClick={() => fileInputRef.current?.click()} disabled={!selectedSessionId || Boolean(uploadingSession)} aria-label="Upload files to workspace" title="Upload reference files"><Plus size={19} /></button>
                   <span className="assistant-composer-hint">{assistantScope === 'shot' ? 'Selected shot' : 'Whole film'}</span><div className="composer-spacer" />
-                  {busy ? <button className="send-button stop" onClick={() => void stop()} aria-label="Stop generation"><CircleStop size={18} /></button> : <button className="send-button" onClick={() => void submit()} disabled={!selectedSessionId || !draft.trim() || uploadingFiles || assistantScope === 'shot' && !selection} aria-label="Send message"><ArrowUp size={19} /></button>}
+                  <button className={`send-button ${(busy || sending) ? 'queue' : ''}`} onClick={() => void submit()} disabled={!queueBridgeReady || !selectedSessionId || !draft.trim() || uploadingFiles || sending || assistantScope === 'shot' && !selection || busy && !chat.queueSupported} aria-label={sending ? 'Sending message' : busy ? 'Queue message' : 'Send message'} title={sending ? 'Sending message' : busy ? 'Queue message' : 'Send message'}>
+                    <ArrowUp size={19} />{busy && !sending && <span>Queue message</span>}{sending && <span>Sending…</span>}
+                  </button>
+                  {busy && <button className="send-button stop" onClick={() => void stop()} aria-label="Stop generation" title="Stop generation"><CircleStop size={18} /></button>}
                 </div>
               </div>
               <small className="assistant-draft-note">Drafts stay with their project.</small>
@@ -567,12 +675,21 @@ function ThemeToggle({theme, onToggle}: {theme: Theme; onToggle: () => void}) {
 
 function MessageRow({message}: {message: Message}) {
   if (message.role === 'activity') return <ActivityRow message={message} />;
+  const deliveryLabel = message.delivery === 'sending' ? 'Sending…'
+    : message.delivery === 'queued' ? 'Queued'
+      : message.delivery === 'running' ? 'In progress'
+        : message.delivery === 'done' ? 'Answered'
+          : message.delivery === 'cancelled' ? 'Cancelled'
+            : message.delivery === 'error' ? 'Failed to send'
+              : '';
   return (
     <article className={`message-row role-${message.role}`}>
       <div className="message-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={{a: (props) => <a {...props} target="_blank" rel="noreferrer" />}}>
           {message.text}
         </ReactMarkdown>
+        {message.role === 'user' && deliveryLabel && <small className={`message-delivery delivery-${message.delivery}`}>{deliveryLabel}</small>}
+        {message.role === 'user' && message.deliveryError && <small className="message-delivery-error">{message.deliveryError}</small>}
       </div>
     </article>
   );
@@ -670,12 +787,15 @@ function SettingsView() {
 
   function update(section: keyof AgentConfig['sections'], field: keyof ConfigSection, value: string) {
     setStatus('');
-    setConfig((current) => current ? {
-      sections: {
-        ...current.sections,
-        [section]: {...current.sections[section], [field]: value},
-      },
-    } : current);
+    setConfig((current) => {
+      if (!current) return current;
+      const sectionValue = current.sections[section];
+      const nextSection = {...sectionValue, [field]: value};
+      if (section === 'video' && field === 'model') {
+        Object.assign(nextSection, videoModelSelection(String(sectionValue.provider || 'openrouter'), value, sectionValue.resolution || '', sectionValue.clip_seconds || sectionValue.effective_clip_seconds || '8'));
+      }
+      return {sections: {...current.sections, [section]: nextSection}};
+    });
   }
 
   function selectVideoProvider(provider: string) {
@@ -685,6 +805,7 @@ function SettingsView() {
       update('video', 'base_url', preset.baseUrl);
       update('video', 'model', preset.defaultModel);
       update('video', 'resolution', preset.resolution);
+      update('video', 'clip_seconds', '8');
     }
   }
 
@@ -702,6 +823,8 @@ function SettingsView() {
     }
   }
 
+  const videoSettings = config?.sections.video;
+  const validVideoSettings = videoSettings?.provider === 'openrouter' ? validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, videoSettings.clip_seconds || videoSettings.effective_clip_seconds || '8') : true;
   if (loading) return <div className="settings-loading">Loading configuration…</div>;
   if (!config) return <div className="settings-loading is-error">{status || 'Configuration unavailable'}</div>;
   return (
@@ -710,7 +833,7 @@ function SettingsView() {
         <div><span>Local configuration</span><h1>Settings</h1></div>
         <div className="settings-save-group">
           {status && <span className={status === 'Saved' ? 'is-saved' : 'is-error'}>{status}</span>}
-          <button className="settings-save" onClick={() => void save()} disabled={saving}>
+          <button className="settings-save" onClick={() => void save()} disabled={saving || !validVideoSettings}>
             <Save size={15} />{saving ? 'Saving…' : 'Save'}
           </button>
         </div>
@@ -722,6 +845,7 @@ function SettingsView() {
             definition={definition}
             value={config.sections[definition.key]}
             onChange={(field, value) => definition.key === 'video' && field === 'provider' ? selectVideoProvider(value) : update(definition.key, field, value)}
+            validVideoSettings={definition.key !== 'video' || validVideoSettings}
           />
         ))}
       </div>
@@ -729,11 +853,15 @@ function SettingsView() {
   );
 }
 
-function ConfigSectionEditor({definition, value, onChange}: {
+function ConfigSectionEditor({definition, value, onChange, validVideoSettings}: {
   definition: {key: keyof AgentConfig['sections']; title: string; description: string};
   value: ConfigSection;
   onChange: (field: keyof ConfigSection, value: string) => void;
+  validVideoSettings: boolean;
 }) {
+  const heygen = definition.key === 'video' && value.provider === 'openrouter' && isHeygenVideoModel(value.model);
+  const duration = value.clip_seconds || value.effective_clip_seconds || '8';
+  const resolutionOptions = heygen ? ['480p', '768p'] : value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p'];
   return (
     <section className="config-section">
       <header><h2>{definition.title}</h2><p>{definition.description}</p></header>
@@ -741,7 +869,9 @@ function ConfigSectionEditor({definition, value, onChange}: {
         {value.model_provider !== undefined && (
           <label><span>Model provider</span><input value={value.model_provider} onChange={(event) => onChange('model_provider', event.target.value)} /></label>
         )}
-        <label><span>Model</span><input value={value.model} onChange={(event) => onChange('model', event.target.value)} /></label>
+        <label><span>Model</span><input value={value.model} list={definition.key === 'video' && value.provider === 'openrouter' ? 'openrouter-video-models' : undefined} onChange={(event) => onChange('model', event.target.value)} />
+          {definition.key === 'video' && value.provider === 'openrouter' && <datalist id="openrouter-video-models">{VIDEO_PROVIDER_PRESETS.openrouter.models.map((model) => <option key={model} value={model} />)}</datalist>}
+        </label>
         {definition.key === 'video' && (
           <label><span>Provider</span>
             <select value={value.provider || 'openrouter'} onChange={(event) => onChange('provider', event.target.value)}>
@@ -756,21 +886,25 @@ function ConfigSectionEditor({definition, value, onChange}: {
             {value.provider !== 'yunwu' && (
               <>
                 <label><span>Resolution</span>
-                  <select value={value.resolution || (value.provider === 'ltx' ? '1080p' : '720p')} onChange={(event) => onChange('resolution', event.target.value)}>
-                    {(value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p']).map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
+                  <select value={value.resolution || (heygen ? '' : value.provider === 'ltx' ? '1080p' : '720p')} onChange={(event) => onChange('resolution', event.target.value)}>
+                    {!value.resolution && heygen && <option value="">Resolution not configured — choose one</option>}
+                    {value.resolution && !resolutionOptions.includes(value.resolution) && <option value={value.resolution}>{value.resolution} (unsupported; choose a listed value)</option>}
+                    {resolutionOptions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
                   </select>
                 </label>
-                <label><span>Clip duration (seconds)</span><input type="number" min={value.provider === 'agnes' ? 4 : value.provider === 'ltx' ? 6 : 1} max={value.provider === 'agnes' ? 12 : 20} value={value.clip_seconds || value.effective_clip_seconds || '8'} onChange={(event) => onChange('clip_seconds', event.target.value)} /></label>
+                <label><span>Clip duration (seconds)</span><input type="number" min={heygen ? 5 : value.provider === 'agnes' ? 4 : value.provider === 'ltx' ? 6 : 1} max={heygen ? 15 : value.provider === 'agnes' ? 12 : 20} value={duration} onChange={(event) => onChange('clip_seconds', event.target.value)} /></label>
               </>
             )}
-            {value.provider !== 'agnes' && value.provider !== 'yunwu' && (
+            {!validVideoSettings && <p className="film-warning">Correct HeyGen’s resolution and 5–15 second clip duration before saving.</p>}
+            {heygen && <p className="film-warning config-field-wide">HeyGen conditions the clip on the first frame only; the final pose is not constrained. Native audio is provided by the model and cannot be toggled via OpenRouter.</p>}
+            {value.provider !== 'agnes' && value.provider !== 'yunwu' && !heygen && (
               <label><span>Generate audio</span>
                 <select value={value.generate_audio || 'true'} onChange={(event) => onChange('generate_audio', event.target.value)}>
                   <option value="true">On</option><option value="false">Off</option>
                 </select>
               </label>
             )}
-</>
+          </>
         )}
         <label className="config-field-wide">
           <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? 'Configured' : 'Not configured'}</i></span>
