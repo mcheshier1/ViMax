@@ -113,10 +113,17 @@ class CameraImageGenerator:
         chat_model,
         image_generator,
         video_generator,
+        working_dir: Optional[str] = None,
     ):
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
+        self.working_dir = working_dir
+        self.style = ""
+
+    def set_reference_context(self, working_dir: str, style: str) -> None:
+        self.working_dir = working_dir
+        self.style = style
 
 
     async def construct_camera_tree(
@@ -238,18 +245,48 @@ class CameraImageGenerator:
         shot_desc: ShotDescription,
         character_portrait_path_and_text_pairs: List[Tuple[str, str]],
     ) -> ImageOutput:
-        prompt = ""
-        reference_image_paths = []
-        for i,(path, text )in enumerate(character_portrait_path_and_text_pairs):
-            prompt += f"Image {i}: {text}\n"
-            reference_image_paths.append(path)
-        prompt += f"Generate an image based on the following description: {shot_desc.ff_desc}."
-        image_output = await self.image_generator.generate_single_image(
+        if not self.working_dir or not self.style:
+            raise RuntimeError("Shot image generation requires an active project and style for approved set references.")
+        from pathlib import Path
+        from pipelines.set_references import accepted_set_references, canonical_render_root
+
+        root = canonical_render_root(self.working_dir)
+        relative = Path(self.working_dir).resolve().relative_to(root).as_posix()
+        slot = f"{relative}/{shot_desc.idx}" if relative != "." else str(shot_desc.idx)
+        image_model = str(getattr(self.image_generator, "model", "") or "unknown-image-model")
+        prepare = getattr(self.image_generator, "prepare", None)
+        if prepare is not None:
+            await prepare()
+        mandatory = accepted_set_references(self.working_dir, slot, self.style, image_model)
+        limit = getattr(self.image_generator, "reference_limit", None)
+        if limit is not None and len(mandatory) > limit:
+            raise RuntimeError(
+                f"Shot {slot} requires {len(mandatory)} approved location references, "
+                f"but this image model accepts only {limit}; no image was generated."
+            )
+        remaining = None if limit is None else limit - len(mandatory)
+        optional = []
+        seen = {path for path, _ in mandatory}
+        for path, text in character_portrait_path_and_text_pairs:
+            if remaining == 0:
+                break
+            if path not in seen and os.path.isfile(path):
+                optional.append((path, text))
+                seen.add(path)
+                if remaining is not None and len(optional) >= remaining:
+                    break
+        pairs = [*mandatory, *optional]
+        reference_image_paths = [path for path, _ in pairs]
+        missing = [path for path in reference_image_paths if not os.path.isfile(path)]
+        if missing:
+            raise RuntimeError(f"Shot {slot} references missing images: {', '.join(missing)}; no image was generated.")
+        prompt = chr(10).join(f"Image {index}: {text}" for index, (_path, text) in enumerate(pairs))
+        prompt += f"{chr(10)}Generate an image based on the following description: {shot_desc.ff_desc}."
+        return await self.image_generator.generate_single_image(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
             size="1600x900",
         )
-        return image_output
 
 
 

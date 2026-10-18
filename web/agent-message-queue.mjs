@@ -76,6 +76,12 @@ export function createAgentMessageQueue() {
     },
 
     cancel,
+    hasWorkFor(sessionId) {
+      if (active && (active.sessionId === sessionId || activeSessionId === sessionId)) return true;
+      for (const message of pending) if (message.sessionId === sessionId) return true;
+      return false;
+    },
+
     snapshot: () => snapshot(),
     get activeSessionId() { return activeSessionId; },
     get activeMessage() { return active; },

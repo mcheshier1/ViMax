@@ -40,6 +40,19 @@ async function fixture() {
 }
 
 describe('film snapshots', () => {
+  it('exposes inherited set choices and honors an explicit shot binding override', async () => {
+    const {root, put, planPath} = await fixture();
+    await put(`${RENDER}/set_references/saloon/set.json`, {id: 'saloon', name: 'Saloon', description: 'Empty saloon.', shots: ['0']});
+    await put(`${RENDER}/set_references/office/set.json`, {id: 'office', name: 'Sheriff office', description: 'Empty office.', shots: []});
+    const inherited = await readFilmSnapshot(root, SESSION);
+    expect(inherited.plans[0].sets.map((set) => set.name)).toEqual(['Sheriff office', 'Saloon']);
+    expect(inherited.plans[0].setIds).toEqual(['saloon']);
+    const plan = JSON.parse(await readFile(planPath, 'utf8'));
+    await writeFile(planPath, JSON.stringify({...plan, set_ids: ['office']}));
+    const overridden = await readFilmSnapshot(root, SESSION);
+    expect(overridden.plans[0].setIds).toEqual(['office']);
+    expect(overridden.sets.sets.find((set) => set.id === 'saloon').shots).toEqual(['0']);
+  });
   it('detects external same-size media replacement and plan edits between snapshots', async () => {
     const {root, planPath, framePath} = await fixture();
     await updateRenderAcceptance(root, {sessionId: SESSION, root: RENDER, stage: 'keyframes', shot: '0', accepted: true});

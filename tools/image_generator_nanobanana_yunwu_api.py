@@ -18,7 +18,11 @@ class ImageGeneratorNanobananaYunwuAPI:
         api_key: str,
         model: str = "gemini-2.5-flash-image-preview",
         base_url: str = "https://yunwu.ai",
+        resolution: str | None = None,
     ):
+        self.resolution = resolution
+        if resolution not in (None, "", "auto"):
+            raise ValueError("Yunwu image resolution is unsupported by the installed SDK; use provider default")
         self.client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(
@@ -45,14 +49,16 @@ class ImageGeneratorNanobananaYunwuAPI:
 
         reference_images = [Image.open(path) for path in reference_image_paths]
 
+        image_config = {"aspect_ratio": aspect_ratio}
+        resolution = kwargs.get("resolution", self.resolution)
+        if resolution not in (None, "", "auto"):
+            raise ValueError("Yunwu image resolution is unsupported by the installed SDK; use provider default")
         response = await self.client.aio.models.generate_content(
             model=self.model,
             contents=reference_images + [prompt],
             config=types.GenerateContentConfig(
                 response_modalities=["TEXT", "IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                ),
+                image_config=types.ImageConfig(**image_config),
             ),
         )
 

@@ -4,6 +4,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -51,6 +52,63 @@ def config_value(section: str, key: str, env_names: list[str], default: str = ""
     return default
 
 
+def _credential_provider(section: dict[str, Any]) -> str:
+    base_url = str(section.get("base_url") or "").strip()
+    try:
+        parsed = urlsplit(base_url)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() in {"http", "https"} and hostname:
+            port = parsed.port
+            for domain, provider in (
+                ("openrouter.ai", "openrouter"), ("agnes-ai.com", "agnes"),
+                ("yunwu.ai", "yunwu"), ("ltx.io", "ltx"), ("openai.com", "openai"),
+                ("anthropic.com", "anthropic"), ("cohere.com", "cohere"),
+                ("cohere.ai", "cohere"), ("jina.ai", "jina"),
+            ):
+                if hostname == domain or hostname.endswith("." + domain):
+                    return provider
+            host = f"[{hostname}]" if ":" in hostname else hostname
+            if port is not None and port != (443 if parsed.scheme.lower() == "https" else 80):
+                host += f":{port}"
+            return f"endpoint:{parsed.scheme.lower()}://{host}{parsed.path.rstrip('/')}"
+    except ValueError:
+        pass
+    model_provider = str(section.get("model_provider") or "").strip().lower()
+    provider = str(section.get("provider") or "").strip().lower()
+    return f"provider:{model_provider or provider or 'default'}"
+
+
+def _scoped_api_key(section: str, workspace_root: str | Path) -> str | None:
+    """Resolve migrated provider credentials without replaying another provider's key."""
+    source = load_agent_config(workspace_root).get(section, {})
+    if not isinstance(source, dict) or "api_keys" not in source:
+        return None
+    keys = source["api_keys"]
+    if not isinstance(keys, dict):
+        raise RuntimeError(f"{section}.api_keys must be a mapping")
+    env_names = [f"VIMAX_{section.upper()}_API_KEY"]
+    if section == "llm":
+        env_names.append("VIMAX_API_KEY")
+    for name in env_names:
+        if os.environ.get(name):
+            return os.environ[name]
+    selected = dict(source)
+    if os.environ.get(f"VIMAX_{section.upper()}_BASE_URL"):
+        selected["base_url"] = os.environ[f"VIMAX_{section.upper()}_BASE_URL"]
+    if os.environ.get(f"VIMAX_{section.upper()}_MODEL_PROVIDER"):
+        selected["model_provider"] = os.environ[f"VIMAX_{section.upper()}_MODEL_PROVIDER"]
+    value = keys.get(_credential_provider(selected))
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if section in {"image", "video"}:
+        # Preserve shared-LLM-key setups only when both effective endpoints use
+        # the same provider. An OpenRouter key must not fall through to Agnes.
+        base_url = image_base_url(workspace_root) if section == "image" else video_base_url(workspace_root)
+        if _credential_provider({"base_url": base_url}) == _credential_provider({"base_url": llm_base_url(workspace_root)}):
+            return llm_api_key(workspace_root)
+    return ""
+
+
 def llm_model(workspace_root: str | Path = ".") -> str:
     return config_value("llm", "model", ["VIMAX_LLM_MODEL"], DEFAULT_LLM_MODEL, workspace_root)
 
@@ -64,7 +122,8 @@ def llm_base_url(workspace_root: str | Path = ".") -> str:
 
 
 def llm_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("llm", "api_key", ["VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], "", workspace_root)
+    scoped = _scoped_api_key("llm", workspace_root)
+    return scoped if scoped is not None else config_value("llm", "api_key", ["VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], "", workspace_root)
 
 
 def image_model(workspace_root: str | Path = ".") -> str:
@@ -75,8 +134,16 @@ def image_base_url(workspace_root: str | Path = ".") -> str:
     return config_value("image", "base_url", ["VIMAX_IMAGE_BASE_URL"], DEFAULT_IMAGE_BASE_URL, workspace_root)
 
 
+def image_resolution(workspace_root: str | Path = ".") -> str:
+    configured = config_value("image", "resolution", ["VIMAX_IMAGE_RESOLUTION"], "", workspace_root).strip()
+    if configured:
+        return configured
+    return "1K" if image_model(workspace_root) == "bytedance-seed/seedream-5-0-flash" else "auto"
+
+
 def image_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("image", "api_key", ["VIMAX_IMAGE_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
+    scoped = _scoped_api_key("image", workspace_root)
+    return scoped if scoped is not None else config_value("image", "api_key", ["VIMAX_IMAGE_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
 
 
 
@@ -93,7 +160,8 @@ def embedding_base_url(workspace_root: str | Path = ".") -> str:
 
 
 def embedding_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("embedding", "api_key", ["VIMAX_EMBEDDING_API_KEY"], "", workspace_root)
+    scoped = _scoped_api_key("embedding", workspace_root)
+    return scoped if scoped is not None else config_value("embedding", "api_key", ["VIMAX_EMBEDDING_API_KEY"], "", workspace_root)
 
 
 def reranker_model(workspace_root: str | Path = ".") -> str:
@@ -105,7 +173,8 @@ def reranker_base_url(workspace_root: str | Path = ".") -> str:
 
 
 def reranker_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("reranker", "api_key", ["VIMAX_RERANKER_API_KEY"], "", workspace_root)
+    scoped = _scoped_api_key("reranker", workspace_root)
+    return scoped if scoped is not None else config_value("reranker", "api_key", ["VIMAX_RERANKER_API_KEY"], "", workspace_root)
 
 
 def video_model(workspace_root: str | Path = ".") -> str:
@@ -138,7 +207,8 @@ def video_base_url(workspace_root: str | Path = ".") -> str:
 
 
 def video_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("video", "api_key", ["VIMAX_VIDEO_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
+    scoped = _scoped_api_key("video", workspace_root)
+    return scoped if scoped is not None else config_value("video", "api_key", ["VIMAX_VIDEO_API_KEY", "VIMAX_LLM_API_KEY", "VIMAX_API_KEY"], llm_api_key(workspace_root), workspace_root)
 
 
 def video_resolution(workspace_root: str | Path = ".") -> str:

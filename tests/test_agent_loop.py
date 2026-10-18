@@ -318,3 +318,42 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("round-1 ", final_transcript)  # oldest round dropped
             # the authoritative record still holds every tool result
             self.assertEqual(len([event for event in events if event["type"] == "tool_result"]), rounds)
+
+    async def test_image_pressure_preserves_all_observations_in_newest_multi_tool_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            observations = []
+
+            def observe(args):
+                image = f"data:image/jpeg;base64,{len(observations)}" + "A" * 6000
+                observations.append(image)
+                return ToolResult(
+                    "observe", True, "reference observed",
+                    model_content=[{"type": "image_url", "image_url": {"url": image, "detail": "high"}}],
+                )
+
+            registry = ToolRegistry([ToolSpec("observe", "Observe a reference", observe, schema={})])
+            replies = [
+                AssistantMessage(tool_calls=[
+                    ToolCall(id=f"round-{round_number}-a", name="observe", arguments={}),
+                    ToolCall(id=f"round-{round_number}-b", name="observe", arguments={}),
+                ])
+                for round_number in range(1, 4)
+            ]
+            llm = CapturingLLM([*replies, AssistantMessage(text="review complete")])
+            compactor = ContextCompactor(None, token_threshold=6000, buffer_tokens=0)
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm, compactor)
+            events = [event async for event in loop.stream_events("inspect the references")]
+
+            for round_number, messages in enumerate(llm.calls[1:], start=1):
+                images = [
+                    block["image_url"]["url"]
+                    for message in messages if isinstance(message.get("content"), list)
+                    for block in message["content"] if block.get("type") == "image_url"
+                ]
+                self.assertEqual(images, observations[(round_number - 1) * 2:round_number * 2])
+                tool_ids = [message["tool_call_id"] for message in messages if message["role"] == "tool"]
+                self.assertEqual(tool_ids, [f"round-{round_number}-a", f"round-{round_number}-b"])
+                self.assertLess(compactor.estimate_messages_tokens(messages), compactor.compact_target_tokens())
+            self.assertEqual(len([event for event in events if event["type"] == "tool_result"]), 6)
+            self.assertEqual(events[-2]["assistant"], "review complete")

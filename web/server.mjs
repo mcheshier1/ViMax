@@ -6,9 +6,10 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
-import {artifactContentType, assembleFilm, createShot, deleteSession, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
 import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
 import {createAgentMessageQueue} from './agent-message-queue.mjs';
+import {approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, selectPortraitCharacter, selectSetReference, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
+import {getShotRestartPlan, restartShot} from './server-lib.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -106,6 +107,93 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/api/artifacts' && request.method === 'GET') {
       return sendJson(response, 200, {artifacts: await listSessionArtifacts(repoRoot, url.searchParams.get('session') || '')});
     }
+    if (url.pathname === '/api/asset-deletion' && request.method === 'GET') {
+      const sessionId = url.searchParams.get('session') || '';
+      const plan = await getAssetDeletionPlan(repoRoot, sessionId, url.searchParams.get('path') || '');
+      return plan ? sendJson(response, 200, plan) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/assets/deletion-plan' && request.method === 'POST') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      const plan = await getAssetsDeletionPlan(repoRoot, body?.sessionId, body?.paths);
+      return plan ? sendJson(response, 200, plan) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/assets' && request.method === 'DELETE') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      const result = await deleteAssets(repoRoot, body, () => agentQueue.hasWorkFor(body?.sessionId));
+      return result ? sendJson(response, 200, result) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/artifacts' && request.method === 'DELETE') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || typeof body.sessionId !== 'string' || typeof body.path !== 'string' || typeof body.revision !== 'string') {
+        return sendJson(response, 400, {error: 'sessionId, path, and revision are required'});
+      }
+      const result = await deleteAsset(repoRoot, body, () => agentQueue.hasWorkFor(body.sessionId));
+      return result ? sendJson(response, 200, result) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/portrait-options' && request.method === 'GET') {
+      const options = await readPortraitOptions(
+        repoRoot,
+        url.searchParams.get('session') || '',
+        url.searchParams.get('path') || '',
+      );
+      return options ? sendJson(response, 200, options) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/portrait-selection' && request.method === 'POST') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      const result = await selectPortraitCharacter(repoRoot, body);
+      return result ? sendJson(response, 200, result) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/portrait-approval' && request.method === 'POST') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      const result = await approvePortraitCharacter(repoRoot, body);
+      return result ? sendJson(response, 200, result) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/set-references' && request.method === 'GET') {
+      const payload = await readSetReferences(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/set-references' && request.method === 'PUT') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(response, 400, {error: 'A JSON object body is required'});
+      const payload = await updateSetReference(repoRoot, body);
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+
+    if (url.pathname === '/api/set-references/selection' && request.method === 'PUT') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(response, 400, {error: 'A JSON object body is required'});
+      const payload = await selectSetReference(repoRoot, body, () => agentQueue.hasWorkFor(body.sessionId));
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/set-references/acceptance' && request.method === 'PUT') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(response, 400, {error: 'A JSON object body is required'});
+      const payload = await updateSetReferenceAcceptance(repoRoot, body);
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
     if (url.pathname === '/api/film' && request.method === 'GET') {
       const payload = await readFilmSnapshot(repoRoot, url.searchParams.get('session') || '', url.searchParams.get('root') || '');
       return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
@@ -162,6 +250,20 @@ const server = createServer(async (request, response) => {
       } catch (error) {
         return sendJson(response, error.statusCode || 400, {error: error.message});
       }
+    }
+
+    if (url.pathname === '/api/shot-restart' && request.method === 'GET') {
+      const payload = await getShotRestartPlan(repoRoot, {
+        sessionId: url.searchParams.get('session') || '',
+        root: url.searchParams.get('root') || '',
+        slot: url.searchParams.get('slot') || '',
+      });
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/shot-restart' && request.method === 'POST') {
+      const body = await readJsonBody(request);
+      const payload = await restartShot(repoRoot, body, () => agentQueue.hasWorkFor(body?.sessionId));
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
     }
 
     if (url.pathname === '/api/shot-plan' && request.method === 'GET') {

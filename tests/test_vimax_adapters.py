@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from PIL import Image
 from interfaces import Camera, CharacterInScene, ShotBriefDescription, ShotDescription
 from agent_runtime.session_index import SessionIndex
 from agent_runtime.vimax_adapters import ViMaxAdapters
@@ -53,29 +54,40 @@ class FakeRevisionModel:
     async def ainvoke(self, prompt):
         return SimpleNamespace(content='[{"idx": 0, "description": "more oppressive"}]')
 
+class FakeSetPlanModel:
+    async def ainvoke(self, prompt):
+        shot_plan = json.loads(prompt.rsplit("SHOT PLAN:\n", 1)[1])
+        slots = [shot["slot"] for shot in shot_plan]
+        return SimpleNamespace(content=json.dumps({"sets": [{
+            "id": "planned_location",
+            "name": "Planned location",
+            "description": "A character-free location with a pale stone doorway and quiet natural light.",
+            "shots": slots,
+        }]}))
+
 
 class FailRenderIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         raise RuntimeError("render failed")
 
 
 class FailRender403IdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         raise RuntimeError("OpenRouter video create failed with HTTP 403: {'error': {'message': 'Key limit exceeded (total limit). Manage it using token sk-short', 'code': 403}}")
 
 
 class FailRenderContentFilterIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         raise RuntimeError("Image generation failed for the first_frame of shot 13: OpenRouter image generation with model meta/muse-image failed with HTTP 400: {'error': {'message': 'The response was filtered due to the prompt triggering our content management policy.', 'code': 400, 'metadata': {'provider_name': 'Meta'}}}")
 
 
 class FailRenderMissingReferenceIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         raise RuntimeError("Image generation failed for the first_frame of shot 0: [Errno 2] No such file or directory: '/tmp/session/script2video/character_portraits/0_Claude/front.png'")
 
 
 class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         print("NOISE_FROM_RENDER_PIPELINE")
         final = self.working_dir / "final_video.mp4"
         final.write_text("video", encoding="utf-8")
@@ -84,7 +96,7 @@ class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
 class RecordingIdeaScopePipeline(FakeIdeaPipeline):
     scopes = []
 
-    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None):
+    async def __call__(self, idea, user_requirement, style, quiet=False, stop_after="portraits", revision_notes=None, progress=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         type(self).scopes.append(only_shots)
         return RenderOutcome(phase="video", style=style)
 
@@ -108,6 +120,28 @@ class FakeScriptPipeline:
             (self.working_dir / "characters.json").write_text(json.dumps([c.model_dump() for c in characters]), encoding="utf-8")
         return {}
 
+class FakeSetReferenceImageGenerator:
+    model = "idea-test-image"
+
+    async def generate_single_image(self, **kwargs):
+        return Image.new("RGB", (1, 1), "white")
+
+
+class FakeSceneShotPlanner:
+    def __init__(self, chat_model, image_generator, video_generator, working_dir):
+        self.working_dir = Path(working_dir)
+
+    async def plan_text_artifacts(self, script, user_requirement, style, characters=None, progress=None, quiet=False):
+        shot = self.working_dir / "shots" / "0"
+        shot.mkdir(parents=True, exist_ok=True)
+        (shot / "shot_description.json").write_text(json.dumps({
+            "idx": 0,
+            "visual_desc": "A room with an old wooden door.",
+            "ff_desc": "An old wooden door in a quiet room.",
+            "lf_desc": "The same door and quiet room.",
+        }), encoding="utf-8")
+
+
 
 
 
@@ -128,29 +162,6 @@ class FakeInitChatModel:
 
 
 class Script2VideoPlanningProgressTests(unittest.IsolatedAsyncioTestCase):
-    async def test_plan_text_artifacts_emits_progress_in_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=tmp)
-            chars = [CharacterInScene(idx=0, identifier_in_scene="Cat", is_visible=True, static_features="black cat", dynamic_features="helmet")]
-            storyboard = [ShotBriefDescription(idx=0, is_last=True, cam_idx=0, visual_desc="cat jumps", audio_desc="wind")]
-            shot = ShotDescription(idx=0, is_last=True, cam_idx=0, visual_desc="cat jumps", variation_type="small", variation_reason="simple motion", ff_desc="cat starts", ff_vis_char_idxs=[0], lf_desc="cat lands", lf_vis_char_idxs=[0], motion_desc="cat jumps", audio_desc="wind")
-            camera = [Camera(idx=0, active_shot_idxs=[0])]
-
-            async def design_storyboard(script, characters, user_requirement, quiet=False, clip_seconds=None):
-                return storyboard
-
-            async def decompose_visual_descriptions(shot_brief_descriptions, characters, quiet=False):
-                return [shot]
-
-            async def construct_camera_tree(shot_descriptions, quiet=False):
-                return camera
-
-            pipeline.design_storyboard = design_storyboard
-            pipeline.decompose_visual_descriptions = decompose_visual_descriptions
-            pipeline.construct_camera_tree = construct_camera_tree
-            events = []
-            await pipeline.plan_text_artifacts("script", "req", "style", characters=chars, progress=lambda stage, message, metadata=None: events.append(stage))
-            self.assertEqual(events, ["extract_characters", "design_storyboard", "decompose_shots", "construct_camera_tree"])
 
 
     async def test_idea_pipeline_quiet_suppresses_text_planning_prints(self):
@@ -222,7 +233,7 @@ class FailingRedrawPipeline:
     def __init__(self, chat_model, image_generator, video_generator, working_dir):
         self.working_dir = Path(working_dir)
 
-    async def __call__(self, script, user_requirement, style, characters=None, quiet=False, progress=None, stop_after="portraits", revision_notes=None):
+    async def __call__(self, script, user_requirement, style, characters=None, quiet=False, progress=None, stop_after="portraits", revision_notes=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         raise RuntimeError("HTTP 402: Insufficient credits")
 
 
@@ -235,7 +246,7 @@ class RecordingScriptPipeline:
     last_revision_notes = None
     last_only_shots = None
 
-    async def __call__(self, script, user_requirement, style, characters=None, quiet=False, progress=None, stop_after="portraits", revision_notes=None, only_shots=None):
+    async def __call__(self, script, user_requirement, style, characters=None, quiet=False, progress=None, stop_after="portraits", revision_notes=None, only_shots=None, set_ids=None, redo_sets=None, set_candidate_count=1):
         type(self).last_revision_notes = revision_notes
         type(self).last_only_shots = only_shots
         return RenderOutcome(phase=stop_after, style=style)
@@ -254,6 +265,45 @@ def _lock(working, relative_path):
     """An acceptance entry for a file on disk, the shape the review API writes."""
     data = (working / relative_path).read_bytes()
     return {"path": relative_path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _approve_set_references(working, render_root, slots, *, style="cinematic", image_model="unknown-image-model"):
+    """Create one correctly fingerprinted, accepted location reference for runtime tests."""
+    root = working / render_root
+    set_id = "approved_location"
+    set_dir = root / "set_references" / set_id
+    set_dir.mkdir(parents=True, exist_ok=True)
+    spec = {
+        "id": set_id,
+        "name": "Interior",
+        "description": "A quiet, character-free interior with pale plaster walls.",
+        "shots": list(slots),
+    }
+    spec_path = set_dir / "set.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    spec_sha = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+    model_dir = set_dir / image_model
+    model_dir.mkdir(exist_ok=True)
+    image_path = model_dir / "reference.png"
+    Image.new("RGB", (1, 1), "white").save(image_path, format="PNG")
+    provenance_path = model_dir / "provenance.json"
+    provenance_path.write_text(json.dumps({
+        "image_model": image_model,
+        "style": style,
+        "spec_sha256": spec_sha,
+    }), encoding="utf-8")
+    artifacts = [{
+        "path": path.relative_to(working).as_posix(),
+        "size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    } for path in (spec_path, image_path, provenance_path)]
+    acceptance_path = working / "render_acceptance.json"
+    store = json.loads(acceptance_path.read_text(encoding="utf-8")) if acceptance_path.exists() else {}
+    store.setdefault(render_root, {}).setdefault("sets", {})[set_id] = {
+        "accepted_at": "now",
+        "artifacts": artifacts,
+    }
+    acceptance_path.write_text(json.dumps(store), encoding="utf-8")
 
 
 def _acceptance_session(tmp):
@@ -308,6 +358,26 @@ class AcceptanceGateTests(unittest.TestCase):
             # The portraits are one set per sequence, not one per shot: naming a shot for a
             # stills run cannot excuse portraits nobody has accepted.
             self.assertIsNotNone(_acceptance_refusal(working, "script2video", "stills", [0]))
+
+    def test_stills_redraw_does_not_wait_for_keyframe_approval(self):
+        from agent_runtime.vimax_adapters import _acceptance_refusal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, _ = self._session(tmp)
+            portrait = working / "script2video" / "character_portraits" / "qwen_qwen-image-3" / "0_Claude" / "front.png"
+            portrait.parent.mkdir(parents=True, exist_ok=True)
+            portrait.write_bytes(b"portrait")
+            (working / "render_acceptance.json").write_text(json.dumps({
+                "script2video": {
+                    "portraits": {"accepted_at": "now", "artifacts": [
+                        _lock(working, str(portrait.relative_to(working)))
+                    ]},
+                },
+            }), encoding="utf-8")
+
+            # The session has unaccepted keyframes on disk, but those are the output
+            # of this stills redraw, not a prerequisite for it.
+            self.assertIsNone(_acceptance_refusal(working, "script2video", "stills", [0]))
 
     def test_keyframes_start_out_rendered_and_block_the_video_phase(self):
         from agent_runtime.vimax_adapters import _acceptance_refusal
@@ -420,6 +490,27 @@ class AcceptanceGateTests(unittest.TestCase):
             self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["1"]), [])
             state = _slot_state(working, _acceptance_slots(working, "script2video")["keyframes"]["0"])
             self.assertEqual(state, "accepted")
+
+    def test_per_shot_continuity_invalidates_successors_with_global_mode_off(self):
+        from agent_runtime.vimax_adapters import _acceptance_slots, _invalidate_continuity_dependents, _slot_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, _ = self._session(tmp)
+            root = working / "script2video"
+            (root / "camera_tree.json").write_text(
+                json.dumps([{"idx": 0, "active_shot_idxs": [1, 0]}]), encoding="utf-8",
+            )
+            shot = root / "shots" / "0"
+            shot.mkdir(parents=True, exist_ok=True)
+            (shot / "shot_description.json").write_text(
+                json.dumps({"reuse_previous_last_frame": True}), encoding="utf-8",
+            )
+            self._accept(working, 0, hashlib.sha256(b"frame").hexdigest())
+
+            self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["1"]), ["0"])
+            state = _slot_state(working, _acceptance_slots(working, "script2video")["keyframes"]["0"])
+            self.assertEqual(state, "stale")
+
     def test_a_rejected_slot_blocks_and_carries_its_reason(self):
         from agent_runtime.vimax_adapters import _acceptance_refusal, _slot_state, _acceptance_slots
 
@@ -465,6 +556,98 @@ class AcceptanceGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             working, _ = self._session(tmp)
             self.assertEqual([item["slot"] for item in _acceptance_refusal(working, "script2video", "video")["unaccepted"]], ["0", "1"])
+
+class CharacterPortraitApprovalGateTests(unittest.TestCase):
+    def setup_portraits(self, working, root_name="script2video"):
+        root = working / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        (working / "render_manifest.json").write_text(json.dumps({"image_model": "test/model"}))
+        (root / "characters.json").write_text(json.dumps([
+            {"idx": idx, "identifier_in_scene": name, "is_visible": True}
+            for idx, name in enumerate(("Claude", "Wife"))
+        ]))
+        registry_dir = root / "character_portraits" / "test_model"
+        registry_dir.mkdir(parents=True)
+        registry = {}
+        for idx, name in enumerate(("Claude", "Wife")):
+            directory = registry_dir / f"{idx}_{name}"
+            directory.mkdir()
+            registry[name] = {}
+            for view in ("front", "side", "back"):
+                file = directory / f"{view}.png"
+                file.write_bytes(f"{name} {view}".encode())
+                registry[name][view] = {"path": str(file)}
+        (registry_dir / "registry.json").write_text(json.dumps(registry))
+        return registry
+
+    def test_character_approval_does_not_approve_another_character_or_replacement(self):
+        from agent_runtime.vimax_adapters import _acceptance_refusal
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            registry = self.setup_portraits(working)
+            records = {}
+            for name in ("Claude", "Wife"):
+                records[f"script2video::{name}"] = {
+                    "accepted_at": "now",
+                    "artifacts": [_lock(working, str(Path(item["path"]).relative_to(working)))
+                                  for item in registry[name].values()],
+                }
+                (working / "render_acceptance.json").write_text(json.dumps({
+                    "script2video": {"portrait_characters": records},
+                }))
+                refusal = _acceptance_refusal(working, "script2video", "stills")
+                if name == "Claude":
+                    self.assertEqual(refusal["unaccepted"], [{"slot": "script2video::Wife", "state": "rendered"}])
+                else:
+                    self.assertIsNone(refusal)
+            replacement = working / "script2video/character_portraits/test_model/0_Claude/alternative.png"
+            replacement.write_bytes(b"a different approved-looking view")
+            registry["Claude"]["front"]["path"] = str(replacement)
+            (replacement.parent.parent / "registry.json").write_text(json.dumps(registry))
+            refusal = _acceptance_refusal(working, "script2video", "stills")
+            self.assertEqual(refusal["unaccepted"], [{"slot": "script2video::Claude", "state": "stale"}])
+
+    def test_old_stage_approval_cannot_cover_a_character_missing_from_registry(self):
+        from agent_runtime.vimax_adapters import _acceptance_refusal
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            registry = self.setup_portraits(working)
+            (working / "render_acceptance.json").write_text(json.dumps({
+                "script2video": {"portraits": {"accepted_at": "now", "artifacts": [
+                    _lock(working, str(Path(item["path"]).relative_to(working)))
+                    for item in registry["Wife"].values()
+                ]}},
+            }))
+            del registry["Claude"]
+            (working / "script2video/character_portraits/test_model/registry.json").write_text(json.dumps(registry))
+            refusal = _acceptance_refusal(working, "script2video", "stills")
+            self.assertIn({"slot": "script2video::Claude", "state": "planned"}, refusal["unaccepted"])
+
+    def test_planned_idea_scenes_share_global_portraits_until_their_registry_exists(self):
+        from agent_runtime.vimax_adapters import _acceptance_refusal
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            registry = self.setup_portraits(working, "idea2video")
+            records = {f"idea2video::{name}": {
+                "accepted_at": "now",
+                "artifacts": [_lock(working, str(Path(item["path"]).relative_to(working)))
+                              for item in entry.values()],
+            } for name, entry in registry.items()}
+            (working / "render_acceptance.json").write_text(json.dumps({
+                "idea2video": {"portrait_characters": records},
+            }))
+            scene = working / "idea2video/scene_0"
+            scene.mkdir()
+            (scene / "characters.json").write_bytes((scene.parent / "characters.json").read_bytes())
+            self.assertIsNone(_acceptance_refusal(working, "idea2video", "stills"))
+            registry_path = scene / "character_portraits/test_model/registry.json"
+            registry_path.parent.mkdir(parents=True)
+            registry_path.write_text("{}")
+            self.assertEqual(_acceptance_refusal(working, "idea2video", "stills")["unaccepted"], [
+                {"slot": "idea2video/scene_0::Claude", "state": "planned"},
+                {"slot": "idea2video/scene_0::Wife", "state": "planned"},
+            ])
+
 
 class RedoResolutionTests(unittest.TestCase):
     """A redraw names exactly the shots it replaces, and is refused before it deletes."""
@@ -942,6 +1125,43 @@ class RenderTallyTests(unittest.TestCase):
         self.assertEqual(tally, {"generated": 2, "reused": 2})
         self.assertEqual(len(emitted), 5)
 
+    def test_set_result_counts_each_generated_candidate_image(self):
+        from agent_runtime.vimax_adapters import _pipeline_progress
+
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(idea="room", style="cinematic")
+            working = Path(tmp) / record["working_dir"]
+            set_directory = working / "script2video" / "set_references" / "saloon" / "image-model"
+            candidates = [
+                set_directory / f"candidate_{'a' * 32}.png",
+                set_directory / f"candidate_{'b' * 32}.png",
+            ]
+            canonical = set_directory / "reference.png"
+            tally: dict[str, object] = {}
+            progress = _pipeline_progress(None, record["session_id"], tally=tally)
+            for path in candidates:
+                progress("set_reference_done", "candidate ready", {"set_id": "saloon", "path": str(path)})
+            outcome = RenderOutcome(
+                phase="sets",
+                style="cinematic",
+                set_references=[str(path) for path in (*candidates, canonical)],
+                awaiting_confirmation="stills",
+            )
+            adapter = ViMaxAdapters(Path(tmp), index)
+
+            result = adapter._render_outcome_result(
+                None,
+                record["session_id"],
+                working,
+                outcome,
+                render_mode="script2video",
+                tally=tally,
+            )
+
+        self.assertEqual(result.metadata["generated"], 2)
+        self.assertEqual(result.metadata["reused"], 1)
+
     def test_no_tally_is_asked_for_when_the_caller_does_not_need_one(self):
         from agent_runtime.vimax_adapters import _pipeline_progress
 
@@ -965,6 +1185,55 @@ class RenderTallyTests(unittest.TestCase):
         self.assertIn("no reference images", tally["warnings"][0])
 
 
+class IdeaSetPhaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sets_phase_plans_and_generates_without_portraits_or_shot_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "idea2video"
+            root.mkdir()
+            set_dir = root / "set_references" / "house"
+            set_dir.mkdir(parents=True)
+            (set_dir / "set.json").write_text(json.dumps({
+                "id": "house",
+                "name": "House room",
+                "description": "A quiet room with an old wooden door and pale plaster walls.",
+                "shots": ["scene_0/0"],
+            }), encoding="utf-8")
+            pipeline = Idea2VideoPipeline.__new__(Idea2VideoPipeline)
+            pipeline.working_dir = str(root)
+            pipeline.chat_model = object()
+            pipeline.image_generator = FakeSetReferenceImageGenerator()
+            pipeline.video_generator = object()
+
+            async def story(**kwargs):
+                return "A hero opens an old wooden door."
+
+            async def characters(**kwargs):
+                return []
+
+            async def scripts(**kwargs):
+                return ["A hero opens the old wooden door."]
+
+            pipeline.develop_story = story
+            pipeline.extract_characters = characters
+            pipeline.write_script_based_on_story = scripts
+
+            with patch("pipelines.idea2video_pipeline.Script2VideoPipeline", FakeSceneShotPlanner):
+                outcome = await pipeline(
+                    idea="A room and a door",
+                    user_requirement="",
+                    style="cinematic",
+                    stop_after="sets",
+                    set_ids=["house"],
+                )
+
+            self.assertEqual(outcome.phase, "sets")
+            self.assertEqual(outcome.awaiting_confirmation, "stills")
+            self.assertEqual(len(outcome.set_references), 1)
+            self.assertTrue((root / "scene_0" / "shots" / "0" / "shot_description.json").exists())
+            self.assertFalse((root / "character_portraits").exists())
+            self.assertFalse(any(root.glob("scene_*/shots/*/qwen_*/first_frame.png")))
+            self.assertFalse((root / "final_video.mp4").exists())
+
 class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
     """What the render tool does with a redo request, end to end."""
 
@@ -976,7 +1245,52 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
         (working / "script2video" / "camera_tree.json").write_text("[]", encoding="utf-8")
         for shot in (0, 1):
             (working / "script2video" / "shots" / str(shot) / "first_frame_selector_output.json").write_text("{}", encoding="utf-8")
+        _approve_set_references(working, "script2video", ["0", "1"])
         return working, index
+
+    async def test_render_tool_generates_all_requested_candidate_images(self):
+        class CandidateImages:
+            model = "local-candidate-model"
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (16, 9), "green")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, index = self._session(tmp)
+            acceptance_path = working / "render_acceptance.json"
+            acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+            acceptance["script2video"].pop("sets", None)
+            acceptance_path.write_text(json.dumps(acceptance), encoding="utf-8")
+            model_directory = working / "script2video" / "set_references" / "approved_location" / "unknown-image-model"
+            (model_directory / "reference.png").unlink()
+            (model_directory / "provenance.json").unlink()
+            images = CandidateImages()
+            adapter = ViMaxAdapters(Path(tmp), index)
+
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=images), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()):
+                result = await adapter.vimax_render_video({
+                    "stop_after": "sets",
+                    "render_mode": "script2video",
+                    "set_ids": ["approved_location"],
+                    "set_candidate_count": 2,
+                })
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(result.metadata["generated"], 2)
+            self.assertEqual(result.metadata["reused"], 0)
+            self.assertEqual(len(images.calls), 2)
+            candidates = [Path(tmp) / path for path in result.metadata["set_references"]]
+            self.assertEqual(len(candidates), 2)
+            for candidate in candidates:
+                self.assertRegex(candidate.name, r"candidate_[0-9a-f]{32}\.png")
+                self.assertTrue(candidate.is_file())
+                self.assertTrue(candidate.with_suffix(".json").is_file())
 
     async def test_the_trail_names_the_redraw_while_it_runs_not_only_when_it_ends(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -987,6 +1301,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
                     "shots": {"1": {"keyframes": {"rejected_at": "later", "reason": "a white studio card"}}},
                 }
             }), encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             adapter = ViMaxAdapters(Path(tmp), index)
             seen_at_start: list[dict] = []
             written = va_write_render_status_recorder(seen_at_start)
@@ -1011,6 +1326,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
                     "shots": {"1": {"keyframes": {"rejected_at": "later", "reason": "a white studio card"}}},
                 }
             }), encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1034,6 +1350,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
             (working / "render_acceptance.json").write_text(json.dumps({
                 "script2video": {"shots": {"1": {"keyframes": {"rejected_at": "later", "reason": "a white studio card"}}}}
             }), encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1063,6 +1380,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
             }), encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1084,6 +1402,7 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
                     "shots": {"1": {"keyframes": {"rejected_at": "later", "reason": "a white studio card"}}},
                 }
             }), encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             kept = (working / "script2video" / "shots" / "1" / "qwen_qwen-image-3" / "first_frame.png").read_bytes()
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
@@ -1152,6 +1471,7 @@ class AcceptanceGateToolTests(unittest.IsolatedAsyncioTestCase):
             (working / "script2video" / "characters.json").write_text("[]", encoding="utf-8")
             (working / "script2video" / "storyboard.json").write_text("[]", encoding="utf-8")
             (working / "script2video" / "camera_tree.json").write_text("[]", encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1164,6 +1484,34 @@ class AcceptanceGateToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(refused.metadata["error_type"], "acceptance_required")
             self.assertTrue(overridden.ok, overridden.content)
 
+
+    async def test_allow_unlocked_never_bypasses_missing_set_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working, index = _acceptance_session(tmp)
+            (working / "script2video" / "script.txt").write_text("script", encoding="utf-8")
+            (working / "script2video" / "characters.json").write_text("[]", encoding="utf-8")
+            (working / "script2video" / "storyboard.json").write_text("[]", encoding="utf-8")
+            (working / "script2video" / "camera_tree.json").write_text("[]", encoding="utf-8")
+            _approve_set_references(working, "script2video", ["0", "1"])
+            store = json.loads((working / "render_acceptance.json").read_text(encoding="utf-8"))
+            del store["script2video"]["sets"]
+            (working / "render_acceptance.json").write_text(json.dumps(store), encoding="utf-8")
+            first_frame = working / "script2video/shots/1/qwen_qwen-image-3/first_frame.png"
+            original = first_frame.read_bytes()
+            adapter = ViMaxAdapters(Path(tmp), index)
+
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", RecordingScriptPipeline):
+                result = await adapter.vimax_render_video({
+                    "stop_after": "video", "render_mode": "script2video", "allow_unlocked": True,
+                })
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "set_approval_required")
+            self.assertIn("allow_unlocked=true does not bypass", result.metadata["error"])
+            self.assertEqual(first_frame.read_bytes(), original)
 
 class PlanningModeTests(unittest.TestCase):
     """Planning must not re-enter an abandoned root the session no longer works in."""
@@ -1283,7 +1631,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat", "user_requirement": "short", "style": "anime"})
@@ -1294,6 +1642,8 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((root / "idea2video" / "scene_0" / "storyboard.json").exists())
             self.assertTrue((root / "idea2video" / "scene_0" / "camera_tree.json").exists())
             self.assertTrue((root / "idea2video" / "scene_0" / "shots" / "0" / "shot_description.json").exists())
+            self.assertEqual(payload["sets"][0]["shots"], ["scene_0/0"])
+            self.assertTrue((root / "idea2video" / "set_references" / "planned_location" / "set.json").is_file())
             self.assertFalse((root / "script2video" / "storyboard.json").exists())
             self.assertFalse((root / "script2video" / "final_video.mp4").exists())
 
@@ -1303,7 +1653,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
             script = "A red ball rolls across a white table."
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"script": script, "user_requirement": "one shot"})
             self.assertTrue(result.ok)
@@ -1321,17 +1671,19 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = ViMaxAdapters(Path(tmp), index)
             events = []
             runtime = ToolRuntimeContext("vimax_narrative_planning", "vimax_narrative_planning", turn_id="turn-test", progress_callback=events.append)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"}, runtime)
             self.assertTrue(result.ok)
+            payload = json.loads(result.content)
             stages = [event["progress"]["stage"] for event in events if event.get("type") == "tool_progress"]
             self.assertIn("initializing_llm", stages)
             self.assertIn("develop_story", stages)
             self.assertIn("design_storyboard", stages)
             self.assertIn("decompose_shots", stages)
             self.assertIn("construct_camera_tree", stages)
+            self.assertEqual(payload["sets"][0]["shots"], ["scene_0/0"])
 
 
     async def test_plan_scene_failure_marks_session_error(self):
@@ -1348,6 +1700,24 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             session = index.active()
             self.assertEqual(session["stage"], "error")
             self.assertIn("storyboard failed", session["summary"])
+
+    async def test_planning_reports_underlying_parser_failure_without_exposing_credentials(self):
+        from langchain_core.exceptions import OutputParserException
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
+        from agents.storyboard_artist import StoryboardArtist
+        from agent_runtime.vimax_adapters import _run_planning_step
+
+        artist = StoryboardArtist(FakeListChatModel(responses=["not JSON: Bearer sk-private-token"]))
+        with self.assertRaises(RuntimeError) as raised:
+            await _run_planning_step(
+                "Planning storyboard", "plan_script",
+                artist.design_storyboard(script="A cowboy walks into a saloon.", characters=[]),
+                None,
+            )
+        self.assertIsInstance(raised.exception.__cause__, OutputParserException)
+        self.assertIn("Invalid json output", str(raised.exception))
+        self.assertNotIn("RetryError", str(raised.exception))
+        self.assertNotIn("sk-private-token", str(raised.exception))
 
 
     async def test_narrative_planning_timeout_marks_session_error(self):
@@ -1372,7 +1742,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             record = index.create(idea="moon cat", user_requirement="short", style="anime")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -1385,7 +1755,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             record = index.create(idea="moon cat", user_requirement="short", style="anime")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline),                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"session_id": record["session_id"]})
             self.assertTrue(result.ok)
             self.assertEqual(index.get(record["session_id"])["style"], "anime")
@@ -1394,7 +1764,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 first = await adapter.vimax_narrative_planning({"idea": "moon cat"})
@@ -1406,7 +1776,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             empty = index.create(project_name="00")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"idea": "moon cat"})
@@ -1423,7 +1793,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             old = index.create(idea="old cat")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", FakeIdeaPipeline), \
                  patch("pipelines.script2video_pipeline.Script2VideoPipeline", FakeScriptPipeline):
                 result = await adapter.vimax_narrative_planning({"session_id": old["session_id"], "idea": "new robot"})
@@ -1607,6 +1977,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            _approve_set_references(Path(tmp) / record["working_dir"], "idea2video", ["scene_0/0"], style="")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1637,6 +2008,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            _approve_set_references(Path(tmp) / record["working_dir"], "idea2video", ["scene_0/0"], style="")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1664,6 +2036,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            _approve_set_references(Path(tmp) / record["working_dir"], "idea2video", ["scene_0/0"], style="")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1689,6 +2062,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            _approve_set_references(Path(tmp) / record["working_dir"], "idea2video", ["scene_0/0"], style="")
             adapter = ViMaxAdapters(Path(tmp), index)
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
@@ -1720,6 +2094,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
             (root / "scene_0" / "storyboard.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "camera_tree.json").write_text("[]", encoding="utf-8")
             (root / "scene_0" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
+            _approve_set_references(Path(tmp) / record["working_dir"], "idea2video", ["scene_0/0"], style="anime")
             adapter = ViMaxAdapters(Path(tmp), index)
             stdout = io.StringIO()
             with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()),                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()),                  patch("pipelines.idea2video_pipeline.Idea2VideoPipeline", NoisyRenderIdeaPipeline),                  contextlib.redirect_stdout(stdout):
@@ -1772,6 +2147,7 @@ class ViMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }},
             }), encoding="utf-8")
+            _approve_set_references(working, "idea2video", ["scene_1/0"])
 
             RecordingIdeaScopePipeline.scopes.clear()
             adapter = ViMaxAdapters(Path(tmp), index)

@@ -13,19 +13,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
-from pipelines.render_contract import DEFAULT_RENDER_PHASE, RENDER_PHASES, normalize_phase
+from pipelines.render_contract import DEFAULT_RENDER_PHASE, RENDER_PHASES, PortraitGenerationError, normalize_phase
+from pipelines.set_references import (
+    accepted_set_references,
+    generate_set_references,
+    plan_set_specs,
+    shot_directories,
+    validate_set_candidate_count,
+    validate_set_reference_generation,
+)
 
-from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_generate_audio, video_model, video_provider, video_resolution
+from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, image_resolution, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_generate_audio, video_model, video_provider, video_resolution
 from .models import ToolResult
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
 from utils.project_lock import ProjectBusyError, project_write_lock
+from utils.text import safe_path_component
 
 if TYPE_CHECKING:
     from interfaces import CharacterInScene
     from pipelines.novel2movie_pipeline import Novel2MoviePipeline
     from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
     from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
+    from tools.image_generator_agnes_api import ImageGeneratorAgnesAPI
     from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
 
 
@@ -82,16 +92,17 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
         ToolSpec(
             name="vimax_render_video",
             description=(
-                "Render a ViMax session in three gated phases, selected with stop_after. "
-                "\"portraits\" renders the character portraits and stops: show them to the user and confirm the style and direction before going further. "
-                "\"stills\" renders the keyframes video generation will consume and stops: show them to the user and get explicit approval before spending money on video clips. "
-                "\"video\" renders the clips and the final concatenated video. "
-                "Phases are gated on the human review recorded in the Timeline: \"stills\" needs the portraits accepted and \"video\" needs every shot's keyframes accepted, otherwise the render refuses and names the unaccepted slots. Review and accept in the Timeline, or pass allow_unlocked=true when the user has explicitly approved spending without a review. "
-                "Default is \"portraits\". Never pass \"video\" before the user has seen the stills and approved them, and never leave \"portraits\" without confirming style with the user. "
-                "Each phase reuses artifacts that already exist, so re-running a phase after a revision is cheap. "
-                "Changing the image model mid-sequence breaks visual consistency and is refused unless allow_model_change=true is passed with explicit user approval. "
-                "render_mode picks which root renders: \"script2video\", \"idea2video\" or \"novel2video\". A session can have more than one root planned (an abandoned first attempt beside the current one), and the render would otherwise pick the first ready root rather than the one the project is being worked in, so pass render_mode when the session has more than one. The chosen root is pinned in render_manifest.json and a later render refuses to switch roots. "
-                "Shot redraws use redo_shots with the zero-based slot keys shown in the Timeline, plus allow_unreviewed_redo only when the user explicitly requests a slot without a rejection note. redo_rejected=true redraws every rejected shot. A redraw is restricted to its shots and phase; its acceptance gate checks those shots only. "
+                "Render a ViMax session in four gated phases, selected with stop_after. "
+                "\"portraits\" renders character portraits and stops for style/direction review. "
+                "\"sets\" generates only the explicitly selected, character-free set references and stops so they can be reviewed and accepted before stills. It can run independently of portrait approval. "
+                "\"stills\" renders the keyframes video generation will consume and stops for explicit approval before video clips. "
+                "\"video\" renders clips and the final concatenated video. "
+                "Portrait approval gates stills; accepted set references are always required before any missing or redrawn shot image, even with allow_unlocked=true; accepted keyframes gate video. allow_unlocked applies only to existing portrait/keyframe gates, never set references. "
+                "Default is \"portraits\". Each phase reuses artifacts that already exist. "
+                "Changing the image model mid-sequence is refused unless allow_model_change=true is passed with explicit user approval. "
+                "render_mode picks which root renders: \"script2video\", \"idea2video\" or \"novel2video\". The chosen root is pinned in render_manifest.json. "
+                "Shot redraws use redo_shots with zero-based slot keys. redo_rejected=true redraws every rejected shot. A redraw is restricted to its shots and phase. "
+                "Use set_ids to explicitly select set references for stop_after=\"sets\". set_candidate_count selects 1–4 alternative candidates per set (default 1) and values other than 1 require stop_after=\"sets\". redo_sets requests new alternatives, preserving existing candidates and canonical references; accepted sets must be unlocked before new candidates can be generated. Set generation never redraws portraits or shot frames. "
                 "This checks that structured text artifacts exist before rendering and reports missing dependencies instead of pretending render started."
             ),
             handler=adapter.vimax_render_video,
@@ -104,6 +115,9 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "redo_shots": ToolArgumentSchema(list, required=False, default=[]),
                 "redo_rejected": ToolArgumentSchema(bool, required=False, default=False),
                 "allow_unreviewed_redo": ToolArgumentSchema(bool, required=False, default=False),
+                "set_ids": ToolArgumentSchema(list, required=False, default=[]),
+                "redo_sets": ToolArgumentSchema(list, required=False, default=[]),
+                "set_candidate_count": ToolArgumentSchema(int, required=False, default=1),
             },
         ),
         ToolSpec(
@@ -307,6 +321,9 @@ class ViMaxAdapters:
                     runtime,
                     {"session_id": session_id},
                 )
+            # Composite roots have all their child shot plans by now; only then may
+            # the shared location plan be derived from complete coverage.
+            set_specs = await plan_set_specs(chat_model, working_dir / ("idea2video" if idea else "script2video"))
         except Exception as exc:
             self.session_index.update_stage(session_id, "error", f"Narrative planning failed: {exc}")
             checklist = self.session_index.artifact_checklist(session_id)
@@ -339,6 +356,10 @@ class ViMaxAdapters:
             "reused": reused,
             "missing": [path for path, present in checklist.items() if not present],
             "ready_for_render": ready_for_render,
+            "sets": [
+                {"id": spec["id"], "name": spec["name"], "description": spec["description"], "shots": list(spec["shots"])}
+                for spec in set_specs.values()
+            ],
         }
         return ToolResult("vimax_narrative_planning", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
 
@@ -388,7 +409,7 @@ class ViMaxAdapters:
             raise
         revision_target_path = target_path.relative_to(working_dir).as_posix()
         revision_plan = _revisioned_shot_plan(revision_target_path)
-        if revision_plan is not None and _continuity_enabled(working_dir):
+        if revision_plan is not None and _continuity_enabled(working_dir, revision_plan[0]):
             root, slot = revision_plan
             reason = f"Shot {slot} plan changed; regenerate and review its keyframes and clip."
             _mark_continuity_records(working_dir, root, [slot], reason)
@@ -399,7 +420,10 @@ class ViMaxAdapters:
             new_plan = json.loads(revised)
             ending_changed = (
                 not isinstance(old_plan, dict) or not isinstance(new_plan, dict)
-                or any(old_plan.get(key) != new_plan.get(key) for key in ("lf_desc", "lf_vis_char_idxs"))
+                or any(
+                    old_plan.get(key) != new_plan.get(key)
+                    for key in ("lf_desc", "lf_vis_char_idxs", "reuse_previous_last_frame")
+                )
             )
             if ending_changed:
                 _invalidate_continuity_dependents(working_dir, root, [slot])
@@ -445,6 +469,7 @@ class ViMaxAdapters:
             if runtime:
                 runtime.emit_progress("Starting novel planning", stage="starting", metadata={"session_id": session_id})
                 await asyncio.sleep(0)
+            chat_model = _build_chat_model()
             pipeline = _build_novel_pipeline(novel_dir)
             await _run_planning_step(
                 "Planning novel structured text artifacts",
@@ -456,6 +481,29 @@ class ViMaxAdapters:
                     progress=_pipeline_progress(runtime, session_id),
                     quiet=True,
                 ),
+                runtime,
+                {"session_id": session_id},
+            )
+            dummy = _UnavailableGenerator()
+            await _run_planning_step(
+                "Planning novel scene shots without rendering images",
+                "novel_plan_scene_artifacts",
+                pipeline.plan_scene_artifacts(
+                    chat_model,
+                    image_generator=dummy,
+                    video_generator=dummy,
+                    user_requirement=user_requirement,
+                    style=style,
+                    progress=_pipeline_progress(runtime, session_id),
+                    quiet=True,
+                ),
+                runtime,
+                {"session_id": session_id},
+            )
+            set_specs = await _run_planning_step(
+                "Planning character-free set descriptions",
+                "novel_plan_set_specs",
+                plan_set_specs(chat_model, novel_dir),
                 runtime,
                 {"session_id": session_id},
             )
@@ -477,6 +525,10 @@ class ViMaxAdapters:
             "generated": generated,
             "reused": reused,
             "missing": missing,
+            "sets": [
+                {"id": spec["id"], "name": spec["name"], "description": spec["description"], "shots": list(spec["shots"])}
+                for spec in set_specs.values()
+            ],
             "ready_for_scene_render": False,
         }
         return ToolResult("vimax_novel_planning", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
@@ -505,9 +557,21 @@ class ViMaxAdapters:
             render_mode = _resolve_render_mode(checklist, _read_render_manifest(working_dir), str(args.get("render_mode", "") or "").strip())
         except ValueError as exc:
             return ToolResult("vimax_render_video", False, str(exc), {"error_type": "invalid_render_mode", "session_id": session_id})
+        set_ids = args.get("set_ids") or []
+        redo_sets = args.get("redo_sets") or []
+        set_candidate_count = args.get("set_candidate_count", 1)
+        shot_redo_requested = bool(args.get("redo_shots") or args.get("redo_rejected", False))
+        try:
+            validate_set_candidate_count(set_candidate_count)
+        except ValueError as exc:
+            return ToolResult("vimax_render_video", False, str(exc), {"error_type": "invalid_set_candidate_count", "session_id": session_id})
+        if stop_after == "sets" and shot_redo_requested:
+            return ToolResult("vimax_render_video", False, "The sets phase cannot be combined with shot redraws.", {"error_type": "invalid_phase_arguments", "session_id": session_id, "phase": stop_after})
+        if stop_after != "sets" and (set_ids or redo_sets or set_candidate_count != 1):
+            return ToolResult("vimax_render_video", False, "set_ids, redo_sets, and non-default set_candidate_count are only valid with stop_after='sets'.", {"error_type": "invalid_phase_arguments", "session_id": session_id, "phase": stop_after})
         # A redo is resolved here, before anything is deleted or spent, so a mistyped
         # shot number cannot clear artifacts the render then fails to replace.
-        redo = _resolve_redo(working_dir, render_mode, args)
+        redo = {} if stop_after == "sets" else _resolve_redo(working_dir, render_mode, args)
         if redo.get("error_type"):
             payload = {**redo, "session_id": session_id, "render_mode": render_mode}
             return ToolResult("vimax_render_video", False, str(redo["error"]), payload)
@@ -535,23 +599,8 @@ class ViMaxAdapters:
             # Deleting a shot's artifacts and then stopping before the phase that redraws
             # them would leave the shot empty, so the redo's own phase is the floor.
             stop_after = redo["phase"]
-        # Novel rendering has no separable stills/video phase, so a phase other than
-        # "video" is reported as ignored rather than failing the request.
-        novel_phase_ignored = render_mode == "novel2video" and stop_after != "video"
-
-        self.session_index.update_stage(session_id, "rendering", f"Rendering {stop_after} phase")
-        # The shots a redraw clears are named here, where the render starts: the review
-        # surface marks them while the render runs, and the outcome row that also carries
-        # them is written too late to show a redraw happening.
-        _write_render_status(working_dir, status="rendering", payload={
-            "session_id": session_id,
-            "render_started": True,
-            "render_completed": False,
-            "phase": stop_after,
-            "stop_after": stop_after,
-            **({"redone_shots": sorted(redo["slots"])} if redo else {}),
-        })
         removed: list[str] = []
+        tally: dict[str, Any] = {}
         try:
             from pipelines.idea2video_pipeline import Idea2VideoPipeline
             from pipelines.script2video_pipeline import Script2VideoPipeline
@@ -559,11 +608,95 @@ class ViMaxAdapters:
             chat_model = _build_chat_model()
             image_generator = _build_image_generator()
             video_generator = _build_video_generator()
+            style = str(session.get("style", "") or "")
+            # A redraw names shots, and this run works on those shots only.
+            only_shots = list(redo.get("slots") or {}) if redo else None
+            script_only_shots = (
+                [int(slot) for slot in only_shots if str(slot).lstrip("-").isdigit()]
+                if only_shots is not None and render_mode == "script2video"
+                else only_shots
+            )
+
+            sequence_refusal = _enforce_render_sequence(
+                working_dir,
+                image_generator=image_generator,
+                video_generator=video_generator,
+                style=style,
+                allow_model_change=allow_model_change,
+                render_mode=render_mode,
+                commit=False,
+            )
+            if sequence_refusal is not None:
+                self.session_index.update_stage(session_id, "error", sequence_refusal["error"])
+                _write_render_status(working_dir, status="error", payload={**sequence_refusal, "session_id": session_id})
+                return ToolResult("vimax_render_video", False, sequence_refusal["error"], sequence_refusal)
+            novel_pipeline = None
+            if render_mode == "novel2video":
+                novel_pipeline = _build_novel_render_pipeline(working_dir / "novel2video", chat_model, image_generator, video_generator)
+                if stop_after in {"sets", "stills", "video"}:
+                    await novel_pipeline.plan_scene_artifacts(
+                        chat_model,
+                        image_generator=image_generator,
+                        video_generator=video_generator,
+                        user_requirement=str(session.get("user_requirement", "")),
+                        style=style,
+                        progress=_pipeline_progress(runtime, session_id, tally=tally),
+                        quiet=True,
+                        require_existing=True,
+                    )
+
+            # Validate the entire selected image scope before cutover, status changes,
+            # destructive shot redo, or any media request. This gate is mandatory even
+            # when the user has opted out of portrait/keyframe approval.
+            if stop_after == "sets":
+                try:
+                    validate_set_reference_generation(
+                        working_dir / render_mode,
+                        image_generator,
+                        style,
+                        set_ids=set_ids,
+                        redo_sets=redo_sets,
+                        set_candidate_count=set_candidate_count,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    refusal = {
+                        "error_type": "set_generation_refused",
+                        "retryable": False,
+                        "render_mode": render_mode,
+                        "stage": "sets",
+                        "error": str(exc),
+                    }
+                    self.session_index.update_stage(session_id, "error", refusal["error"])
+                    _write_render_status(working_dir, status="error", payload={**refusal, "session_id": session_id})
+                    return ToolResult("vimax_render_video", False, refusal["error"], refusal)
+            else:
+                acceptance = None if bool(args.get("allow_unlocked", False)) else _acceptance_refusal(working_dir, render_mode, stop_after, only_shots)
+                if acceptance is not None:
+                    self.session_index.update_stage(session_id, "error", acceptance["error"])
+                    _write_render_status(working_dir, status="error", payload={**acceptance, "session_id": session_id})
+                    return ToolResult("vimax_render_video", False, acceptance["error"], acceptance)
+                supports_last_frame = getattr(video_generator, "supports_last_frame", None)
+                requires_last_frame = True if supports_last_frame is None else bool(await supports_last_frame())
+                set_acceptance = _set_image_acceptance_refusal(
+                    working_dir,
+                    render_mode,
+                    stop_after,
+                    str(getattr(image_generator, "model", "") or "unknown-image-model"),
+                    style,
+                    only_shots,
+                    redo,
+                    requires_last_frame=requires_last_frame,
+                )
+                if set_acceptance is not None:
+                    self.session_index.update_stage(session_id, "error", set_acceptance["error"])
+                    _write_render_status(working_dir, status="error", payload={**set_acceptance, "session_id": session_id})
+                    return ToolResult("vimax_render_video", False, set_acceptance["error"], set_acceptance)
+
             model_change = _enforce_render_sequence(
                 working_dir,
                 image_generator=image_generator,
                 video_generator=video_generator,
-                style=str(session.get("style", "") or ""),
+                style=style,
                 allow_model_change=allow_model_change,
                 render_mode=render_mode,
             )
@@ -571,21 +704,12 @@ class ViMaxAdapters:
                 self.session_index.update_stage(session_id, "error", model_change["error"])
                 _write_render_status(working_dir, status="error", payload={**model_change, "session_id": session_id})
                 return ToolResult("vimax_render_video", False, model_change["error"], model_change)
-            # A redo names shots, and this run works on those shots: the clips of the rest are
-            # left for their own turn rather than generated because a batch was easier.
-            only_shots = list(redo.get("slots") or {}) if redo else None
-            script_only_shots = (
-                [int(slot) for slot in only_shots if str(slot).lstrip("-").isdigit()]
-                if only_shots is not None and render_mode == "script2video"
-                else only_shots
-            )
-            # The gate covers exactly the slots this invocation will draw.
-            acceptance = None if bool(args.get("allow_unlocked", False)) else _acceptance_refusal(working_dir, render_mode, stop_after, only_shots)
-            if acceptance is not None:
-                self.session_index.update_stage(session_id, "error", acceptance["error"])
-                _write_render_status(working_dir, status="error", payload={**acceptance, "session_id": session_id})
-                return ToolResult("vimax_render_video", False, acceptance["error"], acceptance)
-            tally: dict[str, int] = {}
+
+            self.session_index.update_stage(session_id, "rendering", f"Rendering {stop_after} phase")
+            _write_render_status(working_dir, status="rendering", payload={
+                "session_id": session_id, "render_mode": render_mode, "phase": stop_after,
+                "redone_shots": sorted(redo.get("slots", {})), "set_ids": list(set_ids),
+            })
             revision_notes = _revision_notes_for(working_dir, render_mode, redo)
             if redo:
                 keyframe_redraws = [slot for slot, stage in redo["slots"].items() if stage == "keyframes"]
@@ -598,7 +722,7 @@ class ViMaxAdapters:
             if render_mode == "idea2video":
                 idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"))
                 with _suppress_pipeline_output():
-                    outcome = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), quiet=True, stop_after=stop_after, revision_notes=revision_notes, progress=_pipeline_progress(runtime, session_id, tally=tally), only_shots=only_shots)
+                    outcome = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=style, quiet=True, stop_after=stop_after, revision_notes=revision_notes, progress=_pipeline_progress(runtime, session_id, tally=tally), only_shots=only_shots, set_ids=set_ids, redo_sets=redo_sets, set_candidate_count=set_candidate_count)
                 return self._render_outcome_result(runtime, session_id, working_dir, outcome, render_mode="idea2video", redo=redo, removed=removed, tally=tally)
             if render_mode == "script2video":
                 script_dir = working_dir / "script2video"
@@ -606,20 +730,29 @@ class ViMaxAdapters:
                 characters = _load_characters(script_dir / "characters.json")
                 pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir))
                 with _suppress_pipeline_output():
-                    outcome = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id, tally=tally), stop_after=stop_after, revision_notes=revision_notes, only_shots=script_only_shots)
+                    outcome = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=style, characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id, tally=tally), stop_after=stop_after, revision_notes=revision_notes, only_shots=script_only_shots, set_ids=set_ids, redo_sets=redo_sets, set_candidate_count=set_candidate_count)
                 return self._render_outcome_result(runtime, session_id, working_dir, outcome, render_mode="script2video", redo=redo, removed=removed, tally=tally)
             if render_mode == "novel2video":
-                novel_dir = working_dir / "novel2video"
-                pipeline = _build_novel_render_pipeline(novel_dir, chat_model, image_generator, video_generator)
                 with _suppress_pipeline_output():
-                    render_result = await pipeline.render_video_artifacts(style=str(session.get("style", "")), user_requirement=str(session.get("user_requirement", "")), quiet=True, progress=_pipeline_progress(runtime, session_id))
+                    render_result = await novel_pipeline.render_video_artifacts(
+                        style=style,
+                        user_requirement=str(session.get("user_requirement", "")),
+                        quiet=True,
+                        progress=_pipeline_progress(runtime, session_id, tally=tally),
+                        set_candidate_count=set_candidate_count,
+                        stop_after=stop_after,
+                        set_ids=set_ids,
+                        redo_sets=redo_sets,
+                        chat_model=chat_model,
+                    )
+                if isinstance(render_result, RenderOutcome):
+                    return self._render_outcome_result(runtime, session_id, working_dir, render_result, render_mode="novel2video", redo=redo, removed=removed, tally=tally)
                 scene_videos_dir = Path(render_result["scene_videos_dir"])
-                self.session_index.update_stage(session_id, "novel_scene_rendered", "Novel scene videos rendered")
                 payload = {
                     "session_id": session_id,
                     "render_mode": "novel2video",
-                    "phase": "video",
-                    "phase_gating": False,
+                    "phase": render_result.get("phase", "video"),
+                    "phase_gating": True,
                     "render_started": True,
                     "render_completed": True,
                     "scene_render_completed": True,
@@ -627,10 +760,11 @@ class ViMaxAdapters:
                     "scene_videos_dir": str(scene_videos_dir.relative_to(self.workspace_root)),
                     "scene_video_dirs": [str(Path(path).relative_to(self.workspace_root)) for path in render_result.get("scene_video_dirs", [])],
                     "scene_count": render_result.get("scene_count", 0),
+                    "generated": tally.get("generated", 0),
+                    "reused": tally.get("reused", 0),
                     "missing": [],
                 }
-                if novel_phase_ignored:
-                    payload["note"] = f"Novel rendering runs in a single pass; stop_after={stop_after!r} was ignored."
+                self.session_index.update_stage(session_id, "novel_scene_rendered", "Novel scene videos rendered")
                 _write_render_status(working_dir, status="rendered", payload=payload)
                 return ToolResult("vimax_render_video", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
         except Exception as exc:
@@ -644,6 +778,12 @@ class ViMaxAdapters:
             where = traceback.format_exc()
             self.session_index.update_stage(session_id, "error", f"Render failed: {error_text}")
             checklist = self.session_index.artifact_checklist(session_id)
+            portrait_missing = []
+            if isinstance(unwrapped, PortraitGenerationError):
+                portrait_root = Path(unwrapped.working_dir) if unwrapped.working_dir else working_dir / render_mode
+                for missing_path in unwrapped.missing:
+                    absolute = (portrait_root / missing_path).resolve()
+                    portrait_missing.append(absolute.relative_to(working_dir.resolve()).as_posix())
             payload = {
                 "error_type": "render_failed",
                 "retryable": _is_retryable_render_error(unwrapped),
@@ -653,7 +793,17 @@ class ViMaxAdapters:
                 "error": error_text,
                 "wrapped_error": wrapped_error_text,
                 "present": [path for path, present in checklist.items() if present],
-                "missing": [path for path, present in checklist.items() if not present],
+                "missing": portrait_missing if isinstance(unwrapped, PortraitGenerationError) else [path for path, present in checklist.items() if not present],
+                **({
+                    "phase": "portraits",
+                    "render_mode": render_mode,
+                    "render_started": True,
+                    "render_completed": False,
+                    "awaiting_confirmation": None,
+                    "generated": tally.get("generated", 0),
+                    "reused": tally.get("reused", 0),
+                    "failed_characters": {name: _sanitize_error_text(error) for name, error in unwrapped.failures.items()},
+                } if isinstance(unwrapped, PortraitGenerationError) else {}),
             }
             _write_render_status(working_dir, status="error", payload=payload)
             if runtime:
@@ -819,21 +969,41 @@ class ViMaxAdapters:
         }
         return ToolResult("vimax_review_timeline", True, "\n".join(lines), payload)
 
-    def _render_outcome_result(self, runtime: ToolRuntimeContext | None, session_id: str, working_dir: Path, outcome: Any, *, render_mode: str, redo: dict[str, Any] | None = None, removed: list[str] | None = None, tally: dict[str, int] | None = None) -> ToolResult:
+    def _render_outcome_result(self, runtime: ToolRuntimeContext | None, session_id: str, working_dir: Path, outcome: Any, *, render_mode: str, redo: dict[str, Any] | None = None, removed: list[str] | None = None, tally: dict[str, Any] | None = None) -> ToolResult:
         """Report a render phase, and what the user must confirm before the next one.
 
         The artifacts a redraw held are only dropped here, once the phase has run: a phase
         that raises instead keeps them for the rollback.
         """
         stills = [str(Path(path).relative_to(self.workspace_root)) for path in outcome.stills]
+        set_references = [str(Path(path).relative_to(self.workspace_root)) for path in outcome.set_references]
         generated = (tally or {}).get("generated", 0)
+        reused = (tally or {}).get("reused", 0)
+        reused_set_paths: list[str] = []
+        if outcome.phase == "sets":
+            generated_set_paths = {
+                str(Path(path))
+                for path in (tally or {}).get("generated_set_candidate_paths", [])
+            }
+            generated = sum(str(Path(path)) in generated_set_paths for path in outcome.set_references)
+            reused_set_paths = [
+                str(Path(path).relative_to(self.workspace_root))
+                for path in outcome.set_references
+                if str(Path(path)) not in generated_set_paths
+            ]
+            reused = len(reused_set_paths)
+            if runtime:
+                for path in reused_set_paths:
+                    runtime.emit_progress(
+                        f"Reusing set reference: {Path(path).parent.parent.name}",
+                        stage="set_reference_exists",
+                        metadata={"session_id": session_id, "phase": "sets", "set_id": Path(path).parent.parent.name, "path": path},
+                    )
         warnings = list((tally or {}).get("warnings") or [])
         payload = {
             "generated": generated,
-            "reused": (tally or {}).get("reused", 0),
+            "reused": reused,
             **({"redone_shots": sorted((redo or {}).get("slots", {})), "cleared": len(removed or [])} if redo else {}),
-            # What the render could not do properly, in the row the Timeline reads: a frame
-            # drawn without its references is not the frame the plan asked for.
             **({"warnings": warnings} if warnings else {}),
             "session_id": session_id,
             "render_mode": render_mode,
@@ -842,6 +1012,7 @@ class ViMaxAdapters:
             "image_model": outcome.image_model,
             "video_model": outcome.video_model,
             "stills": stills,
+            "set_references": set_references,
             "awaiting_confirmation": outcome.awaiting_confirmation,
             "render_started": True,
             "render_completed": outcome.phase == "video" and bool(outcome.final_video_path),
@@ -850,9 +1021,14 @@ class ViMaxAdapters:
         }
         if outcome.awaiting_confirmation:
             next_phase = outcome.awaiting_confirmation
-            review = "the character portraits and the style/direction they establish" if outcome.phase == "portraits" else "the keyframes that video generation will animate"
+            review = {
+                "portraits": "the character portraits and the style/direction they establish",
+                "sets": "the character-free set/location references and their layout continuity",
+                "stills": "the keyframes that video generation will animate",
+            }.get(outcome.phase, "the generated images")
+            review_count = len(set_references) if outcome.phase == "sets" else len(stills)
             content = (
-                f"{outcome.phase} phase complete: {len(stills)} image(s) ready for review, rendered with style {outcome.style!r} "
+                f"{outcome.phase} phase complete: {review_count} image(s) ready for review, rendered with style {outcome.style!r} "
                 f"and image model {outcome.image_model!r}.\n"
                 f"Show the user {review}, then ask whether to continue to the {next_phase} phase. "
                 f"Only call vimax_render_video again with stop_after=\"{next_phase}\" after the user approves. "
@@ -864,7 +1040,9 @@ class ViMaxAdapters:
                     "re-rendered that video too — a video-model call, not just an image. Its first frame is now the new "
                     "camera still."
                 )
-            if generated == 0 and redo:
+            if outcome.phase == "sets" and generated == 0:
+                content += "\nEvery selected set reference was reused; no image generation was needed."
+            elif generated == 0 and redo:
                 content += (
                     "\nWARNING: this run regenerated nothing — every artifact the redraw was meant to replace is still "
                     "the one on disk. Check that the shot keys you passed exist and that the phase redraws their stage."
@@ -1000,7 +1178,9 @@ async def _run_planning_step(
     except asyncio.TimeoutError as exc:
         raise RuntimeError(f"{message} timed out after {timeout_seconds:g}s") from exc
     except Exception as exc:
-        raise RuntimeError(f"{message} failed: {exc}") from exc
+        cause = _unwrap_retry_error(exc)
+        detail = _sanitize_error_text(str(cause))
+        raise RuntimeError(f"{message} failed: {type(cause).__name__}: {detail}") from cause
 
 
 def _is_new_source_for_session(session: dict[str, Any], requested_source: str) -> bool:
@@ -1020,21 +1200,21 @@ def _llm_request_timeout_seconds() -> float:
 
 
 def _narrative_max_tokens() -> int:
-    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "4096")
+    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "16384")
     try:
         return max(256, int(raw))
     except ValueError:
-        return 4096
+        return 16384
 
 
 # Progress stages the pipeline uses for artifacts it drew, and for ones it reused. A phase
 # that regenerated nothing is a no-op, and reporting it as success is how a redraw that
 # never happened looks like one.
-_GENERATED_STAGES = ("frame_done", "video_clip_done", "character_portrait_front_done", "character_portrait_side_done", "character_portrait_back_done")
-_REUSED_STAGES = ("frame_exists", "video_clip_exists")
+_GENERATED_STAGES = ("frame_done", "video_clip_done", "character_portrait_front_done", "character_portrait_side_done", "character_portrait_back_done", "set_reference_done")
+_REUSED_STAGES = ("frame_exists", "video_clip_exists", "character_portrait_front_exists", "character_portrait_side_exists", "character_portrait_back_exists", "set_reference_exists")
 
 
-def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, scene_index: int | None = None, tally: dict[str, int] | None = None):
+def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, scene_index: int | None = None, tally: dict[str, Any] | None = None):
     """The pipeline's progress sink.
 
     A tally is still kept when there is no runtime to report to: whether a phase actually
@@ -1048,6 +1228,8 @@ def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, s
         if tally is not None:
             if stage in _GENERATED_STAGES:
                 tally["generated"] = tally.get("generated", 0) + 1
+                if stage == "set_reference_done" and metadata and metadata.get("path"):
+                    tally.setdefault("generated_set_candidate_paths", []).append(str(metadata["path"]))
             elif stage in _REUSED_STAGES:
                 tally["reused"] = tally.get("reused", 0) + 1
             elif stage == "references_dropped":
@@ -1083,7 +1265,7 @@ def _build_chat_model() -> Any:
     )
 
 
-def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
+def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI | ImageGeneratorAgnesAPI:
     from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
     from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
 
@@ -1092,9 +1274,14 @@ def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGenerato
         raise RuntimeError("VIMAX_IMAGE_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml image/llm api_key is required for image generation")
     model = image_model()
     base_url = image_base_url()
+    resolution = image_resolution()
     if api_provider_from_base_url(base_url) == "openrouter":
-        return ImageGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
-    return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url)
+        return ImageGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url, resolution=resolution)
+    if api_provider_from_base_url(base_url) == "agnes":
+        from tools.image_generator_agnes_api import ImageGeneratorAgnesAPI
+
+        return ImageGeneratorAgnesAPI(api_key=api_key, model=model, base_url=base_url, resolution=resolution)
+    return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url, resolution=resolution)
 
 
 def _build_video_generator():
@@ -1407,6 +1594,47 @@ def _supersede_clips(root_dir: Path, clip_seconds: int) -> list[str]:
             pass
     return moved
 
+def _discard_image_model_outputs(working_dir: Path, render_mode: str, old_model: str) -> None:
+    """Remove generated images for a cut-over model without deleting set descriptors."""
+    root_dir = working_dir / render_mode if render_mode else working_dir
+    model_slug = safe_path_component(old_model)
+
+    def remove(path: Path) -> None:
+        if path.is_symlink() or not path.is_dir():
+            path.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(path)
+
+    portrait_dir = root_dir / "character_portraits" / model_slug
+    if portrait_dir.exists() or portrait_dir.is_symlink():
+        remove(portrait_dir)
+    for shot_dir in shot_directories(root_dir).values():
+        image_dir = shot_dir / model_slug
+        if image_dir.exists() or image_dir.is_symlink():
+            remove(image_dir)
+
+    set_root = root_dir / "set_references"
+    if set_root.is_dir() and not set_root.is_symlink():
+        for set_dir in set_root.iterdir():
+            if not set_dir.is_dir() or set_dir.is_symlink():
+                continue
+            image_dir = set_dir / model_slug
+            if image_dir.exists() or image_dir.is_symlink():
+                remove(image_dir)
+
+    store = _read_acceptance(working_dir)
+    root_record = store.get(render_mode) if isinstance(store.get(render_mode), dict) else {}
+    set_records = root_record.get("sets") if isinstance(root_record.get("sets"), dict) else {}
+    timestamp = datetime.now(timezone.utc).isoformat()
+    changed = False
+    for record in set_records.values():
+        if isinstance(record, dict) and (record.get("accepted_at") or record.get("artifacts")):
+            record["invalidated_at"] = timestamp
+            record["invalidated_reason"] = "image_model_changed"
+            changed = True
+    if changed:
+        _acceptance_path(working_dir).write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def _enforce_render_sequence(
     working_dir: Path,
@@ -1416,7 +1644,8 @@ def _enforce_render_sequence(
     style: str,
     allow_model_change: bool,
     render_mode: str = "",
-) -> dict[str, Any] | None:
+    commit: bool = True,
+):
     """Keep one image model and one style per render sequence.
 
     Artifacts are reused by ``os.path.exists``, so rendering a sequence with a
@@ -1456,16 +1685,6 @@ def _enforce_render_sequence(
                 f"Set image.model back to {recorded_model!r}, start a new session, or pass allow_model_change=true to render the remaining artifacts with {configured_model!r}."
             ),
         }
-    # A different video model renders the clips again, and the film on disk is the old model's
-    # clips joined. The concatenation is skipped while a film exists, so leaving it would keep
-    # that cut on disk for good. Dropping it lets the next video render build it from the new
-    # clips; the Timeline shows the final_video stage as unrendered until then.
-    recorded_video_model = str(manifest.get("video_model") or "")
-    configured_video_model = str(getattr(video_generator, "model", "") or "")
-    if recorded_video_model and configured_video_model and recorded_video_model != configured_video_model:
-        film = (working_dir / render_mode if render_mode else working_dir) / "final_video.mp4"
-        if film.exists():
-            film.unlink(missing_ok=True)
     if recorded_style and style and recorded_style != style:
         return {
             "error_type": "style_changed",
@@ -1474,11 +1693,24 @@ def _enforce_render_sequence(
             "recorded_style": recorded_style,
             "error": (
                 f"This sequence was rendered with style {recorded_style!r}, but the project style is now {style!r}. "
-                f"Portraits, keyframes and clips drawn under the old style cannot be reused. "
+                f"Portraits, set references, keyframes and clips drawn under the old style cannot be reused. "
                 f"Change the style from the project page, which discards and regenerates the affected artifacts, "
                 f"or set the style back to {recorded_style!r}."
             ),
         }
+    # Validate refusal conditions before planning or approval gates. The committing
+    # pass below performs all filesystem cutovers only after every gate has passed.
+    if not commit:
+        return None
+    if recorded_model and configured_model and recorded_model != configured_model and allow_model_change:
+        _discard_image_model_outputs(working_dir, render_mode, recorded_model)
+    # A different video model renders the clips again, so the old concatenated film
+    # cannot remain current. Do this only after all refusal checks have passed.
+    recorded_video_model = str(manifest.get("video_model") or "")
+    configured_video_model = str(getattr(video_generator, "model", "") or "")
+    if recorded_video_model and configured_video_model and recorded_video_model != configured_video_model:
+        film = (working_dir / render_mode if render_mode else working_dir) / "final_video.mp4"
+        film.unlink(missing_ok=True)
     # A clip of the wrong length is not this film's clip: a line of dialogue cannot be
     # stretched to fit one, and a five second clip of an eight second line loses the line.
     # The keyframes stay — a clip is drawn between them, and they are the length they are —
@@ -1558,6 +1790,10 @@ async def _revise_artifact_with_llm(chat_model: Any, target: str, current_text: 
         "Revise this ViMax structured artifact exactly as requested. "
         "Return only the complete replacement file content, with no Markdown fences or explanation. "
         "If the file is JSON, preserve valid JSON and the existing schema shape.\n\n"
+        "When writing shot descriptions or frame/motion prompts, use existing canonical character names, "
+        "not appearance-based labels or repeated profiles. Use concise present-tense, filmable action, "
+        "clear location/framing, and named speaker cues with verbatim dialogue; "
+        "parentheticals are for essential delivery/action only. Preserve untouched content.\n\n"
         f"Target: {target}\n"
         f"Revision instruction: {instruction}\n\n"
         "Current file content:\n"
@@ -1738,6 +1974,8 @@ def _timeline_review_prompt(evidence: dict[str, Any]) -> str:
         "- motion_desc describes what moves in the shot, in the same style as the timeline's motion descriptions. Write it for this shot: an added shot takes nothing from the shot it is placed after.\n"
         "- A suggestion that restores a lost dialogue line must carry it verbatim in audio_desc, copied from the script or from the cut shot's audio. Use an empty audio_desc when the shot speaks nothing.\n"
         "- characters must be names from the character list, spelled exactly as given there.\n"
+        "- Use canonical character names throughout visual_desc, frames, and motion_desc, retaining angle brackets in visual descriptions; never replace names with long appearance descriptions or repeat profiles.\n"
+        "- Follow screenplay/shot-list conventions: concise present-tense, filmable action; clear location and framing; named dialogue cues with verbatim lines; parentheticals only for essential delivery/action. Keep only brief shot-essential costume or prop details.\n"
         "- visual_desc is a shot description in the same style as the timeline's.\n"
         "- Match the framing and shot size the shots around the gap use, and honour every constraint the direction puts on shot size, framing or style: never propose a shot size the direction rules out, and never introduce a framing the surrounding shots do not use.\n"
         "- frames.first and frames.last describe its opening and closing images, at the same level of detail as the timeline's frames, and keep the characters' appearance as the neighbouring shots show it.\n"
@@ -1811,12 +2049,27 @@ def _read_acceptance(working_dir: Path) -> dict[str, Any]:
 FRAME_CONTINUITY_FILENAME = "frame_continuity.json"
 
 
-def _continuity_enabled(working_dir: Path) -> bool:
+def _continuity_enabled(working_dir: Path, root: str | None = None) -> bool:
     try:
         settings = json.loads((working_dir / FRAME_CONTINUITY_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        settings = {}
+    if isinstance(settings, dict) and settings.get("mode") == "chained_keyframes":
+        return True
+    if root is None:
         return False
-    return isinstance(settings, dict) and settings.get("mode") == "chained_keyframes"
+    root_dir = working_dir / root
+    order = _continuity_playback_order(root_dir)
+    for slot in order[1:]:
+        parts = slot.split("/")
+        shot_dir = root_dir / parts[0] / "shots" / parts[1] if parts[0].startswith("scene_") else root_dir / "shots" / parts[0]
+        try:
+            description = json.loads((shot_dir / "shot_description.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(description, dict) and description.get("reuse_previous_last_frame") is True:
+            return True
+    return False
 
 
 def _continuity_playback_order(root_dir: Path) -> list[str]:
@@ -1862,7 +2115,7 @@ def _invalidate_continuity_dependents(
     ``changed_slots`` names keyframe-bearing slots whose ending has changed. Playback
     order comes exclusively from the active camera trees, never from shot numbers.
     """
-    if not _continuity_enabled(working_dir):
+    if not _continuity_enabled(working_dir, root):
         return []
     if isinstance(changed_slots, dict):
         changed = {str(slot) for slot in changed_slots}
@@ -1924,7 +2177,7 @@ def _invalidate_continuity_dependents(
 
 def _mark_continuity_records(working_dir: Path, root: str, slots: list[str], reason: str) -> None:
     """Preserve reviewed records while requiring a fresh review after a plan revision."""
-    if not _continuity_enabled(working_dir):
+    if not _continuity_enabled(working_dir, root):
         return
     path = _acceptance_path(working_dir)
     store = _read_acceptance(working_dir)
@@ -2011,27 +2264,99 @@ def _shot_sort_key(name: str) -> tuple[int, int | str]:
 
 
 def _shot_dirs(root_dir: Path) -> list[tuple[str, Path]]:
-    """Every planned shot of a render root as (slot key, directory), in timeline order.
+    """Every active shot slot and directory, in the shared set-helper order."""
+    return list(shot_directories(root_dir).items())
 
-    Script mode keeps shots flat under ``shots/``, so the slot key is the directory
-    name. Idea mode nests them under ``scene_<idx>/shots/``, where the same shot index
-    appears once per scene, so the key is scene-qualified. Planned means the shot
-    description exists — the same rule the render gate uses.
-    """
-    flat = root_dir / "shots"
-    if flat.exists():
-        containers = [(flat, "")]
-    else:
-        # The glob matches each scene's `shots` directory, so the scene is its parent,
-        # and scenes are numbered rather than sorted as text (scene_2 before scene_10).
-        scenes = sorted(root_dir.glob("scene_*/shots"), key=lambda path: _shot_sort_key(path.parent.name.split("_")[-1]))
-        containers = [(scene, f"{scene.parent.name}/") for scene in scenes]
-    shots: list[tuple[str, Path]] = []
-    for container, prefix in containers:
-        for shot_dir in sorted(container.iterdir(), key=lambda path: _shot_sort_key(path.name)):
-            if shot_dir.is_dir() and (shot_dir / "shot_description.json").exists():
-                shots.append((f"{prefix}{shot_dir.name}", shot_dir))
-    return shots
+
+def _portrait_acceptance_slots(working_dir: Path, root: str, root_record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Review each visible character's selected trio, never archived alternatives."""
+    root_dir = working_dir / root
+    scopes = [root_dir]
+    if root == "idea2video":
+        scopes.extend(sorted(path for path in root_dir.glob("scene_*")
+                             if path.is_dir() and path.name[6:].isdigit()))
+    try:
+        manifest = json.loads((working_dir / RENDER_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    model = safe_path_component(str(manifest.get("image_model") or "unknown-image-model"))
+    records = root_record.get("portrait_characters")
+    records = records if isinstance(records, dict) else {}
+    slots = {}
+    structured = False
+    for scope in scopes:
+        try:
+            characters = json.loads((scope / "characters.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(characters, list):
+            continue
+        structured = True
+        registry_path = scope / "character_portraits" / model / "registry.json"
+        # Planned Idea scenes share the global set until a scene registry exists.
+        if scope != root_dir and not registry_path.is_file():
+            continue
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            registry = {}
+        registry = registry if isinstance(registry, dict) else {}
+        for character in characters:
+            if not isinstance(character, dict) or character.get("is_visible") is not True:
+                continue
+            name = str(character.get("identifier_in_scene") or "")
+            key = f"{scope.relative_to(working_dir).as_posix()}::{name}"
+            entry = registry.get(name)
+            entry = entry if isinstance(entry, dict) else {}
+            canonical = registry_path.parent / f"{character.get('idx')}_{safe_path_component(name)}"
+            paths = []
+            complete = True
+            for view in ("front", "side", "back"):
+                item = entry.get(view)
+                stored = item.get("path") if isinstance(item, dict) else None
+                candidate = Path(stored) if isinstance(stored, str) and stored else None
+                if candidate is not None and not candidate.is_absolute():
+                    candidate = (working_dir.parent.parent / candidate if stored.startswith(".working_dir/")
+                                 else working_dir / candidate)
+                if candidate is None or not candidate.resolve().is_relative_to(working_dir.resolve()) or not candidate.is_file():
+                    complete = False
+                    candidate = canonical / f"{view}.png"
+                paths.append(candidate.resolve())
+            slots[key] = {"paths": paths, "record": records.get(key), "missing": not complete}
+    if not structured:
+        return {"portraits": {"paths": _locked_stage_paths(root_dir, "portraits"), "record": root_record.get("portraits")}}
+
+    def recorded_paths(record):
+        if not isinstance(record, dict) or not isinstance(record.get("artifacts"), list):
+            return set()
+        return {(working_dir / str(item.get("path") or "")).resolve()
+                for item in record["artifacts"] if isinstance(item, dict)}
+
+    aggregate = root_record.get("portraits")
+    required = {path for slot in slots.values() for path in slot["paths"]}
+    aggregate_valid = (
+        isinstance(aggregate, dict) and not aggregate.get("invalidated_at") and not aggregate.get("rejected_at")
+        and required == recorded_paths(aggregate) and _lock_matches(working_dir, aggregate)
+        and all(not slot["missing"] for slot in slots.values())
+    )
+    for key, slot in slots.items():
+        record = slot["record"]
+        if slot["missing"]:
+            slot["record"] = None
+        elif aggregate_valid:
+            slot["record"] = aggregate
+        elif record is not None and set(slot["paths"]) != recorded_paths(record):
+            slot["record"] = {**record, "invalidated_at": "portrait_selection_changed"} if isinstance(record, dict) else None
+        elif record is None:
+            # Scene registries can reference the same approved global portrait tuple.
+            name = key.split("::", 1)[1]
+            slot["record"] = next((
+                item for other_key, item in records.items()
+                if other_key.endswith(f"::{name}") and recorded_paths(item) == set(slot["paths"])
+                and isinstance(item, dict) and not item.get("invalidated_at") and not item.get("rejected_at")
+                and _lock_matches(working_dir, item)
+            ), None)
+    return slots
 
 
 def _acceptance_slots(working_dir: Path, root: str) -> dict[str, dict[str, Any]]:
@@ -2044,9 +2369,7 @@ def _acceptance_slots(working_dir: Path, root: str) -> dict[str, dict[str, Any]]
     root_record = _read_acceptance(working_dir).get(root) or {}
     shots_record = root_record.get("shots") if isinstance(root_record.get("shots"), dict) else {}
     slots: dict[str, dict[str, Any]] = {
-        "portraits": {
-            "portraits": {"paths": _locked_stage_paths(root_dir, "portraits"), "record": root_record.get("portraits")}
-        },
+        "portraits": _portrait_acceptance_slots(working_dir, root, root_record),
         "keyframes": {},
         "clips": {},
         "final_video": {
@@ -2078,6 +2401,8 @@ def _slot_state(working_dir: Path, slot: dict[str, Any]) -> str:
         return "stale"
     if isinstance(record, dict) and record.get("rejected_at"):
         return "rejected"
+    if slot.get("missing"):
+        return "planned"
     if not slot["paths"]:
         return "planned"
     if not isinstance(record, dict) or not record.get("accepted_at"):
@@ -2139,6 +2464,68 @@ def _acceptance_refusal(working_dir: Path, root: str, phase: str, only_shots: li
             f"Nothing may be generated past {gating_stage} until it is accepted: {listed}. "
             f"Review {gating_stage} in the Timeline and accept what is good, then run this phase.{rejected_note} "
             f"Pass allow_unlocked=true to render anyway."
+        ),
+    }
+
+
+def _set_image_acceptance_refusal(
+    working_dir: Path,
+    root: str,
+    phase: str,
+    image_model: str,
+    style: str,
+    only_shots: list[int | str] | None,
+    redo: dict[str, Any] | None,
+    *,
+    requires_last_frame: bool = True,
+) -> dict[str, Any] | None:
+    """Require approved set references only for shots that will redraw images.
+
+    Cached accepted frames can continue into video rendering without making a project
+    generate sets solely for the new contract. A keyframe redo always needs fresh set
+    references, and ordinary stills/video phases gate only missing frame slots.
+    """
+    if phase not in {"stills", "video"}:
+        return None
+    root_dir = working_dir / root
+    directories = shot_directories(root_dir)
+    scope = list(only_shots) if only_shots is not None else list(directories)
+    redo_slots = (redo or {}).get("slots") or {}
+    required: list[str] = []
+    model_dir = safe_path_component(image_model or "unknown-image-model")
+    for value in scope:
+        slot = str(value)
+        shot_dir = directories.get(slot)
+        if shot_dir is None:
+            continue
+        if redo_slots.get(slot) == "keyframes":
+            required.append(slot)
+            continue
+        image_dir = shot_dir / model_dir
+        frame_names = ["first_frame"]
+        if requires_last_frame:
+            frame_names.append("last_frame")
+        if any(not (image_dir / f"{frame}.png").is_file() for frame in frame_names):
+            required.append(slot)
+    blocked: list[dict[str, str]] = []
+    for slot in required:
+        try:
+            accepted_set_references(root_dir, slot, style, image_model)
+        except Exception as exc:
+            blocked.append({"slot": slot, "state": "unaccepted", "reason": str(exc)})
+    if not blocked:
+        return None
+    listed = "; ".join(f"{item['slot']}: {item['reason']}" for item in blocked)
+    return {
+        "error_type": "set_approval_required",
+        "retryable": False,
+        "render_mode": root,
+        "stage": "sets",
+        "unaccepted": blocked,
+        "required_slots": required,
+        "error": (
+            f"Shot images cannot be generated or redrawn until every assigned set reference is accepted: {listed}. "
+            "Generate/review the assigned set references first. allow_unlocked=true does not bypass this requirement."
         ),
     }
 
@@ -2473,7 +2860,7 @@ def _mark_slots_redone(working_dir: Path, root: str, targets: dict[str, str], no
     root_store = store.get(root) if isinstance(store.get(root), dict) else {}
     shots_store = root_store.get("shots") if isinstance(root_store.get("shots"), dict) else {}
     now = datetime.now().isoformat(timespec="seconds")
-    continuity_enabled = _continuity_enabled(working_dir)
+    continuity_enabled = _continuity_enabled(working_dir, root)
     for slot, stage in sorted(targets.items()):
         shot_store = shots_store.get(slot) if isinstance(shots_store.get(slot), dict) else {}
         stage_record = shot_store.get(stage) if isinstance(shot_store.get(stage), dict) else {}

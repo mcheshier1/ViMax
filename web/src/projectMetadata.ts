@@ -50,7 +50,7 @@ export function describeInvalidation(response: Pick<ProjectUpdateResponse, 'chan
   return {
     paths: [...response.invalidated],
     heading: 'Changing the style regenerates these',
-    detail: 'Portraits, keyframes, shot clips, and the final video are deleted and rebuilt with the new style. Script, characters, storyboard, and camera files are kept.',
+    detail: 'Character portraits, set reference images, keyframes, shot clips, and the final video are deleted and rebuilt with the new style. Set descriptions, script, characters, storyboard, and camera files are kept.',
   };
 }
 
@@ -69,10 +69,11 @@ export type ArtifactCheckpoint = {
  * as missing artifacts, then fills back in as the render rebuilds them.
  */
 export function describeArtifacts(artifacts: ProjectArtifacts): ArtifactCheckpoint[] {
-  const {portraits, shots, frames, clips, finalVideo} = artifacts;
+  const {portraits, setReferences, shots, frames, clips, finalVideo} = artifacts;
   const ofShots = (count: number) => (shots > 0 ? `${count}/${shots}` : 'No shots planned');
   return [
     {label: 'Portraits', detail: portraits > 0 ? `${portraits} ready` : 'None', state: portraits > 0 ? 'ready' : 'missing'},
+    {label: 'Set references', detail: setReferences > 0 ? `${setReferences} generated` : 'None', state: setReferences > 0 ? 'ready' : 'missing'},
     {label: 'Keyframes', detail: ofShots(frames), state: shotState(frames, shots)},
     {label: 'Clips', detail: ofShots(clips), state: shotState(clips, shots)},
     {label: 'Final video', detail: finalVideo ? 'Ready' : 'Missing', state: finalVideo ? 'ready' : 'missing'},

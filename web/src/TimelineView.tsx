@@ -1,13 +1,14 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
-import {AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileJson, Film, Image as ImageIcon, Lock, Plus, RefreshCw, Trash2, Undo2, Unlock, ZoomIn} from 'lucide-react';
+import {AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileJson, Film, Image as ImageIcon, Lock, Plus, RefreshCw, RotateCcw, Trash2, Undo2, Unlock, ZoomIn} from 'lucide-react';
 import {activeRedraw, askedRenderFinished, failedRedraw, filmPosition, moveTarget, planInconsistencies, redoRequestText, renderActivity, renderStatusLine, slotName, slotsInFilmOrder, STATE_LABELS} from './timeline';
 import {ShotPlanPanel, filmDraftToken, hasFilmDrafts, hasSessionFilmDrafts} from './ShotPlanPanel';
 import type {ShotPlanHandle} from './ShotPlanPanel';
 import {addSuggestionRequest, coverageCounts, coverageNeedsAttention, gapBeats, reviewRequestText, reviewStatusLine, runtimeLine, suggestionAddable, suggestionAnchor, suggestionFraming, suggestionPosition, warnChecks} from './continuity';
 import type {ContinuityPayload, ContinuitySuggestion} from './continuity';
-import {assembleFilm, createShot, getAgentConfig, moveShot, readFilmProgress, removeShot, restoreShot, saveAgentConfig, updateAcceptance} from './api';
-import type {AcceptanceSlot, AcceptanceStageName, Artifact, ConfigSection, SessionSummary, ShotPlan} from './types';
+import {assembleFilm, createShot, getAgentConfig, getShotRestartPlan, moveShot, readFilmProgress, readSetReferences, removeShot, restartShot, restoreShot, saveAgentConfig, updateAcceptance} from './api';
+import type {AcceptanceSlot, AcceptanceStageName, Artifact, ConfigSection, SessionSummary, SetReferenceInventory, ShotPlan, ShotRestartPlan} from './types';
 import type {FilmSelection, FilmSessionState} from './filmSession';
+import {CharacterPortraitDecision} from './CharacterPortraitDecision';
 import {artifactUrl, thumbnailUrl} from './media';
 import {isHeygenVideoModel, validHeygenVideoSettings, videoModelSelection, videoProviderPreset, VIDEO_PROVIDER_PRESETS} from './videoPresets';
 import './film-workbench.css';
@@ -31,6 +32,7 @@ type TimelineViewProps = {
   artifacts: Artifact[];
   film: FilmSessionState;
   active?: boolean;
+  requestBusy?: boolean;
   onAskAgent: (text: string, restartAgent?: boolean) => Promise<void>;
   onSelectionChange?: (selection: FilmSelection | null) => void;
 };
@@ -39,7 +41,7 @@ export function TimelineView(props: TimelineViewProps) {
   return <FilmWorkbench key={props.session?.sessionId || 'empty'} {...props} />;
 }
 
-function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onSelectionChange}: TimelineViewProps) {
+function FilmWorkbench({session, artifacts, film, active = true, requestBusy = false, onAskAgent, onSelectionChange}: TimelineViewProps) {
   const sessionId = session?.sessionId || '';
   const uiKey = `vimax:film-ui:${sessionId}`;
   const [ui, setUi] = useState<FilmUi>(() => {
@@ -61,6 +63,8 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
   const [dirty, setDirty] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [generation, setGeneration] = useState<Generation | null>(null);
+  const [restartDecision, setRestartDecision] = useState<(ShotRestartPlan & {drafts: string}) | null>(null);
+  const [portraitGenerationOpen, setPortraitGenerationOpen] = useState(0);
   const generationRef = useRef(generation);
   generationRef.current = generation;
   const liveProgress = useRef(film.progress);
@@ -75,10 +79,19 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
   const [settingsError, setSettingsError] = useState('');
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [newBrief, setNewBrief] = useState('');
+  const [setInventory, setSetInventory] = useState<SetReferenceInventory | null>(null);
+  const [setInventoryReady, setSetInventoryReady] = useState(false);
+  const [setInventoryError, setSetInventoryError] = useState('');
   const payload = film.data?.acceptance;
   const requiredFrameTypes = payload?.totals.requiredFrameTypes || BRACKETED_FRAMES;
+  const setGateReady = Boolean(setInventoryReady && !setInventoryError && setInventory && generation?.slots.length
+    && generation.slots.every((slot) => {
+      const ids = setInventory.shots.find((shot) => shot.slot === slot)?.setIds;
+      return Boolean(ids?.length && ids.every((id) => setInventory.sets.some((set) => set.id === id && set.state === 'accepted')));
+    }));
   const generationFrameTypes = isHeygenVideoModel(videoSettings?.model) ? FIRST_FRAME_ONLY : BRACKETED_FRAMES;
   const root = payload?.root || '';
+  const portraitRecoverySupported = /(?:^|[\\/])script2video(?:[\\/]|$)/i.test(root);
   const plans = useMemo(() => new Map((film.data?.plans || []).map((plan) => [plan.slot, plan])), [film.data?.plans]);
   const byPath = useMemo(() => new Map(artifacts.map((artifact) => [artifact.path, artifact])), [artifacts]);
   const frameStage = payload?.stages.find((stage) => stage.stage === 'keyframes');
@@ -115,17 +128,24 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
   const trail = useMemo(() => parseRenderTrail(progress?.trail || '').filter((row) => attemptAt === null || renderWrittenAfter(row, attemptAt)), [progress?.trail, attemptAt]);
   const redraw = useMemo(() => activeRedraw(trail), [trail]);
   const failure = useMemo(() => failedRedraw(trail), [trail]);
-  const agentRunning = progress?.activeSessionId === sessionId ? progress.agentRunning : false;
+  const agentRunning = Boolean(requestBusy && progress?.activeSessionId === sessionId && progress.agentRunning);
   const currentStatus = attemptAt === null || renderWrittenAfter(progress?.status, attemptAt) ? progress?.status : undefined;
   const activity = renderActivity(currentStatus, {agentRunning, lastProgressAt: progress?.lastProgressAt});
   const statusLine = renderStatusLine(currentStatus, {agentRunning, lastProgressAt: progress?.lastProgressAt});
   const rendering = activity === 'running';
   const waiting = Boolean(asked);
-  const frozen = Boolean(busy) || rendering || waiting;
+  const frozen = Boolean(busy) || requestBusy || rendering || waiting;
   const missingFrameTypes = requiredFrameTypes.filter((type) => !(reviewSlot?.artifacts || []).some((artifact) => artifact.endsWith(`/${type}.png`)));
   const incomplete = reviewStage === 'keyframes' && missingFrameTypes.length > 0;
   const locked = reviewSlot?.state === 'accepted';
   const selectedIdentity = `${sessionId}:${root}:${selected?.slot || ''}`;
+  const restartRead = useRef(0);
+  const restartScope = useRef({identity: selectedIdentity, busy: frozen || requestBusy});
+  restartScope.current = {identity: selectedIdentity, busy: frozen || requestBusy};
+  useEffect(() => {
+    restartRead.current += 1;
+    setRestartDecision(null);
+  }, [selectedIdentity, active]);
 
   function remember(patch: Partial<FilmUi>) {
     const next = {...uiRef.current, ...patch};
@@ -168,6 +188,23 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
     else setSettingsLoading(false);
   }, [sessionId]);
   useEffect(() => {
+    let current = true;
+    setSetInventoryReady(false);
+    setSetInventoryError('');
+    if (!sessionId || !root) return () => {current = false;};
+    void readSetReferences(sessionId, root).then((inventory) => {
+      if (!current) return;
+      setSetInventory(inventory);
+      setSetInventoryReady(true);
+    }).catch((reason) => {
+      if (!current) return;
+      setSetInventory(null);
+      setSetInventoryError(reason instanceof Error ? reason.message : String(reason));
+      setSetInventoryReady(true);
+    });
+    return () => {current = false;};
+  }, [sessionId, root, film.progress?.revision, film.data?.sets?.revision]);
+  useEffect(() => {
     if (!active) {
       videoRef.current?.pause();
       setExpanded(false);
@@ -201,9 +238,9 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
     return () => window.removeEventListener('keydown', escape);
   }, [expanded]);
   useEffect(() => {
-    if (!generation && !expanded) return;
+    if (!generation && !expanded && !restartDecision) return;
     const previousFocus = document.activeElement as HTMLElement | null;
-    const dialog = document.querySelector<HTMLElement>(generation ? '.film-generation' : '.film-preview.is-expanded');
+    const dialog = document.querySelector<HTMLElement>(generation || restartDecision ? '.film-generation' : '.film-preview.is-expanded');
     if (!dialog) return;
     const focusable = () => [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), select:not(:disabled), textarea:not(:disabled), input:not(:disabled), [tabindex="0"]')];
     focusable()[0]?.focus();
@@ -218,7 +255,7 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
     };
     document.addEventListener('keydown', trap);
     return () => { document.removeEventListener('keydown', trap); previousFocus?.focus(); };
-  }, [Boolean(generation), expanded]);
+  }, [Boolean(generation), expanded, Boolean(restartDecision)]);
 
   async function mutate(key: string, operation: () => Promise<unknown>): Promise<boolean> {
     if (action.current || !sessionId || !payload) return false;
@@ -278,7 +315,45 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
       }
     });
     if (succeeded && nextSlot) { setDirty(false); remember({selection: nextSlot}); }
-    else if (succeeded && next) setNotice(`No more rendered ${reviewStage === 'clips' ? 'clips' : 'frames'} waiting for review.`);
+  }
+  function openRestart() {
+    if (!selected || frozen || requestBusy) return;
+    if (inspector.current?.dirty() || hasFilmDrafts(sessionId, root, [selected.slot])) {
+      setError('Save or discard this shot’s local draft before restarting. No changes were made.');
+      return;
+    }
+    setError('');
+    const request = ++restartRead.current;
+    const identity = selectedIdentity;
+    setGeneration(null);
+    void getShotRestartPlan({sessionId, root, slot: selected.slot}).then((plan) => {
+      if (!mounted.current || request !== restartRead.current || restartScope.current.identity !== identity || restartScope.current.busy) return;
+      if (inspector.current?.dirty() || hasFilmDrafts(sessionId, root, [plan.slot])) {
+        setError('A local shot draft changed. Save or discard it before restarting. No changes were made.');
+        return;
+      }
+      setRestartDecision({...plan, drafts: filmDraftToken(sessionId, root, [plan.slot])});
+    }).catch((reason) => { if (mounted.current && request === restartRead.current && restartScope.current.identity === identity) setError(reason instanceof Error ? reason.message : String(reason)); });
+  }
+  async function confirmRestart() {
+    const decision = restartDecision;
+    if (!decision || frozen || requestBusy) return;
+    if (inspector.current?.dirty() || hasFilmDrafts(sessionId, root, [decision.slot])
+      || decision.drafts !== filmDraftToken(sessionId, root, [decision.slot])) {
+      setRestartDecision(null);
+      setError('A local shot draft changed. Save or discard it before restarting. No changes were made.');
+      return;
+    }
+    const succeeded = await mutate('restart', async () => {
+      if (!mounted.current || decision.sessionId !== sessionId || decision.root !== root || decision.slot !== selected?.slot
+        || hasFilmDrafts(sessionId, root, [decision.slot]) || decision.drafts !== filmDraftToken(sessionId, root, [decision.slot])) throw new Error('The project, selection, or local draft changed. No changes were made; review the restart again.');
+      await restartShot({sessionId: decision.sessionId, root: decision.root, slot: decision.slot, revision: decision.revision});
+    });
+    setRestartDecision(null);
+    if (succeeded) {
+      if (restartScope.current.identity === `${decision.sessionId}:${decision.root}:${decision.slot}`) setDirty(false);
+      setNotice(`${slotName('keyframes', decision.slot)} restarted. Its editable plan and shared assets were preserved; no generation was started.`);
+    }
   }
   async function saveFeedback(note: string) {
     if (!reviewSlot) throw new Error('The review slot is no longer available.');
@@ -300,6 +375,11 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
     const slots = generationSlots(phase, scope);
     setGeneration({phase, scope, slots, revision: progress?.revision || '', drafts: filmDraftToken(sessionId, root, slots)});
   }
+  function openPortraitGeneration() {
+    if (!portraitRecoverySupported) return;
+    setGeneration(null);
+    setPortraitGenerationOpen((current) => current + 1);
+  }
   async function submitGeneration() {
     const decision = generation;
     if (!decision || !decision.slots.length || frozen || settingsLoading || settingsError || (decision.phase === 'video' ? !videoSettings?.model || !validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, videoSettings.clip_seconds || videoSettings.effective_clip_seconds || '8') : !imageModel)) return;
@@ -312,8 +392,25 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
       const frames = frameMap.get(slot);
       return frames?.state !== 'accepted' || !hasRequiredFrames(frames.artifacts, generationFrameTypes);
     });
-    const portraitGate = decision.phase === 'stills' && payload?.stages.some((stage) => stage.stage === 'portraits' && stage.slots.some((slot) => slot.artifacts.length > 0 && slot.state !== 'accepted'));
-    if (frameGate || portraitGate) { setError(frameGate ? `Accept the required reference frame(s) (${generationFrameTypes.join(', ')}) for each targeted shot before rendering its clip.` : 'Review and accept portraits before generating frames.'); return; }
+    if (decision.phase === 'stills') {
+      if (!setGateReady || !setInventory) {
+        setError(setInventoryError || 'Shot-image generation is locked until fresh set-reference metadata is available and every targeted shot has accepted location references.');
+        return;
+      }
+      try {
+        const latestSets = await readSetReferences(sessionId, root);
+        if (latestSets.revision !== setInventory.revision) {
+          setSetInventory(latestSets);
+          setError('Set references changed while you reviewed this decision. Review the refreshed approvals before generating shot images.');
+          return;
+        }
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        return;
+      }
+    }
+    const portraitGate = decision.phase === 'stills' && (payload?.characters || []).some((character) => character.visible && (!character.complete || character.state !== 'accepted'));
+    if (frameGate || portraitGate) { setError(frameGate ? `Accept the required reference frame(s) (${generationFrameTypes.join(', ')}) for each targeted shot before rendering its clip.` : 'Complete and accept every required visible character portrait set before generating frames.'); return; }
     const video = {...videoSettings};
     const stage = decision.phase === 'video' ? 'clips' : 'keyframes';
     const text = redoRequestText(decision.slots.map((shot) => ({shot, stage, title: slotName(stage, shot), reason: (stage === 'clips' ? clipMap : frameMap).get(shot)?.reason || (stage === 'clips' ? clipMap : frameMap).get(shot)?.note || ''})), root)
@@ -361,12 +458,12 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
   const videoSettingsValid = validHeygenVideoSettings(videoSettings?.model, videoSettings?.resolution, videoSettings?.clip_seconds || videoSettings?.effective_clip_seconds || '8');
   const heygenResolutionOptions = ['480p', '768p'];
   const missingCount = rows.filter((row) => matches(row, 'missing')).length;
-  const targetHasDraft = generation ? hasFilmDrafts(sessionId, root, generation.slots) : false;
+  const phaseModel = generation?.phase === 'video' ? videoSettings?.model : imageModel;
+  const targetHasDraft = Boolean(generation && hasFilmDrafts(sessionId, root, generation.slots));
   const generationBlocked = generation?.phase === 'video' ? generation.slots.some((slot) => {
     const frames = frameMap.get(slot);
     return frames?.state !== 'accepted' || !hasRequiredFrames(frames.artifacts, generationFrameTypes);
-  }) : payload.stages.some((stage) => stage.stage === 'portraits' && stage.slots.some((slot) => slot.artifacts.length > 0 && slot.state !== 'accepted'));
-  const phaseModel = generation?.phase === 'video' ? videoSettings?.model : imageModel;
+  }) : !setGateReady || (payload?.characters || []).some((character) => character.visible && (!character.complete || character.state !== 'accepted'));
   const changedVideoModel = videoSettings?.provider !== savedVideoSettings.current?.provider || videoSettings?.model !== savedVideoSettings.current?.model || videoSettings?.resolution !== savedVideoSettings.current?.resolution || (videoSettings?.clip_seconds || videoSettings?.effective_clip_seconds) !== (savedVideoSettings.current?.clip_seconds || savedVideoSettings.current?.effective_clip_seconds);
   const generationCost = generation?.phase === 'video' && payload.totals.clipCostUsd > 0
     ? `${changedVideoModel ? 'Cost for this new selection is unknown. ' : ''}Saved-settings reference: ≈$${(generation.slots.length * payload.totals.clipSeconds * payload.totals.clipCostUsd).toFixed(2)} for ${generation.slots.length} clip${generation.slots.length === 1 ? '' : 's'} at ${payload.totals.clipSeconds}s. Provider/model changes and other charges can change the actual price.`
@@ -374,11 +471,11 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
 
   return <section className="timeline-view film-workbench">
     <header className="film-toolbar">
-      <div><h2>Film</h2><span>{rows.length} shots · {payload.totals.acceptedKeyframes}/{payload.totals.keyframes} frames accepted · {missingCount} incomplete</span>{rows.some((row) => row.clip?.state !== 'accepted' || !row.clip.artifacts.length) && <span className="reel-section-hint">Accept a rendered clip for every active shot to assemble.</span>}</div>
       <div className="film-toolbar-actions">
         <button className="timeline-action is-primary" disabled={frozen || !rows.length || rows.some((row) => row.clip?.state !== 'accepted' || !row.clip.artifacts.length)} title={rows.every((row) => row.clip?.state === 'accepted' && row.clip.artifacts.length > 0) ? 'Assemble accepted clips into a final film using local FFmpeg.' : 'Accept a rendered clip for every active shot before assembling the film.'} onClick={() => void assemble()}><Film size={14} />{busy === 'assemble' ? 'Assembling…' : 'Assemble'}</button>
         <button className="timeline-action" disabled={Boolean(busy)} onClick={() => void film.refresh().catch(() => {})} aria-label="Refresh film"><RefreshCw size={14} />Refresh</button>
-        <button className="timeline-action is-primary" disabled={frozen || !rows.length} onClick={() => openGeneration(ui.preview === 'clip' ? 'video' : 'stills', selected ? 'selected' : 'missing')}><Plus size={14} />Generate…</button>
+        <CharacterPortraitDecision sessionId={sessionId} root={root} revision={progress?.revision || ''} characters={payload.characters} imageModel={imageModel} portraitImageModel={payload.portraitImageModel} progress={progress} disabled={requestBusy || frozen || settingsLoading || Boolean(settingsError)} openRequest={portraitGenerationOpen} onAskAgent={async (text) => { await onAskAgent(text); film.wake(); }} onRefresh={film.refresh} />
+        <button className="timeline-action is-primary" disabled={frozen || !rows.length && !payload.characters.some((character) => character.visible && !character.complete)} onClick={() => openGeneration(ui.preview === 'clip' ? 'video' : 'stills', selected ? 'selected' : 'missing')}><Plus size={14} />Generate…</button>
       </div>
     </header>
     {statusLine && <p className={`timeline-render-status${rendering ? ' is-active' : ''}`} role="status">{rendering && <RefreshCw size={12} className="is-spinning" />}{statusLine}</p>}
@@ -439,6 +536,7 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
           />}
           {selected && <>
             <ShotPlanPanel key={selectedIdentity} ref={inspector} sessionId={sessionId} root={root} slot={selected.slot} stage={reviewStage} plan={selected.plan} feedback={reviewSlot?.reason || ''} accepted={selected.frames?.state === 'accepted' || selected.clip?.state === 'accepted'} disabled={frozen} canRegenerate={!frozen && (!locked || dirty)} onChanged={film.refresh} onSaveFeedback={saveFeedback} onRegenerate={() => openGeneration(ui.preview === 'clip' ? 'video' : 'stills', 'selected')} onDirtyChange={setDirty} />
+            <div className="plan-actions"><button className="timeline-action" disabled={frozen || requestBusy || dirty} onClick={openRestart}><RotateCcw size={13} />Restart shot…</button></div>
             <details className="film-structure"><summary>Shot structure</summary><p>Order changes invalidate the final film. New shots copy the selected plan; removed media is kept for restoration.</p><div className="plan-actions"><button className="timeline-action" disabled={frozen || !moveTarget(order, selected.slot, 'earlier')} onClick={() => { if (leaveDraft()) void mutate('move', () => moveShot({sessionId, root, slot: selected.slot, direction: 'earlier'})); }}><ChevronUp size={13} />Earlier</button><button className="timeline-action" disabled={frozen || !moveTarget(order, selected.slot, 'later')} onClick={() => { if (leaveDraft()) void mutate('move', () => moveShot({sessionId, root, slot: selected.slot, direction: 'later'})); }}><ChevronDown size={13} />Later</button><button className="timeline-action" disabled={frozen || dirty} onClick={() => void mutate('duplicate', () => createShot({sessionId, root, after: selected.slot, brief: selected.plan?.brief || ''}))}><Copy size={13} />Duplicate</button><button className="timeline-action is-danger" disabled={frozen} onClick={() => { if (window.confirm(`Remove ${slotName('keyframes', selected.slot)} from the film? Its brief, frames and local draft are kept. This invalidates the final film.`)) void mutate('remove', () => removeShot({sessionId, root, slot: selected.slot})); }}><Trash2 size={13} />Remove</button></div><label className="film-feedback"><span>New shot after this one</span><input value={newBrief} onChange={(event) => setNewBrief(event.target.value)} placeholder="What happens in it?" /></label><button className="timeline-action" disabled={frozen || dirty || !newBrief.trim()} onClick={() => void mutate('add', () => createShot({sessionId, root, after: selected.slot, brief: newBrief.trim()})).then((saved) => { if (saved) setNewBrief(''); })}><Plus size={13} />Add shot</button></details>
           </>}
         </> : <div className="film-preview-missing">Select a shot to review its frames, clip and plan.</div>}
@@ -446,7 +544,7 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
     </div>
     <CoverageSection payload={film.data?.continuity} plans={plans} busy={frozen ? busy || 'rendering' : ''} onReview={() => void reviewCoverage()} onAdd={(suggestion) => void mutate('add-suggestion', () => createShot(addSuggestionRequest(sessionId, root, suggestion, [...plans.values()])))} onAddAll={(suggestions) => void mutate('add-all', async () => { const created: string[] = []; for (const [index, suggestion] of suggestions.entries()) { if (!mounted.current) return; const made = await createShot(addSuggestionRequest(sessionId, root, suggestion, [...plans.values()], suggestionAnchor(index, suggestions, created))); created.push(made.created.slot); } })} />
     {generation && <div className="film-generation-backdrop" onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setGeneration(null); }}><section className="film-generation" role="dialog" aria-modal="true" aria-labelledby="film-generation-title"><header><h3 id="film-generation-title">Generation decision</h3><button className="timeline-action" disabled={Boolean(busy)} onClick={() => setGeneration(null)}>Cancel</button></header>
-      <div className="film-generation-fields"><label><span>Phase</span><select autoFocus value={generation.phase} disabled={Boolean(busy)} onChange={(event) => openGeneration(event.target.value as Generation['phase'], generation.scope)}><option value="stills">First & last frames · stills</option><option value="video">Clips · video</option></select></label><label><span>Scope</span><select value={generation.scope} disabled={Boolean(busy)} onChange={(event) => openGeneration(generation.phase, event.target.value as Generation['scope'])}><option value="selected" disabled={!selected}>Selected shot</option><option value="missing">Missing in this phase</option><option value="changes">Needs changes in this phase</option></select></label></div>
+      <div className="film-generation-fields"><label><span>Phase</span><select autoFocus value={generation.phase} disabled={Boolean(busy)} onChange={(event) => event.target.value === 'portraits' ? openPortraitGeneration() : openGeneration(event.target.value as Generation['phase'], generation.scope)}><option value="stills">First & last frames · stills</option><option value="video">Clips · video</option><option value="portraits" disabled={!portraitRecoverySupported}>Character portraits{portraitRecoverySupported ? '' : ' · unavailable for this workflow'}</option></select></label><label><span>Scope</span><select value={generation.scope} disabled={Boolean(busy)} onChange={(event) => openGeneration(generation.phase, event.target.value as Generation['scope'])}><option value="selected" disabled={!selected}>Selected shot</option><option value="missing">Missing in this phase</option><option value="changes">Needs changes in this phase</option></select></label></div>
       <p><strong>Exactly {generation.slots.length} shot{generation.slots.length === 1 ? '' : 's'}</strong>: {generation.slots.map((slot) => `${slotName('keyframes', slot)} [${slot}]`).join(', ') || 'Nothing eligible. Accepted takes are protected.'}</p><p className="plan-hint">Root: <code>{root}</code> · phase: <code>{generation.phase}</code>. {generation.phase === 'stills' ? 'Replaces selected frames and invalidates their clips and final approval.' : 'Replaces selected clips and may rebuild the final assembly; no other clips are requested.'}</p>
       {generation.phase === 'stills' && selected?.clip?.state === 'rejected' && selected.frames?.state !== 'rejected' && <p className="film-warning">This shot has clip feedback, so the renderer currently targets its clip. Save feedback against the frames first if you intend to redraw frames instead.</p>}
       {generation.phase === 'video' ? <>
@@ -473,9 +571,17 @@ function FilmWorkbench({session, artifacts, film, active = true, onAskAgent, onS
         {heygen && !videoSettingsValid && <p className="timeline-error">Correct HeyGen’s resolution and 5–15 second clip duration before submitting.</p>}
       </> : <p>Image model: <strong>{imageModel || 'Loading configuration…'}</strong></p>}
       <p className="film-warning">{generationCost}</p><p className="plan-hint">Video selection is saved to global configuration when you submit, affecting future renders in every project. Credentials are unchanged. Image model is configured globally in Settings. Failed requests are not automatically retried by this workbench.</p>
-      {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? `Accept all required reference frames (${generationFrameTypes.join(', ')}) for each targeted shot first.` : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
+      {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? `Accept all required reference frames (${generationFrameTypes.join(', ')}) for each targeted shot first.` : !setGateReady ? setInventoryError || 'Approve matching set references for every targeted shot before generating its images. Prepare, select and approve them in Assets → Sets.' : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
       {error && <p className="timeline-error" role="alert">{error}</p>}
       <button className="timeline-action is-primary" disabled={frozen || settingsLoading || Boolean(settingsError) || !phaseModel || !generation.slots.length || generationBlocked || targetHasDraft || generation.phase === 'video' && !videoSettingsValid} onClick={() => void submitGeneration()}><RefreshCw size={14} />{busy === 'generate' ? 'Submitting…' : `Generate ${generation.phase} · ${generation.slots.length} shot${generation.slots.length === 1 ? '' : 's'} · ${phaseModel || 'model unavailable'}`}</button>
+    </section></div>}
+    {restartDecision && <div className="film-generation-backdrop" onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setRestartDecision(null); }}><section className="film-generation" role="dialog" aria-modal="true" aria-labelledby="shot-restart-title"><header><h3 id="shot-restart-title">Restart {slotName('keyframes', restartDecision.slot)}?</h3><button className="timeline-action" disabled={Boolean(busy)} onClick={() => setRestartDecision(null)}>Cancel</button></header>
+      <p>This removes this shot’s generated frames, clips, prompts, and approvals, plus cached assembled film(s). The editable shot plan (including descriptions and brief), portraits, set references, and other shots’ media are preserved.</p>
+      {restartDecision.continuityEnabled && <p>Continuous successor frame/clip approvals will need re-review. Final-film approval is invalidated.</p>}
+      <p>Only these files will be removed:</p><ul className="shot-restart-files">{restartDecision.paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
+      <p className="film-warning">This reset cannot be undone. The final film must be rebuilt and reviewed. Restart does not generate frames or clips, make paid calls, or start the agent.</p>
+      {error && <p className="timeline-error" role="alert">{error}</p>}
+      <button className="timeline-action is-primary" disabled={frozen || requestBusy} onClick={() => void confirmRestart()}><RotateCcw size={14} />{busy === 'restart' ? 'Restarting…' : 'Confirm restart'}</button>
     </section></div>}
   </section>;
 }

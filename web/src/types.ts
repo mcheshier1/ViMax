@@ -33,6 +33,8 @@ export type ProjectMetadata = {
 export type ProjectArtifacts = {
   /** Portrait sets (one per character) present on disk. */
   portraits: number;
+  /** Generated location reference images present on disk. */
+  setReferences: number;
   /** Shot directories found on disk. */
   shots: number;
   /** Shots with a rendered first keyframe. */
@@ -84,12 +86,141 @@ export type AcceptanceTotals = {
   clipCostUsd: number;
 };
 
+export type CharacterPortraitViewState = {
+  path?: string;
+  state: 'missing' | 'invalid' | 'ready';
+};
+
+export type FilmCharacter = {
+  identifier: string;
+  scope: string;
+  description: string;
+  visible: boolean;
+  complete: boolean;
+  state: AcceptanceState;
+  views: {
+    front: CharacterPortraitViewState;
+    side: CharacterPortraitViewState;
+    back: CharacterPortraitViewState;
+  };
+};
+
 export type RenderAcceptance = {
   root: string;
   stages: AcceptanceStage[];
   totals: AcceptanceTotals;
+  characters: FilmCharacter[];
+  portraitImageModel: string;
 };
 
+export type ShotRestartPlan = {
+  sessionId: string;
+  root: string;
+  slot: string;
+  revision: string;
+  paths: string[];
+  continuityEnabled: boolean;
+};
+export type SetReferenceCandidate = {
+  id: string;
+  imagePath: string;
+  state: 'ready' | 'stale' | 'invalid';
+  prompt?: string;
+};
+
+export type SetReference = {
+  id: string;
+  name: string;
+  description: string;
+  shots: string[];
+  state: AcceptanceState;
+  imagePath?: string;
+  imageModel?: string;
+  candidates: SetReferenceCandidate[];
+  selectedCandidateId?: string;
+  revision: string;
+};
+
+export type SetReferenceShot = {slot: string; brief: string; setIds: string[]};
+
+export type SetReferenceInventory = {
+  sessionId: string;
+  root: string;
+  revision: string;
+  imageModel: string;
+  style: string;
+  sets: SetReference[];
+  shots: SetReferenceShot[];
+  unassignedShots: string[];
+};
+
+export type SetReferenceSelectionRequest = {
+  sessionId: string;
+  root: string;
+  id: string;
+  candidateId: string;
+  revision: string;
+};
+
+export type SetReferenceUpdateRequest = {
+  sessionId: string;
+  root: string;
+  id: string;
+  name: string;
+  description: string;
+  shots: string[];
+  revision: string;
+};
+
+export type SetReferenceAcceptanceRequest = {
+  sessionId: string;
+  root: string;
+  id: string;
+  revision: string;
+  accepted: boolean;
+  reason?: string;
+};
+
+export type ShotPlan = {
+  slot: string;
+  root: string;
+  /** The one-line brief the shot came from. */
+  brief: string;
+  characters: {idx: number; name: string}[];
+  firstFrame: PlanFrame;
+  lastFrame: PlanFrame;
+  motionDescription: string;
+  sets: Array<{id: string; name: string; accepted: boolean}>;
+  setIds: string[];
+  setRevision: string;
+  reusePreviousLastFrame: boolean;
+  previousSlot: string | null;
+  previousLastFrameAvailable: boolean;
+};
+
+export type PlanFrame = {
+  description: string;
+  /** Indices of the characters this frame shows. */
+  visible: number[];
+  /** The prompt the frame was last drawn from, as it was sent. Empty until it is drawn. */
+  prompt: string;
+};
+
+export type ShotPlanUpdateRequest = {
+  sessionId: string;
+  root: string;
+  slot: string;
+  ffDesc?: string;
+  lfDesc?: string;
+  ffVis?: number[];
+  lfVis?: number[];
+  brief?: string;
+  motionDesc?: string;
+  setIds?: string[];
+  setRevision?: string;
+  reusePreviousLastFrame?: boolean;
+  previousSlot?: string | null;
+};
 /** One row of the render's trail: either a phase decision or a pipeline progress note. */
 export type RenderEvent = {
   timestamp?: string;
@@ -102,25 +233,6 @@ export type RenderEvent = {
   awaiting_confirmation?: string;
 };
 
-/** What one shot's frames describe and show, with the characters the root can draw. */
-export type ShotPlan = {
-  slot: string;
-  root: string;
-  /** The one-line brief the shot came from. */
-  brief: string;
-  characters: {idx: number; name: string}[];
-  firstFrame: PlanFrame;
-  lastFrame: PlanFrame;
-  motionDescription: string;
-};
-
-export type PlanFrame = {
-  description: string;
-  /** Indices of the characters this frame shows. */
-  visible: number[];
-  /** The prompt the frame was last drawn from, as it was sent. Empty until it is drawn. */
-  prompt: string;
-};
 
 /** A shot taken out of the film, and what is kept for it. */
 export type RemovedShot = {slot: string; files: number; hasBrief: boolean};
@@ -184,15 +296,6 @@ export type ContinuityPayload = {
   clipSeconds: number;
 };
 
-export type ShotPlanUpdateRequest = {
-  sessionId: string;
-  root: string;
-  slot: string;
-  ffDesc?: string;
-  lfDesc?: string;
-  ffVis?: number[];
-  lfVis?: number[];
-};
 
 export type AcceptanceUpdateRequest = {
   sessionId: string;
@@ -228,8 +331,11 @@ export type ConfigSection = {
   base_url: string;
   api_key: string;
   has_api_key: boolean;
+  configured_api_key_providers?: string[];
+  api_key_updates?: Record<string, string>;
   provider?: string;
   resolution?: string;
+  effective_resolution?: string;
   clip_seconds?: string;
   effective_clip_seconds?: string;
   generate_audio?: string;
@@ -239,6 +345,14 @@ export type AgentConfig = {
   sections: Record<'llm' | 'image' | 'video' | 'embedding' | 'reranker', ConfigSection>;
 };
 
+export type ArtifactPortrait = {
+  active: boolean;
+  accepted: boolean;
+  character?: string;
+  view: 'front' | 'side' | 'back';
+  registryPath?: string;
+};
+
 export type Artifact = {
   path: string;
   name: string;
@@ -246,7 +360,73 @@ export type Artifact = {
   size: number;
   updatedAt: string;
   url: string;
+  portrait?: ArtifactPortrait;
+  promptPath?: string;
 };
+export type AssetDeletionPlan = {
+  path: string;
+  revision: string;
+  impacts: string[];
+};
+
+export type AssetsDeletionPlan = {
+  paths: string[];
+  revision: string;
+  impacts: string[];
+};
+
+export type AssetDeletionResponse = {
+  deletedPath: string;
+  artifacts: Artifact[];
+};
+
+export type AssetsDeletionResponse = {
+  deletedPaths: string[];
+  artifacts: Artifact[];
+};
+
+export type AssetDeletionRequest = {
+  sessionId: string;
+  path: string;
+  revision: string;
+};
+
+export type AssetsDeletionRequest = {
+  sessionId: string;
+  paths: string[];
+  revision: string;
+};
+export type PortraitCharacterOption = {
+  identifier: string;
+  idx: number;
+  scope: string;
+  active: boolean;
+  accepted: boolean;
+};
+
+export type PortraitOptions = {
+  root: string;
+  revision: string;
+  sourcePath: string;
+  paths: {front: string; side: string; back: string};
+  complete: boolean;
+  characters: PortraitCharacterOption[];
+};
+
+export type PortraitMutationResponse = {
+  artifacts: Artifact[];
+  options: PortraitOptions;
+};
+
+export type PortraitMutationRequest = {
+  sessionId: string;
+  root: string;
+  scope: string;
+  character: string;
+  sourcePath: string;
+  revision: string;
+};
+
 
 export type WorkspaceUpload = {
   name: string;

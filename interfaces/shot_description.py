@@ -18,8 +18,8 @@ class ShotBriefDescription(BaseModel):
         examples=[0, 1, 2],
     )
     visual_desc: str = Field(
-        description='''A vivid and detailed visual description of the shot that convey rich visual information through text. The character identifiers in the description must match those in the character list and be enclosed in angle brackets (e.g., <Alice>, <Bob>). All visible characters should be described.
-        If there is a conversation, please write down the content of the conversation), when you meet some dialogue, you should write into the visual content description with :" " symbols and the character's features (eg. <SLING> (male, late 20s, Texan accent softened by military precision, confident and energetic.) says: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). 
+        description='''A concise, filmable shot description using present-tense action, location, framing, and canonical character names. Character identifiers must match the character list and be enclosed in angle brackets (e.g., <Alice>, <Bob>). Name all visible characters rather than substituting appearance-based labels or repeating profiles. Include only brief costume, prop, or physical details essential to this shot.
+        Preserve dialogue verbatim and attribute it to the named speaker (e.g., <SLING>: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). Parentheticals are for essential delivery or action, not biographies.
         ''',
         examples=[
             "An over-the-shoulder shot at eye level, positioned behind <Alice>. The foreground, including <Alice>'s shoulder and head, is softly blurred, directing focus onto <Bob>'s face. <Bob>'s subtle reactions—shifting from surprise to delight—are clearly visible. The supermarket background is gently blurred with cool fluorescent lighting.",
@@ -102,8 +102,8 @@ class ShotDescription(BaseModel):
         examples=[0, 1, 2],
     )
     visual_desc: str = Field(
-        description='''A vivid and detailed visual description of the shot that convey rich visual information through text. The character identifiers in the description must match those in the character list and be enclosed in angle brackets (e.g., <Alice>, <Bob>).
-        If there is a conversation, please write down the content of the conversation), when you meet some dialogue, you should write into the visual content description with :" " symbols and the character's features (eg. <SLING> (male, late 20s, Texan accent softened by military precision, confident and energetic.) says: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). ''',
+        description='''A concise, filmable shot description using present-tense action, location, framing, and canonical character names. Character identifiers must match the character list and be enclosed in angle brackets (e.g., <Alice>, <Bob>). Do not replace names with appearance-based labels or repeat character profiles; keep only brief shot-essential costume, prop, or physical details.
+        Preserve dialogue verbatim and attribute it to the named speaker (e.g., <SLING>: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). Parentheticals are for essential delivery or action, not biographies.''',
         examples=[
             "An over-the-shoulder shot at eye level, positioned behind <Alice>. The foreground, including <Alice>'s shoulder and head, is softly blurred, directing focus onto <Bob>'s face. <Bob>'s subtle reactions—shifting from surprise to delight—are clearly visible. The supermarket background is gently blurred with cool fluorescent lighting.",
         ]
@@ -123,14 +123,11 @@ class ShotDescription(BaseModel):
     )
 
     ff_desc: str = Field(
-        description="The first frame of the shot.",
+        description="A static first-frame description using canonical character names, location, framing, composition, and initial poses; no repeated character profiles.",
         examples=[
-            "Medium shot of a supermarket aisle at eye level. Bob(a tall man wearing a blue shirt and jeans) is positioned on the right side of the frame, captured in profile and facing right, while Alice(a young woman with short hair, wearing a green dress) is on the left, shown pushing a shopping cart with her gaze lowered toward the ground. They are arranged in a front-to-back spatial relationship. Shelves line both sides of the frame, and cool-toned fluorescent lighting from above washes over the scene. The vibrant colors of product packaging contrast with the metallic gray of the shopping cart, all contained within a stable, horizontally balanced composition.",
-            "Extreme long shot. Aerial view from hundreds of meters above the ground. The boundless golden desert resembles undulating frozen waves, occupying the vast majority of the frame. At the very center of the image, a tiny, solitary explorer appears only as a faint dark speck, dragging a long, lonely trail of footprints behind him, stretching all the way to the edge of the frame.",
-            "Medium shot at eye level angle. Designer A(with a beard, wearing a white suit) leans forward passionately, speaking emphatically. Product Manager B(with a beard, wearing a white T-shirt) sits with crossed arms, looking skeptical. Between them, Development Engineer C(brown hair, wearing a blue T-shirt) appears anxious, glancing between the two. Project Manager D(curly hair, wearing a red T-shirt) prepares to mediate, focusing on a whiteboard. Bright overhead lighting highlights their expressions, with a blurred whiteboard and glass wall in the background.",
-            "A low-angle close-up shot captures the figure from below, framing him from the chest up. His face appears resolute and commanding, his eyes piercing as he speaks passionately. Flecks of saliva are visible, emphasizing his intensity. The overcast sky breaks with occasional light, casting him as a heroic, almost monumental figure against the gloom.",
-            "An extremely close-up of an old, motionless pocket watch. Soft light highlights scratches on its brass case and the enamel dial with Roman numerals. The second hand remains fixed at 'VIII', casting a sharp shadow. A wrinkled finger gently touches the glass surface, evoking a tangible sense of stillness and time.",
-            "An over-the-shoulder shot at eye level, positioned behind Character A(red hair, wearing a white T-shirt). The foreground, including A's shoulder and head, is softly blurred, directing focus onto Character B(with a beard, wearing a white T-shirt)'s face. B's subtle reactions—shifting from surprise to confusion, then to a glimmer of understanding—are clearly visible. The café background is gently blurred with warm lighting.",
+            "Medium shot at eye level in a supermarket aisle. <Bob> stands on the right in profile, facing right. <Alice> stands on the left behind a shopping cart, looking down. Shelves line both sides under cool fluorescent lighting.",
+            "Medium shot at eye level in a meeting room. <Designer A> leans toward <Product Manager B>, who sits with crossed arms. <Development Engineer C> looks between them. <Project Manager D> faces the whiteboard. A glass wall is visible behind them.",
+            "Over-the-shoulder shot at eye level in a cafe, behind <Alice>. <Alice>'s shoulder is softly blurred in the foreground; <Bob> faces her across the table. Warm lighting falls across the cafe background.",
         ]
     )
     ff_vis_char_idxs: List[int] = Field(
@@ -142,16 +139,25 @@ class ShotDescription(BaseModel):
             [],
         ],
     )
+    set_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional explicit editor binding to known set-reference IDs. None inherits assignments from set descriptors; [] selects no sets and blocks new frame generation. Leave unset during shot planning unless canonical set IDs are already known.",
+    )
+
+    reuse_previous_last_frame: Optional[bool] = Field(
+        default=None,
+        description="When set, explicitly copy the previous active playback shot's last frame as this shot's first frame, or explicitly disable that reuse.",
+    )
+
     lf_desc: str = Field(
-        description="The last frame of the shot.",
+        description="A static last-frame description using canonical character names, location, framing, composition, and final poses; no repeated character profiles.",
     )
     lf_vis_char_idxs: List[int] = Field(
         default=[],
         description="The indices of the characters in the last frame.",
     )
     motion_desc: str = Field(
-        description='''The motion description of the shot.
-        If there is a conversation, please write down the content of the conversation), when you meet some dialogue, you should write into the visual content description with :" " symbols and the character's features (eg. SLING (male, late 20s, Texan accent softened by military precision, confident and energetic.) says: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). If there is a narration, you should write into the visual content description with :" " symbols and the narration's features (eg. Narration: "Everything is looking good. "). ''',
+        description='''Concise present-tense camera movement and on-screen action using canonical character names rather than appearance-based labels or repeated profiles. Preserve spoken dialogue verbatim with named speaker cues (e.g., <SLING>: "Gear retracted."). Use short parentheticals only for essential delivery or action. Label narration separately (e.g., Narration: "Everything is looking good.").''',
     )
 
     # audio

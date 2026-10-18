@@ -8,7 +8,7 @@
  */
 
 import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rm, utimes, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
@@ -235,7 +235,14 @@ describe('reading a coverage review', () => {
 
   it('accepts a review that covers the shots the film has', async () => {
     const {root, working} = await fixture();
-    await writeReview(working, {reviewed_at: new Date().toISOString(), shots_reviewed: [2, 4], beats: [], suggestions: []});
+    // Legacy review freshness compares filesystem mtimes, which can have
+    // sub-millisecond precision. Make source-before-review ordering explicit.
+    const sourceAt = new Date('2020-01-01T00:00:00Z');
+    await Promise.all([
+      'characters.json', 'camera_tree.json', 'storyboard.json',
+      'shots/2/shot_description.json', 'shots/4/shot_description.json',
+    ].map((relative) => utimes(path.join(working, ROOT, relative), sourceAt, sourceAt)));
+    await writeReview(working, {reviewed_at: '2020-01-01T00:00:01Z', shots_reviewed: [2, 4], beats: [], suggestions: []});
 
     const payload = await readContinuityReview(root, SESSION_ID, ROOT);
 
@@ -434,6 +441,10 @@ describe('idea scene timeline storage', () => {
     const listed = await readShotPlans(root, SESSION_ID, 'idea2video');
 
     expect(listed.plans.map((plan) => plan.slot)).toEqual(['scene_0/4', 'scene_0/2', 'scene_1/2']);
+    expect(listed.plans.map(({slot, previousSlot}) => [slot, previousSlot])).toEqual([
+      ['scene_0/4', null], ['scene_0/2', 'scene_0/4'], ['scene_1/2', 'scene_0/2'],
+    ]);
+    expect(listed.plans.find((plan) => plan.slot === 'scene_1/2').previousLastFrameAvailable).toBe(false);
     expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_0/2')).characters.map((character) => character.name)).toEqual(['Scene Zero']);
     expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_1/2')).characters.map((character) => character.name)).toEqual(['Scene One']);
 

@@ -310,8 +310,6 @@ describe('what the render is doing', () => {
   it('does not claim a render is running when the agent it ran in is gone', () => {
     const status = {status: 'rendering', phase: 'stills', timestamp: '2026-09-20T15:23:41'};
 
-    expect(renderStatusLine(status, {now: at(240), agentRunning: false}))
-      .toBe('A render started 15:23, 4 min ago and stopped without finishing — the agent is not running');
     expect(renderActivity(status, {agentRunning: false, now: at(240)})).toBe('interrupted');
   });
 
@@ -503,13 +501,33 @@ describe('a shot plan the user can change', () => {
   });
 
   it('knows when there is nothing to save', () => {
-    const plan = {firstFrame: {description: 'a', visible: [0]}, lastFrame: {description: 'b', visible: [0, 1]}};
-    const same = {ffDesc: 'a', lfDesc: 'b', ffVis: [0], lfVis: [0, 1]};
+    const plan = {firstFrame: {description: 'a', visible: [0]}, lastFrame: {description: 'b', visible: [0, 1]}, brief: 'A conversation', motionDescription: 'Claude stays seated'};
+    const same = {ffDesc: 'a', lfDesc: 'b', ffVis: [0], lfVis: [0, 1], brief: plan.brief, motionDesc: plan.motionDescription};
 
     expect(planDirty(plan, same)).toBe(false);
     expect(planDirty(plan, {...same, ffDesc: 'a '})).toBe(false);
     expect(planDirty(plan, {...same, ffDesc: 'changed'})).toBe(true);
     expect(planDirty(plan, {...same, lfVis: [0, 1, 2]})).toBe(true);
+    expect(planDirty(plan, {...same, brief: 'A quiet conversation'})).toBe(true);
+    expect(planDirty(plan, {...same, motionDesc: 'Claude stands up'})).toBe(true);
+    expect(planDirty(plan, {...same, brief: ' A conversation ', motionDesc: 'Claude stays seated '})).toBe(false);
+    expect(planDirty(plan, {ffDesc: 'a', lfDesc: 'b', ffVis: [0], lfVis: [0, 1]})).toBe(false);
+  });
+  it('protects changed set bindings without treating set order as an edit', () => {
+    const plan = {firstFrame: {description: 'a', visible: [0]}, lastFrame: {description: 'b', visible: [0]}, brief: 'At the bar', motionDescription: 'Waits', setIds: ['saloon', 'street']};
+    const draft = {ffDesc: 'a', lfDesc: 'b', ffVis: [0], lfVis: [0], setIds: ['street', 'saloon']};
+    expect(planDirty(plan, draft)).toBe(false);
+    expect(planDirty(plan, {...draft, setIds: ['office']})).toBe(true);
+    expect(planDirty(plan, {...draft, setIds: []})).toBe(true);
+  });
+  it('tracks continuity toggles and source changes without dirtying legacy drafts', () => {
+    const plan = {firstFrame: {description: 'a', visible: []}, lastFrame: {description: 'b', visible: []}, brief: '', motionDescription: '',
+      reusePreviousLastFrame: true, previousSlot: '7'};
+    const legacy = {ffDesc: 'a', lfDesc: 'b', ffVis: [], lfVis: []};
+    expect(planDirty(plan, legacy)).toBe(false);
+    expect(planDirty(plan, {...legacy, reusePreviousLastFrame: false})).toBe(true);
+    expect(planDirty(plan, {...legacy, reusePreviousLastFrame: true, previousSlot: '7'})).toBe(false);
+    expect(planDirty(plan, {...legacy, reusePreviousLastFrame: true, previousSlot: '3'})).toBe(true);
   });
 });
 

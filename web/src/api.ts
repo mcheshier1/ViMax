@@ -1,4 +1,4 @@
-import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, ContinuityPayload, JsonValue, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, ShotPlan, ShotPlanUpdateRequest, WorkspaceUpload} from './types';
+import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, AssetDeletionPlan, AssetDeletionRequest, AssetDeletionResponse, AssetsDeletionPlan, AssetsDeletionRequest, AssetsDeletionResponse, ContinuityPayload, JsonValue, Message, PortraitMutationRequest, PortraitMutationResponse, PortraitOptions, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, SetReferenceAcceptanceRequest, SetReferenceInventory, SetReferenceSelectionRequest, SetReferenceUpdateRequest, ShotPlan, ShotPlanUpdateRequest, ShotRestartPlan, WorkspaceUpload} from './types';
 import type {FilmProgress, FilmSnapshot} from './filmSession';
 
 export async function getSessions() {
@@ -33,6 +33,35 @@ export async function getArtifacts(sessionId: string) {
   return request<{artifacts: Artifact[]}>(`/api/artifacts?session=${encodeURIComponent(sessionId)}`);
 }
 
+export async function getAssetDeletionPlan(sessionId: string, path: string) {
+  const query = new URLSearchParams({session: sessionId, path});
+  return request<AssetDeletionPlan>(`/api/asset-deletion?${query}`);
+}
+
+export async function deleteAsset(payload: AssetDeletionRequest) {
+  return request<AssetDeletionResponse>('/api/artifacts', {method: 'DELETE', body: JSON.stringify(payload)});
+}
+
+export async function getAssetsDeletionPlan(sessionId: string, paths: string[]) {
+  return request<AssetsDeletionPlan>('/api/assets/deletion-plan', {method: 'POST', body: JSON.stringify({sessionId, paths})});
+}
+
+export async function deleteAssets(payload: AssetsDeletionRequest) {
+  return request<AssetsDeletionResponse>('/api/assets', {method: 'DELETE', body: JSON.stringify(payload)});
+}
+
+export async function getPortraitOptions(sessionId: string, sourcePath: string) {
+  return request<PortraitOptions>(`/api/portrait-options?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(sourcePath)}`);
+}
+
+export async function selectPortraitSet(payload: PortraitMutationRequest) {
+  return request<PortraitMutationResponse>('/api/portrait-selection', {method: 'POST', body: JSON.stringify(payload)});
+}
+
+export async function approvePortraitSet(payload: PortraitMutationRequest) {
+  return request<PortraitMutationResponse>('/api/portrait-approval', {method: 'POST', body: JSON.stringify(payload)});
+}
+
 export async function readFilmSnapshot(sessionId: string, root = '', signal?: AbortSignal) {
   const query = new URLSearchParams({session: sessionId, root});
   return request<FilmSnapshot>(`/api/film?${query}`, {signal, cache: 'no-store'});
@@ -56,6 +85,21 @@ export async function updateAcceptance(payload: AcceptanceUpdateRequest) {
   return request<RenderAcceptance>('/api/acceptance', {method: 'PUT', body: JSON.stringify(payload)});
 }
 
+export async function readSetReferences(sessionId: string, root = '') {
+  return request<SetReferenceInventory>(`/api/set-references?session=${encodeURIComponent(sessionId)}&root=${encodeURIComponent(root)}`);
+}
+
+export async function updateSetReference(payload: SetReferenceUpdateRequest) {
+  return request<SetReferenceInventory>('/api/set-references', {method: 'PUT', body: JSON.stringify(payload)});
+}
+
+export async function selectSetReference(payload: SetReferenceSelectionRequest) {
+  return request<SetReferenceInventory>('/api/set-references/selection', {method: 'PUT', body: JSON.stringify(payload)});
+}
+
+export async function updateSetReferenceAcceptance(payload: SetReferenceAcceptanceRequest) {
+  return request<SetReferenceInventory>('/api/set-references/acceptance', {method: 'PUT', body: JSON.stringify(payload)});
+}
 export type AssembleRequest = {sessionId: string; root: string; revision?: string};
 export type AssembleResponse = {path: string; reused: boolean; shotCount: number};
 
@@ -153,6 +197,17 @@ export async function moveShot(payload: {sessionId: string; root: string; slot: 
 /** Put a removed shot back into the film. */
 export async function restoreShot(payload: {sessionId: string; root: string; slot: string}) {
   return request<RenderAcceptance>('/api/shot-plan', {method: 'PATCH', body: JSON.stringify(payload)});
+}
+
+/** Clear a shot's generated outputs and approvals while retaining its editable plan. */
+export async function restartShot(payload: {sessionId: string; root: string; slot: string; revision: string}) {
+  return request<{ok: true; restarted: string; root: string}>('/api/shot-restart', {method: 'POST', body: JSON.stringify(payload)});
+}
+
+/** Read the exact impact and revision for a shot restart confirmation. */
+export async function getShotRestartPlan(payload: {sessionId: string; root: string; slot: string}) {
+  const query = new URLSearchParams({session: payload.sessionId, root: payload.root, slot: payload.slot});
+  return request<ShotRestartPlan>(`/api/shot-restart?${query}`);
 }
 
 export async function startAgent(options: {sessionId?: string; newSession?: boolean; projectName?: string; style?: string; userRequirement?: string}) {

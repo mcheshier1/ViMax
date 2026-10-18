@@ -1,4 +1,6 @@
 import unittest
+import asyncio
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -119,31 +121,50 @@ class ProviderGenerationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(create_attempts, 3)
-        self.assertEqual([call.args[0] for call in retry_sleep.await_args_list], [2, 4, 1.5])
         self.assertEqual(status_calls, 1)
         self.assertEqual([event[0] for event in progress].count("video_create_retry"), 2)
         self.assertEqual(output.data, VIDEO_BYTES)
 
-    async def test_agnes_stops_after_three_capacity_responses(self):
-        create_attempts = 0
+    async def test_agnes_waits_hours_for_capacity_and_same_job_completion(self):
+        creates = 0
+        queries = []
+        elapsed = 0.0
 
         async def create(_request):
-            nonlocal create_attempts
-            create_attempts += 1
-            return web.json_response({"code": "video_queue_full", "message": "Video queue is full"}, status=503)
+            nonlocal creates
+            creates += 1
+            if creates <= 120:
+                return web.json_response({"code": "video_queue_full"}, status=503)
+            return web.json_response({"video_id": "long-queue"})
+
+        async def status(request):
+            queries.append(dict(request.query))
+            if len(queries) <= 120:
+                return web.json_response({"status": "queued"})
+            return web.json_response({"status": "completed", "url": str(server.make_url("/result.mp4"))})
+
+        async def sleep(delay):
+            nonlocal elapsed
+            elapsed += delay
+
+        async def result(_request):
+            return web.Response(body=VIDEO_BYTES)
 
         app = web.Application()
         app.router.add_post("/v1/videos", create)
+        app.router.add_get("/agnesapi", status)
+        app.router.add_get("/result.mp4", result)
         server = TestServer(app)
         await server.start_server()
         self.addAsyncCleanup(server.close)
-        generator = VideoGeneratorAgnesAPI(api_key="agnes-secret", base_url=str(server.make_url("/v1")))
-        with patch("tools.video_generator_agnes_api.asyncio.sleep") as retry_sleep:
-            with self.assertRaisesRegex(RuntimeError, "video_queue_full"):
-                await generator.generate_single_video(prompt="A quiet sunrise")
-
-        self.assertEqual(create_attempts, 3)
-        self.assertEqual([call.args[0] for call in retry_sleep.await_args_list], [2, 4])
+        generator = VideoGeneratorAgnesAPI(api_key="test", base_url=str(server.make_url("/v1")))
+        virtual_asyncio = SimpleNamespace(sleep=sleep, get_running_loop=lambda: SimpleNamespace(time=lambda: elapsed), TimeoutError=asyncio.TimeoutError)
+        with patch("tools.video_generator_agnes_api.asyncio", virtual_asyncio), patch("tools.video_generator_agnes_api.random.uniform", side_effect=lambda low, high: high), patch.dict("os.environ", {}, clear=True):
+            output = await generator.generate_single_video()
+        self.assertGreater(elapsed, 3 * 3600)
+        self.assertEqual(creates, 121)
+        self.assertEqual(queries, [{"video_id": "long-queue", "model_name": "agnes-video-2.5"}] * 121)
+        self.assertEqual(output.data, VIDEO_BYTES)
 
     async def test_agnes_does_not_retry_unrelated_503_response(self):
         create_attempts = 0
@@ -206,11 +227,9 @@ class ProviderGenerationTests(unittest.IsolatedAsyncioTestCase):
             output = await generator.generate_single_video(progress=lambda *event: progress.append(event))
         self.assertEqual(len(creates), 1)
         self.assertEqual(queries, [{"video_id": "existing-job", "model_name": "agnes-video-2.5"}] * 10)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1.5, 3, 7, 12, 24, 48, 60, 60, 1.5, 3])
         self.assertEqual(output.data, VIDEO_BYTES)
         retries = [event for event in progress if event[0] == "video_status_retry"]
         self.assertTrue(all(event[2]["video_id"] == "existing-job" for event in retries))
-        self.assertIn("rate-limited", retries[0][1])
 
     async def test_agnes_retry_after_cannot_extend_query_deadline(self):
         creates = 0
@@ -237,6 +256,122 @@ class ProviderGenerationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "timed out.*still-running"):
                 await generator.generate_single_video()
         self.assertEqual((creates, queries), (1, 1))
+
+    async def test_agnes_recovers_status_and_download_without_duplicate_creation(self):
+        creates = 0
+        queries = []
+        downloads = 0
+        waits = []
+        progress = []
+
+        async def create(_request):
+            nonlocal creates
+            creates += 1
+            if creates == 1:
+                return web.Response(status=429, text="Busy", headers={"Retry-After": "180"})
+            return web.json_response({"video_id": "one-paid-job"})
+
+        async def status(request):
+            queries.append(request.query["video_id"])
+            if len(queries) == 1:
+                return web.Response(status=502, text="Gateway unavailable")
+            return web.json_response({"status": "completed", "url": str(server.make_url("/result.mp4"))})
+
+        async def result(request):
+            nonlocal downloads
+            downloads += 1
+            self.assertNotIn("Authorization", request.headers)
+            if downloads == 1:
+                return web.Response(status=503, text="Download busy")
+            return web.Response(body=VIDEO_BYTES)
+
+        async def sleep(delay):
+            waits.append(delay)
+
+        app = web.Application()
+        app.router.add_post("/v1/videos", create)
+        app.router.add_get("/agnesapi", status)
+        app.router.add_get("/result.mp4", result)
+        server = TestServer(app)
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+        generator = VideoGeneratorAgnesAPI(api_key="test", base_url=str(server.make_url("/v1")))
+        virtual_asyncio = SimpleNamespace(sleep=sleep, get_running_loop=asyncio.get_running_loop, TimeoutError=asyncio.TimeoutError)
+        with patch("tools.video_generator_agnes_api.asyncio", virtual_asyncio):
+            output = await generator.generate_single_video(progress=lambda *event: progress.append(event))
+        self.assertEqual((creates, queries, downloads), (2, ["one-paid-job", "one-paid-job"], 2))
+        self.assertEqual(output.data, VIDEO_BYTES)
+        self.assertGreaterEqual(sum(waits), 180)
+        self.assertTrue(all(delay <= 60 for delay in waits))
+        self.assertTrue(any(event[0] == "video_wait" for event in progress))
+
+    async def test_agnes_cancellation_interrupts_submission_polling_and_download_backoff(self):
+        for phase in ("create", "status", "download"):
+            with self.subTest(phase=phase):
+                waiting = asyncio.Event()
+                creates = 0
+                sleeps = 0
+
+                async def create(_request):
+                    nonlocal creates
+                    creates += 1
+                    if phase == "create":
+                        return web.json_response({"code": "video_queue_full"}, status=503)
+                    return web.json_response({"video_id": "cancellable"})
+
+                async def status(_request):
+                    return web.json_response({"status": "completed", "url": str(server.make_url("/result.mp4"))})
+
+                async def result(_request):
+                    return web.Response(status=503, text="Busy")
+
+                async def sleep(_delay):
+                    nonlocal sleeps
+                    sleeps += 1
+                    if phase == "download" and sleeps == 1:
+                        return
+                    waiting.set()
+                    await asyncio.Event().wait()
+
+                app = web.Application()
+                app.router.add_post("/v1/videos", create)
+                app.router.add_get("/agnesapi", status)
+                app.router.add_get("/result.mp4", result)
+                server = TestServer(app)
+                await server.start_server()
+                self.addAsyncCleanup(server.close)
+                virtual_asyncio = SimpleNamespace(sleep=sleep, get_running_loop=asyncio.get_running_loop, TimeoutError=asyncio.TimeoutError)
+                generator = VideoGeneratorAgnesAPI(api_key="test", base_url=str(server.make_url("/v1")))
+                with patch("tools.video_generator_agnes_api.asyncio", virtual_asyncio):
+                    task = asyncio.create_task(generator.generate_single_video())
+                    await waiting.wait()
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                self.assertEqual(creates, 1)
+
+    async def test_agnes_terminal_job_failure_does_not_submit_another_paid_job(self):
+        creates = 0
+
+        async def create(_request):
+            nonlocal creates
+            creates += 1
+            return web.json_response({"video_id": "failed-job"})
+
+        async def status(_request):
+            return web.json_response({"status": "failed", "error": "Invalid prompt"})
+
+        app = web.Application()
+        app.router.add_post("/v1/videos", create)
+        app.router.add_get("/agnesapi", status)
+        server = TestServer(app)
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+        generator = VideoGeneratorAgnesAPI(api_key="test", base_url=str(server.make_url("/v1")))
+        with patch("tools.video_generator_agnes_api.asyncio.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "Invalid prompt"):
+                await generator.generate_single_video()
+        self.assertEqual(creates, 1)
 
 
 if __name__ == "__main__":

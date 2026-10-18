@@ -8,6 +8,10 @@ import {readRenderAcceptance, updateRenderAcceptance} from './server-lib.mjs';
 const roots = [];
 const SESSION_ID = 'session-1';
 const ROOT = 'script2video';
+const png = (payload) => Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from(payload),
+]);
 
 afterEach(async () => {
   delete process.env.VIMAX_OPENROUTER_VIDEO_DURATION;
@@ -212,12 +216,161 @@ describe('render acceptance', () => {
     expect(Object.keys(await storedAcceptance(working))).toEqual([ROOT]);
   });
 
-  it('accepts a session-wide portraits slot', async () => {
+  it('retains planned visible and nonvisible character inventory after all portrait files and registry are gone', async () => {
     const {root, working} = await fixture();
+    await put(working, `${ROOT}/characters.json`, JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'a sailor'},
+      {identifier_in_scene: 'Offscreen', is_visible: false, static_features: 'never visible'},
+    ]));
+    const registry = {};
+    const portraitFiles = [];
     for (const view of ['front', 'side', 'back']) {
-      await put(working, `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/${view}.png`, view);
+      const relative = `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/${view}.png`;
+      portraitFiles.push(relative);
+      await put(working, relative, png(view));
+      registry[view] = {path: path.join(working, relative)};
     }
-    await put(working, `${ROOT}/character_portraits/qwen_qwen-image-3/registry.json`, '{}');
+    const registryPath = `${ROOT}/character_portraits/qwen_qwen-image-3/registry.json`;
+    await put(working, registryPath, JSON.stringify({Claude: registry}));
+    await accept(root, {stage: 'portraits', accepted: true});
+    await Promise.all([...portraitFiles, registryPath].map((relative) => rm(path.join(working, relative), {force: true})));
+
+    const payload = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(payload).toMatchObject({
+      portraitImageModel: 'qwen/qwen-image-3',
+      characters: [
+        {identifier: 'Claude', scope: ROOT, description: 'a sailor', visible: true, complete: false, state: 'planned',
+          views: {front: {state: 'missing'}, side: {state: 'missing'}, back: {state: 'missing'}}},
+        {identifier: 'Offscreen', scope: ROOT, description: 'never visible', visible: false, complete: false, state: 'planned'},
+      ],
+    });
+    expect(stage(payload, 'portraits').state).toBe('planned');
+    await expect(accept(root, {stage: 'portraits', accepted: true})).rejects.toMatchObject({statusCode: 400});
+  });
+  it('distinguishes dangling registered views from malformed PNG data', async () => {
+    const {root, working} = await fixture();
+    await put(working, `${ROOT}/characters.json`, JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'a sailor'},
+    ]));
+    const front = `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/front.png`;
+    const back = `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/back.png`;
+    await put(working, back, 'not a PNG');
+    await put(working, `${ROOT}/character_portraits/qwen_qwen-image-3/registry.json`, JSON.stringify({Claude: {
+      front: {path: path.join(working, front)},
+      side: {path: path.join(working, `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/side.png`)},
+      back: {path: path.join(working, back)},
+    }}));
+
+    const [claude] = (await readRenderAcceptance(root, SESSION_ID, ROOT)).characters;
+    expect(claude.views).toEqual({
+      front: {path: front, state: 'missing'},
+      side: {path: `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/side.png`, state: 'missing'},
+      back: {path: back, state: 'invalid'},
+    });
+  });
+
+  it('uses configured image model to inventory Idea scene plans before a manifest exists', async () => {
+    const {root, working} = await fixture();
+    await rm(path.join(working, 'render_manifest.json'));
+    await mkdir(path.join(root, 'configs'), {recursive: true});
+    await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['image:', '  model: qwen/qwen-image-3', ''].join('\n'));
+    await put(working, 'idea2video/characters.json', JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'global sailor'},
+    ]));
+    await put(working, 'idea2video/scene_1/characters.json', JSON.stringify([
+      {identifier_in_scene: 'SceneOnly', is_visible: true, static_features: 'scene sailor'},
+    ]));
+    await put(working, 'idea2video/scene_1/character_portraits/qwen_qwen-image-3/registry.json', '{}');
+    const payload = await readRenderAcceptance(root, SESSION_ID, 'idea2video');
+    expect(payload.portraitImageModel).toBe('qwen/qwen-image-3');
+    expect(payload.characters).toContainEqual(expect.objectContaining({
+      identifier: 'Claude',
+      scope: 'idea2video',
+      description: 'global sailor',
+      visible: true,
+      state: 'planned',
+      views: {front: {state: 'missing'}, side: {state: 'missing'}, back: {state: 'missing'}},
+    }));
+    expect(payload.characters).toContainEqual(expect.objectContaining({
+      identifier: 'SceneOnly',
+      scope: 'idea2video/scene_1',
+      description: 'scene sailor',
+      state: 'planned',
+    }));
+  });
+  it('reuses approved global portraits for planned Idea scenes without scene registries', async () => {
+    const {root, working} = await fixture();
+    await put(working, 'render_manifest.json', JSON.stringify({
+      image_model: 'qwen/qwen-image-3',
+      video_model: 'kwaivgi/kling-video-o1',
+      render_mode: 'idea2video',
+    }));
+    await put(working, 'idea2video/characters.json', JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'global Claude'},
+    ]));
+    await put(working, 'idea2video/scene_1/characters.json', JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'scene Claude'},
+    ]));
+    const globalEntry = {};
+    for (const view of ['front', 'side', 'back']) {
+      const relative = `idea2video/character_portraits/qwen_qwen-image-3/0_Claude/${view}.png`;
+      await put(working, relative, png(view));
+      globalEntry[view] = {path: path.join(working, relative)};
+    }
+    await put(working, 'idea2video/character_portraits/qwen_qwen-image-3/registry.json',
+      JSON.stringify({Claude: globalEntry}));
+    await accept(root, {root: 'idea2video', stage: 'portraits', accepted: true});
+
+    const payload = await readRenderAcceptance(root, SESSION_ID, 'idea2video');
+    expect(stage(payload, 'portraits').state).toBe('accepted');
+    expect(payload.characters).toEqual([
+      expect.objectContaining({
+        identifier: 'Claude',
+        scope: 'idea2video',
+        description: 'global Claude',
+        visible: true,
+        complete: true,
+        state: 'accepted',
+        views: Object.fromEntries(['front', 'side', 'back'].map((view) => [view, {
+          path: `idea2video/character_portraits/qwen_qwen-image-3/0_Claude/${view}.png`,
+          state: 'ready',
+        }])),
+      }),
+    ]);
+  });
+  it('retains planned characters before an image model is configured', async () => {
+    const {root, working} = await fixture();
+    await rm(path.join(working, 'render_manifest.json'));
+    await put(working, `${ROOT}/characters.json`, JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true, static_features: 'a sailor'},
+    ]));
+    const payload = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(payload.portraitImageModel).toBe('');
+    expect(payload.characters).toEqual([expect.objectContaining({
+      identifier: 'Claude', visible: true, complete: false, state: 'planned',
+      views: {front: {state: 'missing'}, side: {state: 'missing'}, back: {state: 'missing'}},
+    })]);
+  });
+
+
+  it('does not report malformed character metadata as an empty inventory', async () => {
+    const {root, working} = await fixture();
+    await put(working, `${ROOT}/characters.json`, '{');
+    await expect(readRenderAcceptance(root, SESSION_ID, ROOT)).rejects.toMatchObject({statusCode: 400});
+  });
+
+
+  it('stage-wide portrait acceptance records one lock per visible character', async () => {
+    const {root, working} = await fixture();
+    const character = {idx: 0, identifier_in_scene: 'Claude', is_visible: true, static_features: 'a sailor', dynamic_features: null};
+    await put(working, `${ROOT}/characters.json`, JSON.stringify([character]));
+    const entry = {};
+    for (const view of ['front', 'side', 'back']) {
+      const relative = `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/${view}.png`;
+      await put(working, relative, png(view));
+      entry[view] = {path: path.join(working, relative)};
+    }
+    await put(working, `${ROOT}/character_portraits/qwen_qwen-image-3/registry.json`, JSON.stringify({Claude: entry}));
 
     const portraits = stage(await accept(root, {stage: 'portraits', accepted: true}), 'portraits');
     expect(portraits).toMatchObject({scope: 'session', state: 'accepted', accepted: true});
@@ -230,6 +383,16 @@ describe('render acceptance', () => {
         `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/side.png`,
       ],
     }]);
+    expect((await storedAcceptance(working))[ROOT].portrait_characters).toEqual({
+      'script2video::Claude': {
+        accepted_at: expect.any(String),
+        artifacts: expect.arrayContaining([
+          expect.objectContaining({path: `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/front.png`, size: expect.any(Number), sha256: expect.any(String)}),
+          expect.objectContaining({path: `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/side.png`, size: expect.any(Number), sha256: expect.any(String)}),
+          expect.objectContaining({path: `${ROOT}/character_portraits/qwen_qwen-image-3/0_Claude/back.png`, size: expect.any(Number), sha256: expect.any(String)}),
+        ]),
+      },
+    });
   });
 
   it('prices the clips it finds and honours the configured clip duration', async () => {

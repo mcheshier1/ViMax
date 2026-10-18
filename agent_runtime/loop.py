@@ -95,20 +95,34 @@ class AgentLoop:
         in_turn: list[dict[str, Any]] = []
         history_compacted = False
 
-        def over_budget(extra: list[dict[str, Any]] | None = None) -> bool:
-            """True when the next request would exceed the compaction target.
+        # History and appended messages are unchanged between samples. Count them
+        # once per turn rather than repeatedly scanning retained image Data URIs.
+        budget_enabled = self.context_compactor.compact_target_tokens() > 0
+        schema_tokens = _tool_schema_tokens(tool_schemas) if budget_enabled else 0
+        in_turn_token_counts: list[int] = []
+        in_turn_tokens = 0
 
-            ``extra`` is appended after the user input, i.e. the live in-turn
-            messages when guarding a mid-loop sample.
-            """
-            messages = [*self.history, {"role": "user", "content": user_input}]
-            if extra:
-                messages.extend(extra)
-            return self.context_compactor.should_preflight_compact(
-                messages,
-                system_tokens=_prompt_tokens(parts),
-                tools_tokens=_tool_schema_tokens(tool_schemas),
+        def base_token_count() -> int:
+            if not budget_enabled:
+                return 0
+            return (
+                self.context_compactor.estimate_messages_tokens([*self.history, {"role": "user", "content": user_input}])
+                + _prompt_tokens(parts)
+                + schema_tokens
             )
+
+        base_tokens = base_token_count()
+
+        def append_in_turn(message: dict[str, Any]) -> None:
+            nonlocal in_turn_tokens
+            tokens = self.context_compactor.estimate_message_tokens(message) if budget_enabled else 0
+            in_turn.append(message)
+            in_turn_token_counts.append(tokens)
+            in_turn_tokens += tokens
+
+        def over_budget(extra: list[dict[str, Any]] | None = None) -> bool:
+            target = self.context_compactor.compact_target_tokens()
+            return target > 0 and base_tokens + (in_turn_tokens if extra else 0) >= target
 
         if over_budget():
             yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
@@ -116,6 +130,7 @@ class AgentLoop:
             history_compacted = True
             parts = self.prompt_builder.build_parts(user_input)
             system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+            base_tokens = base_token_count()
         yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": self.prompt_builder.trace(parts)}
         assistant_turns: list[dict[str, Any]] = []
         tool_rounds: list[dict[str, Any]] = []
@@ -139,7 +154,13 @@ class AgentLoop:
                     history_compacted = True
                     parts = self.prompt_builder.build_parts(user_input)
                     system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
-                while over_budget(in_turn) and _drop_oldest_tool_round(in_turn):
+                    base_tokens = base_token_count()
+                while over_budget(in_turn):
+                    previous_count = len(in_turn)
+                    if not _drop_oldest_tool_round(in_turn):
+                        break
+                    del in_turn_token_counts[:previous_count - len(in_turn)]
+                    in_turn_tokens = sum(in_turn_token_counts)
                     yield {"type": "status", "turn_id": control.turn_id, "phase": "trim", "message": "Dropped the oldest in-turn tool round to stay inside the model context window"}
             runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}, *in_turn]
             yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
@@ -167,7 +188,7 @@ class AgentLoop:
                 break
             tool_round += 1
             yield {"type": "status", "turn_id": control.turn_id, "phase": "executing_tools", "message": f"Running tools (round {tool_round})"}
-            in_turn.append({"role": "assistant", "content": assistant.text or "", "tool_calls": [_openai_tool_call(call) for call in assistant.tool_calls]})
+            append_in_turn({"role": "assistant", "content": assistant.text or "", "tool_calls": [_openai_tool_call(call) for call in assistant.tool_calls]})
             round_results: list[ToolResult] = []
             round_model_content: list[dict[str, Any]] = []
 
@@ -203,11 +224,11 @@ class AgentLoop:
                     # Cap only the copy replayed to the LLM; the authoritative,
                     # full result is still stored by the tool executor / session.
                     tool_content = _clip_tool_content(tool_content, _max_result_chars)
-                in_turn.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": tool_content})
+                append_in_turn({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": tool_content})
                 if result.model_content:
                     round_model_content.extend(result.model_content)
             if round_model_content:
-                in_turn.append(
+                append_in_turn(
                     {
                         "role": "user",
                         "content": [

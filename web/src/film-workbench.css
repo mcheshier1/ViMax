@@ -67,13 +67,17 @@
 .film-inspector-disclosure[open] > summary::before { content: '−'; }
 .film-inspector-disclosure > summary > span { margin-left: auto; color: var(--amber); font-size: 11px; }
 .film-plan-fields { padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; }
-.film-plan-fields > summary { color: var(--ink); font-size: 12px; }
 .film-plan-fields .plan-frame { margin-top: 14px; }
-.film-workbench .plan-frame header strong, .film-workbench .plan-brief, .film-workbench .plan-brief > span { color: var(--ink); font-size: 12px; }
+.film-plan-fields .plan-frame:first-child { margin-top: 0; }
+.film-workbench .plan-frame-description { margin: 10px 0; color: var(--ink); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.film-workbench .plan-frame header strong { color: var(--ink); font-size: 12px; }
 .film-workbench .plan-frame textarea, .film-workbench .film-feedback textarea, .film-workbench .film-feedback input, .film-workbench .coverage-field textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; padding: 9px 10px; resize: vertical; color: var(--ink); background: var(--surface-soft); line-height: 1.6; font-size: 12px; }
 .film-workbench .plan-character { min-height: 27px; color: var(--muted); border-color: var(--line); background: var(--surface-soft); }
 .film-workbench .plan-character.is-on { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 40%, var(--line)); background: color-mix(in srgb, var(--blue) 8%, var(--surface)); }
 .film-workbench .plan-hint, .film-workbench .plan-prompt { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.film-workbench .plan-frame-continuity { margin: 8px 0 12px; }
+.film-workbench .plan-frame-continuity label { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--ink); }
+.film-workbench .plan-frame-continuity input { flex: 0 0 auto; margin-top: 3px; accent-color: var(--blue); }
 .film-workbench .plan-prompt pre { padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); background: var(--surface-soft); font-size: 11px; }
 .film-workbench .plan-actions { flex-wrap: wrap; }
 .film-feedback { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
@@ -94,6 +98,7 @@
 .film-generation-fields label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .film-generation-fields select { width: 100%; min-height: 36px; padding: 7px; color: var(--ink); background: var(--surface-soft); border: 1px solid var(--line-strong); border-radius: 5px; }
 .film-generation > .timeline-action.is-primary { width: 100%; justify-content: center; white-space: normal; margin-top: 12px; padding: 10px; }
+.shot-restart-files { padding-left: 20px; overflow-wrap: anywhere; }
 .film-empty { display: flex; align-items: center; flex-direction: column; padding: 32px 16px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); text-align: center; }
 .film-empty h3 { color: var(--ink); }
 .film-empty p { max-width: 470px; font-size: 13px; line-height: 1.7; }

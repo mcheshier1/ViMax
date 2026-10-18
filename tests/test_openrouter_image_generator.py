@@ -341,5 +341,59 @@ class OpenRouterImageGeneratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generator.model, "openai/gpt-image-2")
 
 
+    async def test_seedream_resolution_and_references(self):
+        captured = {}
+
+        async def fake_post(url, *, headers, payload, timeout):
+            captured.clear()
+            captured.update(payload)
+            return 200, {"data": [{"b64_json": _encoded_png(), "media_type": "image/png"}]}
+
+        self.catalogue["bytedance-seed/seedream-5-0-flash"] = {
+            "supported_parameters": {
+                "resolution": {"type": "enum", "values": ["1K", "2K"]},
+                "input_references": {"type": "range", "min": 0, "max": 2},
+            }
+        }
+        generator = ImageGeneratorOpenRouterAPI(api_key="secret", model="bytedance-seed/seedream-5-0-flash")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ref.png"
+            path.write_bytes(base64.b64decode(_encoded_png()))
+            with patch("tools.image_generator_openrouter_api._post_json", fake_post):
+                await generator.generate_single_image("scene", [str(path)], resolution="2K")
+                self.assertEqual(captured["resolution"], "2K")
+                self.assertEqual(len(captured["input_references"]), 1)
+                await generator.generate_single_image("scene", resolution="1K")
+                self.assertEqual(captured["resolution"], "1K")
+                await generator.generate_single_image("scene", resolution="auto")
+                self.assertNotIn("resolution", captured)
+
+    async def test_seedream_defaults_and_explicit_tiers_work_without_catalogue(self):
+        post = AsyncMock(return_value=(200, {"data": [{"b64_json": _encoded_png()}]}))
+        with patch("tools.image_generator_openrouter_api._post_json", post):
+            for preference, expected in ((None, "1K"), ("2K", "2K"), ("auto", None), ("", None)):
+                with self.subTest(resolution=preference):
+                    generator = ImageGeneratorOpenRouterAPI(
+                        api_key="secret", model="bytedance-seed/seedream-5-0-flash", resolution=preference,
+                    )
+                    await generator.generate_single_image("scene")
+                    self.assertEqual(post.await_args.kwargs["payload"].get("resolution"), expected)
+            generator = ImageGeneratorOpenRouterAPI(api_key="secret", model="unknown/image", resolution="1K")
+            count = post.await_count
+            with self.assertRaisesRegex(ValueError, "Cannot verify image resolution"):
+                await generator.generate_single_image("scene")
+            self.assertEqual(post.await_count, count)
+
+    async def test_unsupported_seedream_resolution_fails_before_post(self):
+        self.catalogue["bytedance-seed/seedream-5-0-flash"] = {
+            "supported_parameters": {"resolution": {"type": "enum", "values": ["1K", "2K"]}}
+        }
+        post = AsyncMock()
+        generator = ImageGeneratorOpenRouterAPI(api_key="secret", model="bytedance-seed/seedream-5-0-flash")
+        with patch("tools.image_generator_openrouter_api._post_json", post):
+            with self.assertRaisesRegex(ValueError, "does not support image resolution"):
+                await generator.generate_single_image("scene", resolution="4K")
+        post.assert_not_awaited()
+
 if __name__ == "__main__":
     unittest.main()

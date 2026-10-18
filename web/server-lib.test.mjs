@@ -2,8 +2,12 @@ import {mkdtemp, mkdir, readFile, rename, stat, writeFile} from 'node:fs/promise
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {deleteSession, listSessionArtifacts, readSessionHistory, readSessionState, resolveArtifactPath, storeWorkspaceUpload} from './server-lib.mjs';
+import {deleteSession, listSessionArtifacts, readSessionHistory, readSessionState, resolveArtifactPath, storeWorkspaceUpload, updateRenderAcceptance} from './server-lib.mjs';
 
+const png = (payload) => Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from(payload),
+]);
 const roots = [];
 
 afterEach(async () => {
@@ -157,6 +161,69 @@ describe('web bridge state', () => {
     expect(second).toMatchObject({name: 'script (2).txt', path: 'uploads/script (2).txt', size: 6});
     expect(await readFile(path.join(root, '.working_dir', 'session-1', second.path), 'utf8')).toBe('second');
     await expect(storeWorkspaceUpload(root, 'session-1', '../escape.txt', Buffer.from('no'))).rejects.toThrow(/unsupported/);
+  });
+
+  it('distinguishes registry-selected portraits from backups and stale approvals', async () => {
+    const repo = await fixture();
+    const session = path.join(repo, '.working_dir', 'session-1');
+    const portraits = path.join(session, 'script2video', 'character_portraits');
+    const current = path.join(portraits, 'test_model', '0_Claude');
+    const backup = path.join(portraits, '_backup');
+    await Promise.all([mkdir(current, {recursive: true}), mkdir(backup, {recursive: true})]);
+    await writeFile(path.join(session, 'render_manifest.json'), JSON.stringify({render_mode: 'script2video', image_model: 'test/model'}));
+    await writeFile(path.join(session, 'script2video', 'characters.json'), JSON.stringify([{identifier_in_scene: 'Claude', is_visible: true}]));
+    const entry = {};
+    for (const view of ['front', 'side', 'back']) {
+      const file = path.join(current, `${view}.png`);
+      await writeFile(file, png(view));
+      await writeFile(path.join(backup, `${view}.png`), png(`old ${view}`));
+      entry[view] = {path: file};
+    }
+    const registry = path.join(portraits, 'test_model', 'registry.json');
+    await writeFile(registry, JSON.stringify({Claude: entry}));
+    await writeFile(path.join(backup, 'prompts_weathered.json'), JSON.stringify({front: 'Saved backup prompt'}));
+    let artifacts = await listSessionArtifacts(repo, 'session-1');
+    expect(artifacts.filter((artifact) => artifact.portrait?.active).map((artifact) => artifact.name).sort()).toEqual(['back.png', 'front.png', 'side.png']);
+    expect(artifacts.find((artifact) => artifact.path.endsWith('_backup/front.png'))).toMatchObject({
+      portrait: {active: false, accepted: false, view: 'front'}, promptPath: 'script2video/character_portraits/_backup/prompts_weathered.json',
+    });
+    await updateRenderAcceptance(repo, {sessionId: 'session-1', root: 'script2video', stage: 'portraits', accepted: true});
+    artifacts = await listSessionArtifacts(repo, 'session-1');
+    expect(artifacts.filter((artifact) => artifact.portrait?.accepted)).toHaveLength(3);
+    await writeFile(entry.front.path, png('other'));
+    artifacts = await listSessionArtifacts(repo, 'session-1');
+    expect(artifacts.filter((artifact) => artifact.portrait?.accepted)).toEqual([]);
+    expect(artifacts.filter((artifact) => artifact.portrait?.active)).toHaveLength(3);
+    await writeFile(registry, JSON.stringify({}));
+    artifacts = await listSessionArtifacts(repo, 'session-1');
+    expect(artifacts.filter((artifact) => artifact.portrait?.active)).toEqual([]);
+  });
+
+  it('keeps partial selected paths active without accepting incomplete or invisible character sets', async () => {
+    const repo = await fixture();
+    const session = path.join(repo, '.working_dir', 'session-1');
+    const directory = path.join(session, 'script2video/character_portraits/test_model');
+    await mkdir(directory, {recursive: true});
+    await writeFile(path.join(session, 'render_manifest.json'), JSON.stringify({render_mode: 'script2video', image_model: 'test/model'}));
+    await writeFile(path.join(session, 'script2video', 'characters.json'), JSON.stringify([
+      {identifier_in_scene: 'Claude', is_visible: true}, {identifier_in_scene: 'Offscreen', is_visible: false},
+    ]));
+    const registry = {};
+    for (const character of ['Claude', 'Offscreen']) {
+      registry[character] = {};
+      const characterDir = path.join(directory, character);
+      await mkdir(characterDir);
+      for (const view of ['front', 'side', 'back']) {
+        const file = path.join(characterDir, `${view}.png`);
+        if (character !== 'Claude' || view !== 'back') await writeFile(file, png(view));
+        registry[character][view] = {path: file};
+      }
+    }
+    await writeFile(path.join(directory, 'registry.json'), JSON.stringify(registry));
+    const artifacts = await listSessionArtifacts(repo, 'session-1');
+    expect(artifacts.filter((artifact) => artifact.portrait?.active).map((artifact) => artifact.name).sort())
+      .toEqual(['front.png', 'side.png']);
+    expect(artifacts.filter((artifact) => artifact.portrait?.accepted)).toEqual([]);
   });
 
   it('deletes project state, artifacts, and matching log records', async () => {

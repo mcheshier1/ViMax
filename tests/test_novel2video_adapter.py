@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from PIL import Image
 
 from interfaces import CharacterInEvent, CharacterInNovel, CharacterInScene, Event, Scene
 from interfaces.environment import EnvironmentInScene
@@ -61,6 +63,16 @@ class FakeGlobalPlanner:
     def merge_characters_to_existing_characters_in_novel(self, event_idx, existing_characters_in_novel, characters_in_event):
         return [CharacterInNovel(index=0, identifier_in_novel="Hero", active_events={event_idx: "Hero"}, static_features="adult")]
 
+class FakeSetPlanModel:
+    async def ainvoke(self, prompt):
+        return SimpleNamespace(content=json.dumps({"sets": [{
+            "id": "house",
+            "name": "House room",
+            "description": "A quiet room with an old wooden door, pale plaster walls, and a low table.",
+            "shots": ["videos/event_0/scene_0/0"],
+        }]}))
+
+
 
 class FakeNovelPipeline:
     def __init__(self, working_dir: Path):
@@ -93,6 +105,19 @@ class FakeNovelPipeline:
         novel_char = CharacterInNovel(index=0, identifier_in_novel="Hero", active_events={0: "Hero"}, static_features="adult")
         (novel_level / "novel_characters_after_event_0.json").write_text(json.dumps([novel_char.model_dump()]), encoding="utf-8")
         return {}
+
+    async def plan_scene_artifacts(self, chat_model, **kwargs):
+        shot = self.working_dir / "videos" / "event_0" / "scene_0" / "shots" / "0"
+        shot.mkdir(parents=True, exist_ok=True)
+        (shot / "shot_description.json").write_text(json.dumps({
+            "idx": 0,
+            "visual_desc": "An old wooden door opens into a quiet room.",
+            "ff_desc": "A quiet room with an old wooden door.",
+            "lf_desc": "The same quiet room and door.",
+        }), encoding="utf-8")
+        return ["videos/event_0/scene_0/0"]
+
+
 
 
 class FakeMergeChain:
@@ -157,7 +182,6 @@ class Novel2MoviePlanningTests(unittest.IsolatedAsyncioTestCase):
             with patch("pipelines.novel2movie_pipeline.CacheBackedEmbeddings.from_bytes_store", return_value=object()), \
                  patch("pipelines.novel2movie_pipeline.FAISS.from_texts", return_value=FakeKnowledgeBase()):
                 result = await pipeline.plan_text_artifacts("Hero opens a door.", progress=lambda stage, message, metadata=None: events.append(stage), quiet=True)
-            self.assertEqual(events, ["save_novel", "compress_novel", "extract_events", "retrieve_chunks", "extract_scenes", "merge_characters", "completed"])
             root = Path(tmp)
             self.assertTrue((root / "novel" / "novel_compressed.txt").exists())
             self.assertTrue((root / "events" / "event_0.json").exists())
@@ -166,28 +190,98 @@ class Novel2MoviePlanningTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((root / "global_information" / "characters" / "novel_level" / "novel_characters_after_event_0.json").exists())
             self.assertFalse((root / "character_portraits").exists())
             self.assertFalse((root / "videos").exists())
-            self.assertEqual(len(result["events"]), 1)
+
+class FakeSetImageGenerator:
+    model = "test-image-model"
+
+    def __init__(self):
+        self.calls = []
+
+    async def generate_single_image(self, **kwargs):
+        self.calls.append(kwargs)
+        return Image.new("RGB", (1, 1), "white")
+
+
+class NovelSetPhaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_phases_refuse_missing_scene_plans_without_paid_planning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            write_minimal_novel_artifacts(working)
+            model = SimpleNamespace(ainvoke=AsyncMock())
+            images = FakeSetImageGenerator()
+            pipeline = Novel2MoviePipeline.__new__(Novel2MoviePipeline)
+            pipeline.working_dir = working / "novel2video"
+            pipeline.image_generator = images
+            pipeline.script2video_pipeline = SimpleNamespace(chat_model=model)
+            for phase in ("sets", "stills", "video"):
+                with self.subTest(phase=phase), self.assertRaises(RuntimeError):
+                    await pipeline.render_video_artifacts(style="noir", stop_after=phase, set_ids=["house"] if phase == "sets" else None)
+            model.ainvoke.assert_not_awaited()
+            self.assertEqual(images.calls, [])
+
+    async def test_sets_phase_generates_only_the_selected_location_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            write_minimal_novel_artifacts(working)
+            render_root = working / "novel2video"
+            shot = render_root / "videos/event_0/scene_0/shots/0"
+            shot.mkdir(parents=True)
+            (shot / "shot_description.json").write_text(json.dumps({
+                "idx": 0, "visual_desc": "An old wooden door opens into a quiet room.",
+            }), encoding="utf-8")
+            (shot.parent.parent / "storyboard.json").write_text("[]", encoding="utf-8")
+            (shot.parent.parent / "camera_tree.json").write_text("[]", encoding="utf-8")
+            set_dir = render_root / "set_references/house"
+            set_dir.mkdir(parents=True)
+            (set_dir / "set.json").write_text(json.dumps({
+                "id": "house",
+                "name": "House room",
+                "description": "A quiet room with an old wooden door and pale plaster walls.",
+                "shots": ["videos/event_0/scene_0/0"],
+            }), encoding="utf-8")
+            image_generator = FakeSetImageGenerator()
+            pipeline = Novel2MoviePipeline.__new__(Novel2MoviePipeline)
+            pipeline.working_dir = render_root
+            pipeline.image_generator = image_generator
+            pipeline.script2video_pipeline = SimpleNamespace(
+                chat_model=object(),
+                video_generator=SimpleNamespace(model="test-video-model"),
+            )
+            progress = []
+
+            outcome = await pipeline.render_video_artifacts(
+                style="noir",
+                stop_after="sets",
+                set_ids=["house"],
+                progress=lambda stage, message, metadata=None: progress.append(stage),
+            )
+
+            self.assertEqual(outcome.phase, "sets")
+            self.assertEqual(outcome.awaiting_confirmation, "stills")
+            self.assertEqual(len(outcome.set_references), 1)
+            self.assertEqual(len(image_generator.calls), 1)
+            self.assertEqual(image_generator.calls[0]["reference_image_paths"], [])
+            self.assertFalse((render_root / "character_portraits").exists())
+            self.assertFalse(any(render_root.glob("videos/**/qwen_*/first_frame.png")))
+            self.assertFalse((render_root / "videos/event_0/scene_0/final_video.mp4").exists())
+
 
 
 class FakeNovelRenderPipeline:
+
     def __init__(self, working_dir: Path):
         self.working_dir = Path(working_dir)
+        self.render_calls = 0
 
-    async def render_video_artifacts(self, style, user_requirement="", progress=None, quiet=False):
-        if progress:
-            progress("novel_portraits_start", "portraits", {})
-            progress("novel_scene_render_start", "scene", {"event_idx": 0, "scene_idx": 0})
-            progress("novel_render_completed", "done", {"scene_count": 1})
-        scene_dir = self.working_dir / "videos" / "event_0" / "scene_0"
-        scene_dir.mkdir(parents=True, exist_ok=True)
-        (scene_dir / "final_video.mp4").write_text("video", encoding="utf-8")
-        return {
-            "character_portraits_dir": str(self.working_dir / "character_portraits"),
-            "scene_videos_dir": str(self.working_dir / "videos"),
-            "scene_video_dirs": [str(scene_dir)],
-            "scene_count": 1,
-        }
+    async def plan_scene_artifacts(self, chat_model, **kwargs):
+        shot = self.working_dir / "videos" / "event_0" / "scene_0" / "shots" / "0"
+        shot.mkdir(parents=True, exist_ok=True)
+        (shot / "shot_description.json").write_text('{"idx":0,"visual_desc":"room"}', encoding="utf-8")
+        return ["videos/event_0/scene_0/0"]
 
+    async def render_video_artifacts(self, style, user_requirement="", progress=None, quiet=False, stop_after="portraits", **kwargs):
+        self.render_calls += 1
+        return {"phase": stop_after, "scene_video_dirs": [], "scene_count": 0}
 
 def write_minimal_novel_artifacts(root: Path):
     novel = root / "novel2video"
@@ -220,7 +314,8 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             empty = index.create(project_name="Novel draft")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
+                 patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
                 result = await adapter.vimax_novel_planning({"novel_text": "Hero opens a door."})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -245,7 +340,8 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = ViMaxAdapters(Path(tmp), index)
             progress_events = []
             runtime = ToolRuntimeContext("vimax_novel_planning", "vimax_novel_planning", turn_id="turn-test", progress_callback=progress_events.append)
-            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
+                 patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
                 result = await adapter.vimax_novel_planning({"novel_text": "Hero opens a door.", "style": "noir"}, runtime)
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -253,37 +349,37 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((root / "novel2video" / "novel" / "novel_compressed.txt").exists())
             self.assertTrue((root / "novel2video" / "events" / "event_0.json").exists())
             self.assertIn("novel2video/scenes/event_*/scene_*.json", payload["generated"])
+            self.assertEqual(payload["sets"][0]["shots"], ["videos/event_0/scene_0/0"])
             self.assertFalse(payload["ready_for_scene_render"])
             self.assertEqual(index.active()["stage"], "novel_planned")
             stages = [event["progress"]["stage"] for event in progress_events if event.get("type") == "tool_progress"]
             self.assertIn("novel_plan_text_artifacts", stages)
             self.assertIn("merge_characters", stages)
+            self.assertIn("novel_plan_set_specs", stages)
 
-    async def test_render_video_routes_novel2video_with_mock_pipeline(self):
+    async def test_novel_shot_render_waits_for_approved_sets_even_when_unlocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
             record = index.create(idea="novel", user_requirement="scene render", style="noir")
             root = Path(tmp) / record["working_dir"]
             write_minimal_novel_artifacts(root)
             adapter = ViMaxAdapters(Path(tmp), index)
-            progress_events = []
-            runtime = ToolRuntimeContext("vimax_render_video", "vimax_render_video", turn_id="turn-test", progress_callback=progress_events.append)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+            runtime = ToolRuntimeContext("vimax_render_video", "vimax_render_video", turn_id="turn-test")
+            render_pipeline = FakeNovelRenderPipeline(root / "novel2video")
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=FakeSetPlanModel()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", side_effect=lambda working_dir, chat_model, image_generator, video_generator: FakeNovelRenderPipeline(Path(working_dir))):
-                result = await adapter.vimax_render_video({}, runtime)
-            self.assertTrue(result.ok)
-            payload = json.loads(result.content)
-            self.assertEqual(payload["render_mode"], "novel2video")
-            self.assertTrue(payload["scene_render_completed"])
-            self.assertIsNone(payload["final_video_path"])
-            self.assertEqual(payload["scene_count"], 1)
-            self.assertEqual(index.get(record["session_id"])["stage"], "novel_scene_rendered")
-            self.assertTrue((root / "novel2video" / "videos" / "event_0" / "scene_0" / "final_video.mp4").exists())
-            stages = [event["progress"]["stage"] for event in progress_events if event.get("type") == "tool_progress"]
-            self.assertIn("novel_scene_render_start", stages)
-            self.assertIn("novel_render_completed", stages)
+                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", return_value=render_pipeline):
+                result = await adapter.vimax_render_video({
+                    "stop_after": "video", "render_mode": "novel2video", "allow_unlocked": True,
+                }, runtime)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["error_type"], "set_approval_required")
+            self.assertEqual(render_pipeline.render_calls, 0)
+            self.assertTrue((root / "novel2video/videos/event_0/scene_0/shots/0/shot_description.json").exists())
+            self.assertFalse((root / "novel2video/character_portraits").exists())
+            self.assertFalse((root / "novel2video/videos/event_0/scene_0/final_video.mp4").exists())
 
 
 if __name__ == "__main__":

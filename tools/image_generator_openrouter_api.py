@@ -79,6 +79,7 @@ class ImageGeneratorOpenRouterAPI:
         rate_limiter: RateLimiter | None = None,
         http_referer: str = "",
         app_title: str = "ViMax",
+        resolution: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -89,6 +90,9 @@ class ImageGeneratorOpenRouterAPI:
         self.rate_limiter = rate_limiter
         self.http_referer = http_referer
         self.app_title = app_title
+        self.resolution = resolution
+        self._resolution_explicit = resolution is not None
+
 
     async def prepare(self) -> None:
         """Warm the model catalogue so the reference limit is known before references are built.
@@ -159,6 +163,25 @@ class ImageGeneratorOpenRouterAPI:
             timeout=timeout,
             hard_timeout_seconds=_request_timeout_seconds(),
         )
+        resolution = kwargs.get("resolution", self.resolution)
+        explicit_resolution = "resolution" in kwargs or self._resolution_explicit
+        if resolution is None:
+            resolution = "1K" if self.model == "bytedance-seed/seedream-5-0-flash" else None
+            explicit_resolution = False
+        if resolution in ("", "auto"):
+            resolution = None
+            explicit_resolution = False
+        if resolution is not None:
+            parameters = _supported_parameters(capabilities) if capabilities is not None else {}
+            spec = parameters.get("resolution")
+            if capabilities is not None and not _enum_accepts(spec, resolution):
+                raise ValueError(f"{self.model} does not support image resolution {resolution}")
+            if capabilities is None and self.model == "bytedance-seed/seedream-5-0-flash" and resolution in {"1K", "2K"}:
+                payload["resolution"] = resolution
+            elif capabilities is None and explicit_resolution:
+                raise ValueError(f"Cannot verify image resolution {resolution} for {self.model}")
+            elif capabilities is not None:
+                payload["resolution"] = resolution
         if capabilities is None:
             # No catalogue: keep sending the OpenAI-only parameters this API documents.
             if self.model.startswith("openai/"):

@@ -109,4 +109,36 @@ describe('agent message queue', () => {
     expect(queue.snapshot()).toMatchObject({activeSessionId: 'session-b', busy: false, pending: []});
   });
 
+  it('guards project mutations until both the running turn and queued follow-up complete', () => {
+    const queue = createAgentMessageQueue();
+    queue.reset('session-a');
+    expect(queue.hasWorkFor('session-a')).toBe(false);
+    queue.enqueue('session-a', message('one'));
+    queue.enqueue('session-a', message('two'));
+    expect(queue.hasWorkFor('session-a')).toBe(true);
+    expect(queue.hasWorkFor('session-b')).toBe(false);
+    queue.consumeEvent({type: 'turn', turn_id: 'turn-one'});
+    queue.consumeEvent({type: 'done', turn_id: 'turn-one'});
+    expect(queue.hasWorkFor('session-a')).toBe(true);
+    queue.consumeEvent({type: 'turn', turn_id: 'turn-two'});
+    queue.consumeEvent({type: 'done', turn_id: 'turn-two'});
+    expect(queue.hasWorkFor('session-a')).toBe(false);
+  });
+
+  it('guards both the running turn owner and a newly active project during a session change', () => {
+    const queue = createAgentMessageQueue();
+    queue.reset('session-a');
+    queue.enqueue('session-a', message('running'));
+    queue.consumeEvent({type: 'turn', turn_id: 'running-turn'});
+    queue.setSessionId('session-b');
+    queue.enqueue('session-b', message('follow-up'));
+    expect(queue.hasWorkFor('session-a')).toBe(true);
+    expect(queue.hasWorkFor('session-b')).toBe(true);
+    queue.consumeEvent({type: 'done', turn_id: 'running-turn'});
+    expect(queue.hasWorkFor('session-a')).toBe(false);
+    expect(queue.hasWorkFor('session-b')).toBe(true);
+    queue.cancel();
+    expect(queue.hasWorkFor('session-b')).toBe(false);
+  });
+
 });

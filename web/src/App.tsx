@@ -37,7 +37,9 @@ import {describeArtifacts, describeInvalidation, describeStyleMismatch, diffProj
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
 import type {AgentConfig, AgentEvent, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
-import {VIDEO_PROVIDER_PRESETS, isHeygenVideoModel, validHeygenVideoSettings, videoModelSelection, videoProviderPreset} from './videoPresets';
+import {IMAGE_PROVIDER_PRESETS, compatibleImageResolution, defaultImageResolution, imageProviderFromBaseUrl, imageProviderPreset, imageResolutionTiers} from './imagePresets';
+import {isHeygenVideoModel, validHeygenVideoSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
+import {credentialProvider} from '../provider-credentials.mjs';
 import {TimelineView} from './TimelineView';
 import {useFilmSession, type FilmSelection} from './filmSession';
 import './workbench-shell.css';
@@ -115,11 +117,10 @@ export default function App() {
   }
 
   function confirmLeaveFilm() {
-    return !dirtyFilmSessions.current.has(selectedSessionIdRef.current) || window.confirm('This film has unsaved shot edits. Leave this view? Your local drafts will be kept, not discarded.');
+    return !dirtyFilmSessions.current.has(selectedSessionIdRef.current) || window.confirm('This project has unsaved shot edits. Switch projects? Your local drafts will be kept, not discarded.');
   }
 
   function changeDestination(view: WorkspaceView) {
-    if (view !== workspaceView && workspaceView === 'film' && !confirmLeaveFilm()) return;
     setWorkspaceView(view);
     try {
       window.localStorage.setItem(`vimax-view:${selectedSessionId}`, view);
@@ -575,12 +576,19 @@ export default function App() {
             ) : (
               <>
                 {!film.loading && film.data && film.data.plans.length === 0 && <div className="workbench-planning-prompt"><div><strong>Give your film a starting point</strong><span>Use the Assistant to develop a script and shot plan before generating media.</span></div><button onClick={openPlanningAssistant}><MessageSquare size={15} />Plan with Assistant</button></div>}
-                <TimelineView key={selectedSessionId} session={selectedSession} artifacts={artifacts} film={film} active={workspaceView === 'film' && !utility} onAskAgent={(text, restartAgent) => askAgent(text, [], restartAgent)} onSelectionChange={setSelection} />
+
+                <TimelineView key={selectedSessionId} session={selectedSession} artifacts={artifacts} film={film} active={workspaceView === 'film' && !utility} requestBusy={chat.busy || sending || !queueBridgeReady} onAskAgent={(text, restartAgent) => askAgent(text, [], restartAgent)} onSelectionChange={setSelection} />
               </>
             )}
           </div>
           {workspaceView === 'script' && <ScriptView key={selectedSessionId} session={selectedSession} artifacts={artifacts} onPlan={openPlanningAssistant} />}
-          {workspaceView === 'assets' && <ArtifactsView key={selectedSessionId} session={selectedSession} artifacts={artifacts} />}
+          {workspaceView === 'assets' && <ArtifactsView key={selectedSessionId} session={selectedSession} artifacts={artifacts} characters={film.data?.acceptance.characters || []} root={film.data?.acceptance.root || ''} revision={film.progress?.revision || ''} portraitImageModel={film.data?.acceptance.portraitImageModel || ''} progress={film.progress} disabled={chat.busy || sending || !queueBridgeReady} onAskAgent={(text) => {setDrawer('activity'); return askAgent(text, [], false, 'film', {sessionId: selectedSessionId});}} onRefresh={async (sessionId) => {
+            if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before refreshing assets.');
+            try { await filmRef.current.refresh(); } catch (error) {
+              if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
+              throw error;
+            }
+          }} />}
         </main>
         {drawer && <aside className={`workbench-drawer ${drawer === 'assistant' ? 'assistant-drawer' : 'activity-drawer'}`} aria-label={drawer === 'assistant' ? 'Assistant' : 'Activity'}>
           <header className="workbench-drawer-heading"><div><strong>{drawer === 'assistant' ? 'Assistant' : 'Activity'}</strong><span>{selectedSession ? sessionTitle(selectedSession) : 'No project selected'}</span></div><button className="icon-button" onClick={() => setDrawer(null)} aria-label={`Close ${drawer}`}><X size={18} /></button></header>
@@ -769,9 +777,27 @@ const CONFIG_SECTIONS: Array<{key: keyof AgentConfig['sections']; title: string;
   {key: 'embedding', title: 'Embedding', description: 'Optional novel retrieval'},
   {key: 'reranker', title: 'Reranker', description: 'Optional novel retrieval ranking'},
 ];
+function redactConfig(config: AgentConfig): AgentConfig {
+  return {
+    ...config,
+    sections: Object.fromEntries(Object.entries(config.sections).map(([section, value]) => [
+      section,
+      {
+        ...value,
+        api_key: '',
+        api_key_updates: undefined,
+        has_api_key: Array.isArray(value.configured_api_key_providers)
+          ? value.configured_api_key_providers.includes(credentialProvider(value))
+          : value.has_api_key,
+      },
+    ])) as AgentConfig['sections'],
+  };
+}
+
 
 function SettingsView() {
   const [config, setConfig] = useState<AgentConfig>();
+  const [drafts, setDrafts] = useState<Partial<Record<keyof AgentConfig['sections'], Record<string, string>>>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState('');
@@ -779,14 +805,26 @@ function SettingsView() {
   useEffect(() => {
     let cancelled = false;
     void getAgentConfig()
-      .then((payload) => !cancelled && setConfig(payload))
+      .then((payload) => !cancelled && setConfig(redactConfig(payload)))
       .catch((error) => !cancelled && setStatus(error instanceof Error ? error.message : String(error)))
       .finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
   }, []);
 
   function update(section: keyof AgentConfig['sections'], field: keyof ConfigSection, value: string) {
+    if (saving) return;
     setStatus('');
+    if (field === 'api_key') {
+      setDrafts((current) => ({
+        ...current,
+        [section]: {...current[section], [credentialProvider(config?.sections[section] || {})]: value},
+      }));
+      setConfig((current) => {
+        if (!current) return current;
+        return {...current, sections: {...current.sections, [section]: {...current.sections[section], api_key: value}}};
+      });
+      return;
+    }
     setConfig((current) => {
       if (!current) return current;
       const sectionValue = current.sections[section];
@@ -794,27 +832,69 @@ function SettingsView() {
       if (section === 'video' && field === 'model') {
         Object.assign(nextSection, videoModelSelection(String(sectionValue.provider || 'openrouter'), value, sectionValue.resolution || '', sectionValue.clip_seconds || sectionValue.effective_clip_seconds || '8'));
       }
+      if (section === 'image' && field === 'model') {
+        const provider = imageProviderFromBaseUrl(sectionValue.base_url);
+        nextSection.resolution = compatibleImageResolution(sectionValue.resolution || defaultImageResolution(provider, sectionValue.model), provider, value);
+      }
+      const identity = credentialProvider(nextSection);
+      nextSection.api_key = drafts[section]?.[identity] || '';
+      nextSection.has_api_key = (nextSection.configured_api_key_providers || []).includes(identity);
       return {sections: {...current.sections, [section]: nextSection}};
     });
   }
 
+  function selectImageProvider(provider: string) {
+    if (saving) return;
+    const preset = imageProviderPreset(provider);
+    if (!preset) return;
+    setStatus('');
+    setConfig((current) => {
+      if (!current) return current;
+      const image = current.sections.image;
+      const nextImage = {...image, base_url: preset.baseUrl, model: preset.defaultModel};
+      nextImage.resolution = compatibleImageResolution(image.resolution || defaultImageResolution(imageProviderFromBaseUrl(image.base_url), image.model), provider, preset.defaultModel);
+      const identity = credentialProvider(nextImage);
+      nextImage.api_key = drafts.image?.[identity] || '';
+      nextImage.has_api_key = (nextImage.configured_api_key_providers || []).includes(identity);
+      return {...current, sections: {...current.sections, image: nextImage}};
+    });
+  }
+
   function selectVideoProvider(provider: string) {
+    if (saving) return;
     const preset = videoProviderPreset(provider);
-    update('video', 'provider', provider);
-    if (preset) {
-      update('video', 'base_url', preset.baseUrl);
-      update('video', 'model', preset.defaultModel);
-      update('video', 'resolution', preset.resolution);
-      update('video', 'clip_seconds', '8');
-    }
+    setStatus('');
+    setConfig((current) => {
+      if (!current) return current;
+      const video = current.sections.video;
+      const nextVideo = preset
+        ? {...video, provider, base_url: preset.baseUrl, model: preset.defaultModel, resolution: preset.resolution, clip_seconds: '8'}
+        : {...video, provider};
+      const identity = credentialProvider(nextVideo);
+      nextVideo.api_key = drafts.video?.[identity] || '';
+      nextVideo.has_api_key = (nextVideo.configured_api_key_providers || []).includes(identity);
+      return {...current, sections: {...current.sections, video: nextVideo}};
+    });
   }
 
   async function save() {
     if (!config || saving) return;
     setSaving(true);
     setStatus('');
+    const request: AgentConfig = {
+      ...config,
+      sections: Object.fromEntries(Object.entries(config.sections).map(([section, value]) => [
+        section,
+        {
+          ...value,
+          api_key: drafts[section as keyof AgentConfig['sections']]?.[credentialProvider(value)] || '',
+          api_key_updates: Object.fromEntries(Object.entries(drafts[section as keyof AgentConfig['sections']] || {}).filter(([, secret]) => secret)),
+        },
+      ])) as AgentConfig['sections'],
+    };
     try {
-      setConfig(await saveAgentConfig(config));
+      setConfig(redactConfig(await saveAgentConfig(request)));
+      setDrafts({});
       setStatus('Saved');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -825,17 +905,21 @@ function SettingsView() {
 
   const videoSettings = config?.sections.video;
   const validVideoSettings = videoSettings?.provider === 'openrouter' ? validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, videoSettings.clip_seconds || videoSettings.effective_clip_seconds || '8') : true;
+  const credentialsSupported = Boolean(config && CONFIG_SECTIONS.every(({key}) => Array.isArray(config.sections[key].configured_api_key_providers)));
   if (loading) return <div className="settings-loading">Loading configuration…</div>;
   if (!config) return <div className="settings-loading is-error">{status || 'Configuration unavailable'}</div>;
+  const imageResolutionSupported = Object.hasOwn(config.sections.image, 'resolution');
   return (
     <section className="settings-view">
       <header>
         <div><span>Local configuration</span><h1>Settings</h1></div>
         <div className="settings-save-group">
           {status && <span className={status === 'Saved' ? 'is-saved' : 'is-error'}>{status}</span>}
-          <button className="settings-save" onClick={() => void save()} disabled={saving || !validVideoSettings}>
+          <button className="settings-save" onClick={() => void save()} disabled={saving || !validVideoSettings || !credentialsSupported || !imageResolutionSupported}>
             <Save size={15} />{saving ? 'Saving…' : 'Save'}
           </button>
+          {!credentialsSupported && <span className="is-error">Restart the web server after the active request finishes, then reload settings to enable provider-specific key saving.</span>}
+          {!imageResolutionSupported && <span className="is-error">Reload settings after the backend reloads to enable image resolution saving.</span>}
         </div>
       </header>
       <div className="settings-sections">
@@ -844,8 +928,10 @@ function SettingsView() {
             key={definition.key}
             definition={definition}
             value={config.sections[definition.key]}
-            onChange={(field, value) => definition.key === 'video' && field === 'provider' ? selectVideoProvider(value) : update(definition.key, field, value)}
+            onChange={(field, value) => definition.key === 'image' && field === 'provider' ? selectImageProvider(value) : definition.key === 'video' && field === 'provider' ? selectVideoProvider(value) : update(definition.key, field, value)}
             validVideoSettings={definition.key !== 'video' || validVideoSettings}
+            disabled={saving}
+            imageResolutionSupported={definition.key !== 'image' || imageResolutionSupported}
           />
         ))}
       </div>
@@ -853,25 +939,57 @@ function SettingsView() {
   );
 }
 
-function ConfigSectionEditor({definition, value, onChange, validVideoSettings}: {
+const OPENROUTER_IMAGE_MODELS = IMAGE_PROVIDER_PRESETS.openrouter.models;
+
+function ConfigSectionEditor({definition, value, onChange, validVideoSettings, disabled, imageResolutionSupported}: {
   definition: {key: keyof AgentConfig['sections']; title: string; description: string};
   value: ConfigSection;
   onChange: (field: keyof ConfigSection, value: string) => void;
   validVideoSettings: boolean;
+  disabled: boolean;
+  imageResolutionSupported: boolean;
 }) {
   const heygen = definition.key === 'video' && value.provider === 'openrouter' && isHeygenVideoModel(value.model);
   const duration = value.clip_seconds || value.effective_clip_seconds || '8';
   const resolutionOptions = heygen ? ['480p', '768p'] : value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p'];
+  const imageProvider = definition.key === 'image' ? imageProviderFromBaseUrl(value.base_url) : undefined;
+  const openrouterImage = imageProvider === 'openrouter';
+  const agnesImage = imageProvider === 'agnes';
+  const imageTiers = definition.key === 'image' ? imageResolutionTiers(imageProvider || '', value.model) : [];
+  const customOpenRouterImage = openrouterImage && imageTiers.length === 0;
+  const imageResolution = value.resolution || value.effective_resolution || defaultImageResolution(imageProvider || '', value.model);
+  const [customImageModel, setCustomImageModel] = useState('');
+  const imageModels = imageProvider === 'agnes' ? IMAGE_PROVIDER_PRESETS.agnes.models : OPENROUTER_IMAGE_MODELS;
+  const imageModelIsCustom = customImageModel === value.model || !imageModels.some((model) => model.id === value.model);
   return (
     <section className="config-section">
       <header><h2>{definition.title}</h2><p>{definition.description}</p></header>
-      <div className="config-fields">
+      <fieldset className="config-fields" disabled={disabled} style={{border: 0, padding: 0, margin: 0, minWidth: 0}}>
         {value.model_provider !== undefined && (
           <label><span>Model provider</span><input value={value.model_provider} onChange={(event) => onChange('model_provider', event.target.value)} /></label>
         )}
-        <label><span>Model</span><input value={value.model} list={definition.key === 'video' && value.provider === 'openrouter' ? 'openrouter-video-models' : undefined} onChange={(event) => onChange('model', event.target.value)} />
+        {definition.key === 'image' && (
+          <label><span>Provider</span>
+            <select value={imageProvider} onChange={(event) => onChange('provider' as keyof ConfigSection, event.target.value)}>
+              {Object.entries(IMAGE_PROVIDER_PRESETS).map(([provider, preset]) => <option key={provider} value={provider}>{preset.label}</option>)}
+            </select>
+          </label>
+        )}
+        {(openrouterImage || agnesImage) ? <>
+          <label><span>Model</span>
+            <select value={imageModelIsCustom ? '@custom' : value.model} onChange={(event) => {
+              const custom = event.target.value === '@custom';
+              setCustomImageModel(custom ? value.model : '');
+              if (!custom) onChange('model', event.target.value);
+            }}>
+              {imageModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+              <option value="@custom">Custom model…</option>
+            </select>
+          </label>
+          {imageModelIsCustom && <label><span>Custom model ID</span><input value={value.model} onChange={(event) => onChange('model', event.target.value)} /></label>}
+        </> : <label><span>Model</span><input value={value.model} list={definition.key === 'video' && value.provider === 'openrouter' ? 'openrouter-video-models' : undefined} onChange={(event) => onChange('model', event.target.value)} />
           {definition.key === 'video' && value.provider === 'openrouter' && <datalist id="openrouter-video-models">{VIDEO_PROVIDER_PRESETS.openrouter.models.map((model) => <option key={model} value={model} />)}</datalist>}
-        </label>
+        </label>}
         {definition.key === 'video' && (
           <label><span>Provider</span>
             <select value={value.provider || 'openrouter'} onChange={(event) => onChange('provider', event.target.value)}>
@@ -881,6 +999,28 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings}: 
           </label>
         )}
         <label className="config-field-wide"><span>Base URL</span><input value={value.base_url} onChange={(event) => onChange('base_url', event.target.value)} inputMode="url" /></label>
+        {definition.key === 'image' && (
+          <>
+            <label><span>Resolution</span>
+              {customOpenRouterImage ? (
+                <>
+                  <input list="custom-openrouter-image-resolutions" value={imageResolution} disabled={!imageResolutionSupported} onChange={(event) => onChange('resolution', event.target.value)} />
+                  <datalist id="custom-openrouter-image-resolutions"><option value="auto" /><option value="1K" /><option value="2K" /></datalist>
+                </>
+              ) : (
+                <select value={imageResolution} disabled={!imageResolutionSupported} onChange={(event) => onChange('resolution', event.target.value)}>
+                  {imageResolution !== 'auto' && !imageTiers.includes(imageResolution) && <option value={imageResolution}>{imageResolution} (unsupported; choose a listed value)</option>}
+                  <option value="auto">Provider default</option>
+                  {imageTiers.map((tier) => <option key={tier} value={tier}>{tier}</option>)}
+                </select>
+              )}
+            </label>
+            {imageResolution !== 'auto' && !imageTiers.includes(imageResolution) && !customOpenRouterImage && <p className="film-warning config-field-wide">This resolution is unsupported for the selected model. Choose Provider default.</p>}
+            <p className="config-field-wide">Applies to new portraits and keyframes only; existing assets are not resized or regenerated.</p>
+            {value.effective_resolution && <p className="config-field-wide">Active saved resolution: {value.effective_resolution === 'auto' ? 'Provider default' : value.effective_resolution}. VIMAX_IMAGE_RESOLUTION overrides the saved choice when set.</p>}
+            {customOpenRouterImage && <p className="film-warning config-field-wide">Custom OpenRouter model resolutions are checked against the provider catalog; unsupported tiers are rejected before generation.</p>}
+          </>
+        )}
         {definition.key === 'video' && (
           <>
             {value.provider !== 'yunwu' && (
@@ -909,11 +1049,13 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings}: 
         <label className="config-field-wide">
           <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? 'Configured' : 'Not configured'}</i></span>
           <input type="password" value={value.api_key} onChange={(event) => onChange('api_key', event.target.value)} placeholder={value.has_api_key ? 'Leave blank to keep current key' : 'Enter API key'} autoComplete="off" />
+          <small>Saved keys are remembered per provider.</small>
         </label>
-      </div>
+      </fieldset>
     </section>
   );
 }
+
 
 function ProjectView({sessionId, onChanged}: {sessionId: string; onChanged: () => void}) {
   const [project, setProject] = useState<ProjectMetadata>();

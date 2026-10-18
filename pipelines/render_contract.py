@@ -9,7 +9,7 @@ from utils.text import safe_path_component
 
 # Render phases, in execution order. Each phase is idempotent: artifacts that
 # already exist are reused, so re-running a phase to revise it is cheap.
-RENDER_PHASES = ("portraits", "stills", "video")
+RENDER_PHASES = ("portraits", "sets", "stills", "video")
 
 # Cheapest phase, and the one that needs a style decision before anything else is
 # rendered from it. Callers opt in to spending more by asking for a later phase.
@@ -29,6 +29,17 @@ def normalize_phase(value: str | None, default: str = DEFAULT_RENDER_PHASE) -> s
     return phase
 
 
+class PortraitGenerationError(RuntimeError):
+    """An incomplete portrait batch whose successful work remains on disk."""
+
+    def __init__(self, missing: list[str], failures: dict[str, str], *, working_dir: str = ""):
+        self.missing = list(missing)
+        self.failures = dict(failures)
+        self.working_dir = working_dir
+        details = "; ".join(f"{name}: {error}" for name, error in failures.items())
+        super().__init__(f"Portrait generation incomplete: {', '.join(missing)}" + (f". {details}" if details else ""))
+
+
 @dataclass(slots=True)
 class RenderOutcome:
     """What a pipeline run produced, and what the caller should review next.
@@ -43,6 +54,7 @@ class RenderOutcome:
     image_model: str = ""
     video_model: str = ""
     stills: List[str] = field(default_factory=list)
+    set_references: List[str] = field(default_factory=list)
     awaiting_confirmation: str = ""
     final_video_path: str = ""
 
@@ -53,6 +65,7 @@ class RenderOutcome:
             "image_model": self.image_model,
             "video_model": self.video_model,
             "stills": list(self.stills),
+            "set_references": list(self.set_references),
             "awaiting_confirmation": self.awaiting_confirmation,
             "final_video_path": self.final_video_path,
         }
@@ -132,13 +145,14 @@ class ModelScopedArtifacts:
     def clip_path(self, shot_idx: int) -> str:
         return os.path.join(self.shot_video_dir(shot_idx), "video.mp4")
 
-    def render_outcome(self, phase: str, style: str, *, stills: Optional[List[str]] = None, awaiting: str = "", final_video_path: str = "") -> RenderOutcome:
+    def render_outcome(self, phase: str, style: str, *, stills: Optional[List[str]] = None, set_references: Optional[List[str]] = None, awaiting: str = "", final_video_path: str = "") -> RenderOutcome:
         return RenderOutcome(
             phase=phase,
             style=style,
             image_model=str(getattr(self.image_generator, "model", "") or ""),
             video_model=str(getattr(self.video_generator, "model", "") or ""),
             stills=list(stills or []),
+            set_references=list(set_references or []),
             awaiting_confirmation=awaiting,
             final_video_path=final_video_path,
         )

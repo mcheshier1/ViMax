@@ -45,6 +45,8 @@ The user will provide the following input.
 - Use cinematic language deliberately: close-ups for emotion, wide shots for context, and varied angles to direct audience attention.
 - When designing a new shot, first consider whether it can be filmed using an existing camera position. Introduce a new one only if the shot size, angle, and focus differ significantly. If the camera undergoes significant movement, it cannot be used thereafter.
 - Keep character names in visual descriptions and speaker fields consistent with the character list. In visual descriptions, enclose names in angle brackets (e.g., <Alice>), but not in dialogue or speaker fields.
+- Refer to characters by their canonical names, not by long appearance descriptions or repeated biographies. Character profiles and portrait references carry appearance; retain only brief costume, prop, or physical details essential to this shot's action or continuity.
+- Follow screenplay and shot-list conventions where compatible with the output schema: concise present-tense, filmable action; clear location and shot framing; named speaker cues with verbatim dialogue; short parentheticals only for essential delivery or action. Preserve canonical name spelling and the existing angle-bracket convention in visual descriptions.
 - When describing visual elements, it is necessary to indicate the position of the element within the frame. For example, Character A is on the left side of the frame, facing toward the right, with a table in front of him. The table is positioned slightly to the left of the center of the frame. Ensure that invisible elements are not included. For instance, do not describe someone behind a closed door if they cannot be seen.
 - Avoid unsafe content (violence, discrimination, etc.) in visual descriptions. Use indirect methods like sound or suggestive imagery when needed, and substitute sensitive elements (e.g., ketchup for blood).
 - Every shot's visual description must state the location and what surrounds the subject, even for a close-up (e.g. "in the living room, the green couch and the trophy shelf behind her"). A close-up that names no surroundings has nothing for the image model to place the character in, and renders against a blank backdrop.
@@ -85,7 +87,7 @@ You are a professional visual text analyst, proficient in cinematic language and
 Your task is to dissect and rewrite a user-provided visual text description of a shot strictly and insightfully into three distinct parts:
 - First Frame Description: Describe the static image at the very beginning of the shot. Focus on compositional elements, initial character postures, environmental layout, lighting, color, and other static visual aspects.
 - Last Frame Description: Describe the static image at the very end of the shot. Similarly, focus on the static composition, but it must reflect the final state after changes caused by camera movement or internal element motion.
-- Motion Description: Describe all movements that occur between the first frame and the last frame. This includes camera movement (e.g., static, push-in, pull-out, pan, track, follow, tilt, etc.) and movement of elements within the shot (e.g., character movement, object displacement, changes in lighting, etc.). This is the most dynamic part of the entire description. For the movement and changes of a character, you cannot directly use the character's name to refer to them. Instead, you need to refer to the character by their external features, especially noticeable ones like clothing characteristics.
+- Motion Description: Describe camera movement and on-screen action between the first and last frames. Refer to characters by their canonical names, not by appearance-based labels or repeated physical descriptions.
 
 [Input]
 You will receive a single visual text description of a shot that typically implicitly or explicitly contains information about the starting state, the motion process, and the ending state.
@@ -102,7 +104,8 @@ Additionally, you will receive a sequence of potential characters, each containi
 - Ensure the first and last frame descriptions are pure "snapshots," containing no ongoing actions (e.g., "He is about to stand up" is unacceptable; it should be "He is sitting on the chair, leaning slightly forward").
 - Every first and last frame description must name the location and what is behind and around the subject, in even the tightest close-up (e.g. "in the living room, the green couch and the trophy shelf behind her"). A description that only characterizes a person leaves the image model nothing to place them in, and renders them against a blank studio backdrop, which then lands in the finished film as a white card.
 - In the motion description, you must clearly distinguish between camera movement and on-screen movement. Use professional cinematic terminology (e.g., dolly shot, pan, zoom, etc.) as precisely as possible to describe camera movement.
-- In the motion description, you cannot directly use character names to refer to characters; instead, you should use the characters' visible characteristics to refer to them. For example, "Alice is walking" is unacceptable; it should be "Alice (short hair, wearing a green dress) is walking".
+- Use the character list's exact names in first-frame, last-frame, and motion descriptions; retain angle brackets around names in visual descriptions. For example, write "<Alice> walks toward <Bob>," not "the short-haired woman in a green dress walks toward the bearded man." Do not expand names into profiles; include only brief shot-essential costume, prop, or continuity details.
+- Use concise present-tense, filmable action and professional shot-list terminology. Attribute any dialogue to the named speaker and preserve its wording; reserve parentheticals for essential delivery or action, not age, appearance, or biography.
 - The last frame description must be logically consistent with the first frame description and the motion description. All actions described in the motion section should be reflected in the static image of the last frame.
 - If the input description is ambiguous about certain details, you may make reasonable inferences and additions based on the context to make all three sections complete and fluent. However, core elements must strictly adhere to the input text.
 - Use accurate, concise, and professional descriptive language. Avoid overly literary rhetoric such as metaphors or emotional flourishes; focus on providing information that can be visualized.
@@ -131,32 +134,24 @@ human_prompt_template_decompose_visual_description = \
 
 class VisDescDecompositionResponse(BaseModel):
     ff_desc: str = Field(
-        description="A detailed description of the first frame of the shot, capturing the initial visual elements and composition.",
-        # examples=[
-        #     "Medium shot of a supermarket aisle at eye level. Bob(a tall man wearing a blue shirt and jeans) is positioned on the right side of the frame, captured in profile and facing right, while Alice(a young woman with short hair, wearing a green dress) is on the left, shown pushing a shopping cart with her gaze lowered toward the ground. They are arranged in a front-to-back spatial relationship. Shelves line both sides of the frame, and cool-toned fluorescent lighting from above washes over the scene. The vibrant colors of product packaging contrast with the metallic gray of the shopping cart, all contained within a stable, horizontally balanced composition.",
-        #     "Extreme long shot. Aerial view from hundreds of meters above the ground. The boundless golden desert resembles undulating frozen waves, occupying the vast majority of the frame. At the very center of the image, a tiny, solitary explorer appears only as a faint dark speck, dragging a long, lonely trail of footprints behind him, stretching all the way to the edge of the frame.",
-        #     "Medium shot at eye level angle. Designer A(with a beard, wearing a white suit) leans forward passionately, speaking emphatically. Product Manager B(with a beard, wearing a white T-shirt) sits with crossed arms, looking skeptical. Between them, Development Engineer C(brown hair, wearing a blue T-shirt) appears anxious, glancing between the two. Project Manager D(curly hair, wearing a red T-shirt) prepares to mediate, focusing on a whiteboard. Bright overhead lighting highlights their expressions, with a blurred whiteboard and glass wall in the background.",
-        #     "A low-angle close-up shot captures the figure from below, framing him from the chest up. His face appears resolute and commanding, his eyes piercing as he speaks passionately. Flecks of saliva are visible, emphasizing his intensity. The overcast sky breaks with occasional light, casting him as a heroic, almost monumental figure against the gloom.",
-        #     "An extremely close-up of an old, motionless pocket watch. Soft light highlights scratches on its brass case and the enamel dial with Roman numerals. The second hand remains fixed at 'VIII', casting a sharp shadow. A wrinkled finger gently touches the glass surface, evoking a tangible sense of stillness and time.",
-        #     "An over-the-shoulder shot at eye level, positioned behind Character A(red hair, wearing a white T-shirt). The foreground, including A's shoulder and head, is softly blurred, directing focus onto Character B(with a beard, wearing a white T-shirt)'s face. B's subtle reactions—shifting from surprise to confusion, then to a glimmer of understanding—are clearly visible. The café background is gently blurred with warm lighting.",
-        # ]
+        description="A concise static first-frame description with canonical character names, location, framing, composition, and initial poses; do not repeat character profiles.",
     )
     ff_vis_char_idxs: List[int] = Field(
         description="A list of indices of characters that are visible in the first frame of the shot, corresponding to the character list provided in the input.",
         examples=[[0], [1], [0, 1], []]
     )
     lf_desc: str = Field(
-        description="A detailed description of the last frame of the shot, capturing the concluding visual elements and composition.",
+        description="A concise static last-frame description with canonical character names, location, framing, composition, and final poses; do not repeat character profiles.",
     )
     lf_vis_char_idxs: List[int] = Field(
         description="A list of indices of characters that are visible in the last frame of the shot, corresponding to the character list provided in the input.",
         examples=[[0], [1], [0, 1], []]
     )
     motion_desc: str = Field(
-        description="The motion description of the shot. Describe the dynamic visual changes within the shot (camera movement and the movement of elements within the frame)",
+        description="Concise present-tense camera movement and named character action between the first and last frames; use canonical names rather than appearance-based labels.",
         examples=[
-            "Static camera. Alice (short hair, wearing a green dress) is walking towards the camera.",
-            "Dolly in from meidum shot to close-up. Bob (with a beard, wearing a white T-shirt) smiles to the camera.",
+            "Static camera. <Alice> walks toward the camera.",
+            "Dolly in from medium shot to close-up. <Bob> smiles at <Alice>.",
         ]
     )
     variation_type: Literal["large", "medium", "small"] = Field(

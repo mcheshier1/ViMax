@@ -1,10 +1,11 @@
 import {createHash} from 'node:crypto';
 import {existsSync} from 'node:fs';
-import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {createShot, readRemovedShots, readShotPlan, readRenderAcceptance, removeShot, restoreShot, updateRenderAcceptance, updateShotPlan} from './server-lib.mjs';
+import {createShot, readRemovedShots, readSetReferences, readShotPlan, readShotPlans, readRenderAcceptance, removeShot, restoreShot, updateRenderAcceptance, updateSetReference, updateShotPlan} from './server-lib.mjs';
+import {getShotRestartPlan, restartShot} from './server-lib.mjs';
 
 const storageTestControl = vi.hoisted(() => ({failAcceptanceWrite: false}));
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -134,6 +135,144 @@ describe('shot plans', () => {
     expect(plan.firstFrame).toMatchObject({description: 'DeepSeek enters from the right.', visible: [0], prompt: ''});
     expect(plan.lastFrame).toMatchObject({description: 'DeepSeek beside the Wife.', visible: [0, 1], prompt: 'the prompt that was sent'});
   });
+  it('derives reuse from playback neighbors, including camera boundaries, and keeps list/detail plans aligned', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const descriptionPath = (slot) => path.join(working, ROOT, 'shots', slot, 'shot_description.json');
+    const first = JSON.parse(await readFile(descriptionPath('4'), 'utf8'));
+    const crossCamera = JSON.parse(await readFile(descriptionPath('2'), 'utf8'));
+    await writeFile(descriptionPath('4'), JSON.stringify({...first, reuse_previous_last_frame: true}));
+    await writeFile(descriptionPath('2'), JSON.stringify({...crossCamera, reuse_previous_last_frame: null}));
+    const sameCamera = JSON.parse(await readFile(descriptionPath('7'), 'utf8'));
+    await writeFile(descriptionPath('7'), JSON.stringify({...sameCamera, reuse_previous_last_frame: null}));
+
+    let snapshot = await readShotPlans(root, SESSION_ID, ROOT);
+    const bySlot = (plans, slot) => plans.find((plan) => plan.slot === slot);
+    expect(bySlot(snapshot.plans, '4')).toMatchObject({
+      previousSlot: null, reusePreviousLastFrame: false, previousLastFrameAvailable: false,
+    });
+    expect(bySlot(snapshot.plans, '7')).toMatchObject({
+      previousSlot: '4', reusePreviousLastFrame: true, previousLastFrameAvailable: true,
+    });
+    expect(bySlot(snapshot.plans, '2')).toMatchObject({
+      previousSlot: '7', reusePreviousLastFrame: false, previousLastFrameAvailable: true,
+    });
+    await writeFile(descriptionPath('7'), JSON.stringify({...sameCamera, reuse_previous_last_frame: false}));
+    expect((await readShotPlan(root, SESSION_ID, ROOT, '7')).reusePreviousLastFrame).toBe(false);
+    delete sameCamera.reuse_previous_last_frame;
+    await writeFile(descriptionPath('7'), JSON.stringify(sameCamera));
+    await rm(path.join(working, ROOT, 'shots', '4', 'qwen_qwen-image-3', 'last_frame.png'));
+    expect((await readShotPlan(root, SESSION_ID, ROOT, '7')).previousLastFrameAvailable).toBe(false);
+
+    await rm(path.join(working, 'frame_continuity.json'));
+    const legacy = await readShotPlan(root, SESSION_ID, ROOT, '7');
+    expect(legacy.reusePreviousLastFrame).toBe(false);
+    const explicit = JSON.parse(await readFile(descriptionPath('2'), 'utf8'));
+    await writeFile(descriptionPath('2'), JSON.stringify({...explicit, reuse_previous_last_frame: true}));
+    const detail = await readShotPlan(root, SESSION_ID, ROOT, '2');
+    snapshot = await readShotPlans(root, SESSION_ID, ROOT);
+    expect(detail).toMatchObject({previousSlot: '7', reusePreviousLastFrame: true, previousLastFrameAvailable: true});
+    expect(bySlot(snapshot.plans, '2')).toMatchObject({
+      previousSlot: detail.previousSlot,
+      reusePreviousLastFrame: detail.reusePreviousLastFrame,
+      previousLastFrameAvailable: detail.previousLastFrameAvailable,
+    });
+  });
+
+  it('persists a boolean choice only against the predecessor the editor reviewed', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const request = {sessionId: SESSION_ID, root: ROOT, slot: '7', reusePreviousLastFrame: true, previousSlot: '4'};
+
+    const plan = await updateShotPlan(root, request);
+
+    expect(plan).toMatchObject({previousSlot: '4', reusePreviousLastFrame: true});
+    expect(JSON.parse(await readFile(path.join(working, ROOT, 'shots', '7', 'shot_description.json'), 'utf8'))
+      .reuse_previous_last_frame).toBe(true);
+    await expect(updateShotPlan(root, {...request, reusePreviousLastFrame: 'true'})).rejects.toMatchObject({statusCode: 400});
+    await expect(updateShotPlan(root, {...request, previousSlot: undefined})).rejects.toMatchObject({statusCode: 400});
+
+    await expect(updateShotPlan(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '4', reusePreviousLastFrame: true, previousSlot: null,
+    })).rejects.toMatchObject({statusCode: 400});
+    const cameraTreePath = path.join(working, ROOT, 'camera_tree.json');
+    const cameras = JSON.parse(await readFile(cameraTreePath, 'utf8'));
+    cameras[0].active_shot_idxs = [7, 4];
+    await writeFile(cameraTreePath, JSON.stringify(cameras));
+    await expect(updateShotPlan(root, request)).rejects.toMatchObject({statusCode: 409});
+  });
+
+  it('rolls back a reuse choice when approval invalidation fails', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const descriptionPath = path.join(working, ROOT, 'shots', '7', 'shot_description.json');
+    const descriptionBefore = await readFile(descriptionPath);
+    const acceptancePath = path.join(working, 'render_acceptance.json');
+    const acceptanceBefore = await readFile(acceptancePath);
+    storageTestControl.failAcceptanceWrite = true;
+
+    await expect(updateShotPlan(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '7', reusePreviousLastFrame: false, previousSlot: '4',
+    })).rejects.toThrow(/injected acceptance metadata failure/);
+
+    storageTestControl.failAcceptanceWrite = false;
+    expect(await readFile(descriptionPath)).toEqual(descriptionBefore);
+    expect(await readFile(acceptancePath)).toEqual(acceptanceBefore);
+  });
+
+  it('invalidates explicitly linked successors after an ending edit when global chaining is off', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    await rm(path.join(working, 'frame_continuity.json'));
+    for (const slot of ['7', '2']) {
+      const file = path.join(working, ROOT, 'shots', slot, 'shot_description.json');
+      const description = JSON.parse(await readFile(file, 'utf8'));
+      await writeFile(file, JSON.stringify({...description, reuse_previous_last_frame: true}));
+    }
+
+    await updateShotPlan(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '4', lfDesc: 'The doorway closes behind her.',
+    });
+
+    const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
+  });
+
+  it('invalidates linked approvals on a toggle without deleting frame, clip, or final media', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    await rm(path.join(working, 'frame_continuity.json'));
+    for (const slot of ['7', '2', '0']) {
+      const file = path.join(working, ROOT, 'shots', slot, 'shot_description.json');
+      const description = JSON.parse(await readFile(file, 'utf8'));
+      await writeFile(file, JSON.stringify({...description, reuse_previous_last_frame: true}));
+    }
+    const keepPaths = [
+      `${ROOT}/shots/7/qwen_qwen-image-3/first_frame.png`,
+      `${ROOT}/shots/7/qwen_qwen-image-3/last_frame.png`,
+      `${ROOT}/shots/7/kwaivgi_kling-video-o1/video.mp4`,
+      `${ROOT}/final_video.mp4`,
+    ];
+    const before = await Promise.all(keepPaths.map((file) => readFile(path.join(working, file))));
+
+    await updateShotPlan(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '7', reusePreviousLastFrame: false, previousSlot: '4',
+    });
+
+    const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
+    expect(await Promise.all(keepPaths.map((file) => readFile(path.join(working, file))))).toEqual(before);
+  });
 
   it('writes back which characters each frame shows, and what it describes', async () => {
     const {root, working} = await fixture();
@@ -149,6 +288,91 @@ describe('shot plans', () => {
     expect(stored.motion_desc).toBe('he walks in');
     expect(stored.ff_desc).toBe('DeepSeek enters from the right.');
   });
+  it('saves the brief into the render storyboard and gives a shot brief.json precedence', async () => {
+    const {root, working} = await fixture();
+    const briefPath = path.join(working, ROOT, 'shots', '7', 'brief.json');
+    await writeFile(briefPath, JSON.stringify({idx: 7, visual_desc: 'inserted shot brief', audio_desc: ''}));
+    expect((await read(root)).brief).toBe('inserted shot brief');
+
+    const plan = await update(root, {brief: '  A revised shot brief.  '});
+
+    expect(plan.brief).toBe('A revised shot brief.');
+    expect(JSON.parse(await readFile(briefPath, 'utf8')).visual_desc).toBe('A revised shot brief.');
+    expect(JSON.parse(await readFile(path.join(working, ROOT, 'storyboard.json'), 'utf8'))[0].visual_desc).toBe('A revised shot brief.');
+    expect(JSON.parse(await readFile(path.join(working, ROOT, 'shots', '7', 'shot_description.json'), 'utf8')).visual_desc).toBe('A revised shot brief.');
+  });
+
+  it('saves motion guidance without changing frame descriptions', async () => {
+    const {root, working} = await fixture();
+
+    const plan = await update(root, {motionDesc: '  The camera tracks as he walks in.  '});
+
+    expect(plan.motionDescription).toBe('The camera tracks as he walks in.');
+    const stored = JSON.parse(await readFile(path.join(working, ROOT, 'shots', '7', 'shot_description.json'), 'utf8'));
+    expect(stored.motion_desc).toBe('The camera tracks as he walks in.');
+    expect(stored.ff_desc).toBe('DeepSeek enters from the right.');
+    expect(stored.lf_desc).toBe('DeepSeek beside the Wife.');
+  });
+
+  it('can revise motion when no storyboard brief exists', async () => {
+    const {root, working} = await fixture();
+    await rm(path.join(working, ROOT, 'storyboard.json'));
+    const plan = await update(root, {motionDesc: 'The Claude already in frame turns toward the saloon.'});
+    expect(plan.brief).toBe('');
+    expect(plan.motionDescription).toBe('The Claude already in frame turns toward the saloon.');
+    expect(plan.firstFrame.description).toBe('DeepSeek enters from the right.');
+  });
+
+  it('saves brief, motion and frame changes together while preserving neighboring shots', async () => {
+    const {root, working} = await fixture();
+    const neighbor = path.join(working, ROOT, 'shots', '8');
+    await mkdir(neighbor, {recursive: true});
+    const neighborDescription = {idx: 8, ff_desc: 'neighbor frame', motion_desc: 'neighbor motion'};
+    await writeFile(path.join(neighbor, 'shot_description.json'), JSON.stringify(neighborDescription));
+    await writeFile(path.join(working, ROOT, 'storyboard.json'), JSON.stringify([
+      {idx: 7, visual_desc: 'the shot being removed'},
+      {idx: 8, visual_desc: 'neighbor brief'},
+    ]));
+
+    const plan = await update(root, {
+      brief: 'Reframed visual brief.',
+      motionDesc: 'She turns and sits.',
+      ffDesc: 'The entrance, from a tighter angle.',
+    });
+
+    expect(plan.brief).toBe('Reframed visual brief.');
+    expect(plan.motionDescription).toBe('She turns and sits.');
+    expect(plan.firstFrame.description).toBe('The entrance, from a tighter angle.');
+    expect(JSON.parse(await readFile(path.join(neighbor, 'shot_description.json'), 'utf8'))).toEqual(neighborDescription);
+    expect(JSON.parse(await readFile(path.join(working, ROOT, 'storyboard.json'), 'utf8'))[1].visual_desc).toBe('neighbor brief');
+  });
+
+  it('rolls back guidance and storyboard edits when output invalidation fails', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const descriptionPath = path.join(working, ROOT, 'shots', '7', 'shot_description.json');
+    const storyboardPath = path.join(working, ROOT, 'storyboard.json');
+    const originalDescription = await readFile(descriptionPath, 'utf8');
+    const originalStoryboard = await readFile(storyboardPath, 'utf8');
+    storageTestControl.failAcceptanceWrite = true;
+
+    await expect(update(root, {brief: 'must roll back', motionDesc: 'must roll back'})).rejects.toThrow(/injected acceptance metadata failure/);
+
+    storageTestControl.failAcceptanceWrite = false;
+    expect(await readFile(descriptionPath, 'utf8')).toBe(originalDescription);
+    expect(await readFile(storyboardPath, 'utf8')).toBe(originalStoryboard);
+    expect((await read(root)).brief).toBe('the shot being removed');
+    expect((await read(root)).motionDescription).toBe('he walks in');
+  });
+
+  it('rejects invalid guidance text', async () => {
+    const {root} = await fixture();
+    await expect(update(root, {brief: '  '})).rejects.toThrow(/Brief cannot be empty/);
+    await expect(update(root, {motionDesc: 42})).rejects.toThrow(/Motion description must be text/);
+    await expect(update(root, {brief: 'x'.repeat(1201)})).rejects.toThrow(/at most 1200 characters/);
+    await expect(update(root, {motionDesc: '  '})).rejects.toThrow(/Motion description cannot be empty/);
+    await expect(update(root, {motionDesc: 'x'.repeat(4001)})).rejects.toThrow(/at most 4000 characters/);
+  });
 
   it('refuses a plan edit that would leave the render nothing to work with', async () => {
     const {root} = await fixture();
@@ -160,6 +384,55 @@ describe('shot plans', () => {
     expect((await readShotPlan(root, SESSION_ID, ROOT, '99').catch((error) => error)).message).toMatch(/Unknown shot: 99/);
     await expect(readShotPlan(root, 'unknown-session', ROOT, '7')).resolves.toBeNull();
   });
+  it('persists effective set overrides without changing default assignments or existing set review records', async () => {
+    const {root, working} = await fixture();
+    let inventory = await readSetReferences(root, SESSION_ID, ROOT);
+    inventory = await updateSetReference(root, {
+      sessionId: SESSION_ID,
+      root: ROOT,
+      id: 'saloon',
+      name: 'Saloon',
+      description: 'The town saloon.',
+      shots: ['7'],
+      revision: inventory.revision,
+    });
+    expect((await read(root)).setIds).toEqual(['saloon']);
+    const shotDescriptionPath = path.join(working, ROOT, 'shots', '7', 'shot_description.json');
+    const shotDescription = JSON.parse(await readFile(shotDescriptionPath, 'utf8'));
+    await writeFile(shotDescriptionPath, JSON.stringify({...shotDescription, set_ids: []}));
+    const setApproval = {accepted_at: 'approved', artifacts: []};
+    const shotApproval = {accepted_at: 'rendered', artifacts: []};
+    await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({
+      [ROOT]: {
+        sets: {saloon: setApproval},
+        shots: {'7': {keyframes: shotApproval, clips: shotApproval}},
+        final_video: shotApproval,
+      },
+    }));
+
+    const initial = await read(root);
+    const currentInventory = await readSetReferences(root, SESSION_ID, ROOT);
+    expect(initial.sets).toEqual([{id: 'saloon', name: 'Saloon', accepted: false}]);
+    expect(initial.setIds).toEqual([]);
+    expect(initial.setRevision).toBe(currentInventory.revision);
+    expect(currentInventory.shots[0]).toMatchObject({slot: '7', setIds: []});
+
+    const updated = await update(root, {setIds: ['saloon'], setRevision: initial.setRevision});
+
+    expect(updated.setIds).toEqual(['saloon']);
+    expect(JSON.parse(await readFile(shotDescriptionPath, 'utf8')).set_ids).toEqual(['saloon']);
+    const updatedInventory = await readSetReferences(root, SESSION_ID, ROOT);
+    expect(updatedInventory.sets[0].shots).toEqual(['7']);
+    expect(updatedInventory.shots[0].setIds).toEqual(['saloon']);
+    expect(updated.setRevision).toBe(updatedInventory.revision);
+    const acceptance = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(acceptance.sets.saloon).toEqual(setApproval);
+
+    await expect(update(root, {setIds: [], setRevision: initial.setRevision})).rejects.toMatchObject({statusCode: 409});
+    await expect(update(root, {setIds: ['saloon', 'saloon'], setRevision: updated.setRevision})).rejects.toMatchObject({statusCode: 400});
+    await expect(update(root, {setIds: ['unknown'], setRevision: updated.setRevision})).rejects.toMatchObject({statusCode: 400});
+  });
+
 });
 
 describe('continuous keyframe approvals', () => {
@@ -217,6 +490,25 @@ describe('continuous keyframe approvals', () => {
     expect(store.shots['7'].keyframes).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
     expect(await readFile(path.join(working, ROOT, 'shots', '2', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
       .toBe('clip-2');
+    expect(await readFile(path.join(working, ROOT, '.removed_shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
+      .toBe('clip-7');
+  });
+  it('tracks explicit reuse links through a removal with global chaining off', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    await rm(path.join(working, 'frame_continuity.json'));
+    for (const slot of ['2', '0']) {
+      const file = path.join(working, ROOT, 'shots', slot, 'shot_description.json');
+      const description = JSON.parse(await readFile(file, 'utf8'));
+      await writeFile(file, JSON.stringify({...description, reuse_previous_last_frame: true}));
+    }
+
+    const acceptance = await removeShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '7'});
+
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('accepted');
     expect(await readFile(path.join(working, ROOT, '.removed_shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
       .toBe('clip-7');
   });
@@ -464,4 +756,81 @@ describe('adding and restoring shots', () => {
     const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
     expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('accepted');
   });
+});
+
+describe('complete shot restart', () => {
+  const target = {sessionId: SESSION_ID, root: ROOT, slot: '7'};
+  it('clears all model outputs and held redraws while preserving the plan, shared assets, and other shots', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const shotDir = path.join(working, ROOT, 'shots', '7');
+    const planBytes = await readFile(path.join(shotDir, 'shot_description.json'));
+    await writeFile(path.join(shotDir, 'brief.json'), '{"visual_desc":"Keep this brief"}');
+    const shared = path.join(working, ROOT, 'shared-reference.png');
+    await writeFile(shared, 'shared');
+    const backup = path.join(working, '.redo_backup', ROOT, 'shots', '7', 'old-model');
+    await mkdir(backup, {recursive: true});
+    await writeFile(path.join(backup, 'first_frame.png'), 'held image');
+    const plan = await getShotRestartPlan(root, target);
+    await restartShot(root, {...target, revision: plan.revision});
+    for (const relative of plan.paths) expect(existsSync(path.join(working, relative))).toBe(false);
+    expect(await readFile(path.join(shotDir, 'shot_description.json'))).toEqual(planBytes);
+    expect(await readFile(path.join(shotDir, 'brief.json'), 'utf8')).toBe('{"visual_desc":"Keep this brief"}');
+    expect(await readFile(shared, 'utf8')).toBe('shared');
+    expect(await readFile(path.join(working, ROOT, 'shots', '2', 'qwen_qwen-image-3', 'first_frame.png'), 'utf8')).toBe('first-2');
+    const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    const frames = acceptance.stages.find((stage) => stage.stage === 'keyframes').slots;
+    expect(frames.find((slot) => slot.shot === '7').state).toBe('planned');
+    expect(frames.find((slot) => slot.shot === '4').state).toBe('accepted');
+    expect(frames.find((slot) => slot.shot === '2').state).toBe('stale');
+    expect(acceptance.stages.find((stage) => stage.stage === 'clips').slots.find((slot) => slot.shot === '7').state).toBe('planned');
+    const final = acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0];
+    expect(final.state).toBe('stale');
+    expect(final.artifacts).toEqual([]);
+  });
+
+  it.each(['output', 'plan', 'approval'])('refuses stale confirmation after a changed %s without removing files', async (changed) => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const preview = await getShotRestartPlan(root, target);
+    const file = changed === 'output' ? preview.paths.find((relative) => relative.endsWith('first_frame.png'))
+      : changed === 'plan' ? `${ROOT}/shots/7/shot_description.json` : 'render_acceptance.json';
+    await writeFile(path.join(working, file), 'changed');
+    await expect(restartShot(root, {...target, revision: preview.revision})).rejects.toMatchObject({statusCode: 409});
+    expect(await readFile(path.join(working, ROOT, 'shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8')).toBe('clip-7');
+    expect(await readFile(path.join(working, ROOT, 'final_video.mp4'), 'utf8')).toBe('film');
+  });
+
+  it('refuses queued work admitted during confirmation preflight without removing media', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const preview = await getShotRestartPlan(root, target);
+    let checks = 0;
+    await expect(restartShot(root, {...target, revision: preview.revision}, () => ++checks === 2)).rejects.toMatchObject({statusCode: 409});
+    expect(await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'first_frame.png'), 'utf8')).toBe('first-7');
+  });
+
+  it('rolls back output removal and all approvals when acceptance persistence fails', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const preview = await getShotRestartPlan(root, target);
+    const before = await Promise.all(preview.paths.map((relative) => readFile(path.join(working, relative))));
+    const acceptanceBytes = await readFile(path.join(working, 'render_acceptance.json'));
+    storageTestControl.failAcceptanceWrite = true;
+    await expect(restartShot(root, {...target, revision: preview.revision})).rejects.toThrow('injected acceptance metadata failure');
+    storageTestControl.failAcceptanceWrite = false;
+    expect(await Promise.all(preview.paths.map((relative) => readFile(path.join(working, relative))))).toEqual(before);
+    expect(await readFile(path.join(working, 'render_acceptance.json'))).toEqual(acceptanceBytes);
+  });
+});
+
+it('refuses unsafe shot restart paths before touching generated media', async () => {
+  const {root, working} = await fixture();
+  await withContinuityFilm(working);
+  const outside = path.join(root, 'do-not-delete.txt');
+  await writeFile(outside, 'private');
+  await symlink(outside, path.join(working, ROOT, 'shots', '7', 'linked-output.txt'));
+  await expect(getShotRestartPlan(root, {sessionId: SESSION_ID, root: ROOT, slot: '7'})).rejects.toMatchObject({statusCode: 400});
+  expect(await readFile(outside, 'utf8')).toBe('private');
+  expect(await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'first_frame.png'), 'utf8')).toBe('first-7');
 });

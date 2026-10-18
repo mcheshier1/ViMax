@@ -197,24 +197,24 @@ export function visualRole(path: string): VisualRole | undefined {
   return {family: 'other', kind: '', order: 0, shot, model};
 }
 
-/** `character_portraits/<character>/<view>.png`, with or without a `<model-slug>` level. */
+/** `character_portraits/<character>/<view>.png`, with or without model/backup folders. */
+/** Portrait images may use plain or REMOVED_ view filenames anywhere in this tree. */
 function portraitRole(normalized: string, lower: string): VisualRole | undefined {
-  const view = PORTRAIT_VIEWS.find((candidate) => lower === `${candidate}.png`);
+  const view = PORTRAIT_VIEWS.find((candidate) => lower === `${candidate}.png` || lower === `removed_${candidate}.png`);
   if (!view) return undefined;
   const segments = normalized.split('/');
   const portraitsAt = segments.lastIndexOf('character_portraits');
-  if (portraitsAt < 0 || portraitsAt + 2 > segments.length) return undefined;
-  // `<idx>_<name>` is the character directory, whether or not a model slug sits above it.
-  const characterSegment = segments.slice(portraitsAt + 1, -1).find((segment) => /^\d+_.+/.test(segment));
-  if (!characterSegment) return undefined;
-  const [index, ...rest] = characterSegment.split('_');
-  const name = rest.join('_');
-  const model = segments.length - portraitsAt > 3 ? segments[portraitsAt + 1] : undefined;
+  if (portraitsAt < 0 || portraitsAt + 1 >= segments.length) return undefined;
+  const folders = segments.slice(portraitsAt + 1, -1);
+  const characterSegment = folders.find((segment) => /^\d+_.+/.test(segment));
+  const [, index, ...nameParts] = characterSegment?.match(/^(\d+)_(.+)$/) || [];
+  const folderContext = folders.filter((segment) => segment !== characterSegment);
+  const name = nameParts?.join('_') || folderContext.join(' · ') || 'Backup';
   return {
     family: 'review',
     kind: `${name} · ${view[0].toUpperCase()}${view.slice(1)} portrait`,
-    order: Number(index) * 10 + PORTRAIT_VIEWS.indexOf(view),
-    model,
+    order: index ? Number(index) * 10 + PORTRAIT_VIEWS.indexOf(view) : 100000 + PORTRAIT_VIEWS.indexOf(view),
+    model: characterSegment && folderContext.length === 1 && !/^_|backup|archive/i.test(folderContext[0]) ? folderContext[0] : undefined,
   };
 }
 
@@ -244,14 +244,15 @@ export type VisualPromptSource = {
  *
  * The render records what it sent where it computes it: a keyframe's prompt lives
  * in the shot's `<frame>_selector_output.json`, and a clip's prompt is the shot's
- * motion and audio description. Portraits, camera moves and derived angles build
- * their prompts in memory and keep no record, so they have none to show.
+ * motion and audio description. Portrait prompts are recorded beside their images.
+ * Camera moves and derived angles may have no saved prompt.
  */
 export function visualPromptSource(path: string): VisualPromptSource | undefined {
   const normalized = normalizeArtifactPath(path);
   const role = visualRole(normalized);
   if (role?.family === 'review' && role.kind.includes('portrait')) {
-    // Portrait prompts sit beside the portraits they produced, one file per character.
+    const promptName = normalized.split('/').pop() || '';
+    const view = promptName.toLowerCase().replace(/^removed_/, '').replace(/\.png$/, '');
     return {documentPath: `${normalized.slice(0, normalized.lastIndexOf('/'))}/prompts.json`, field: 'portrait_prompt'};
   }
   if (role?.shot === undefined) return undefined;
@@ -271,7 +272,7 @@ export function visualPromptSource(path: string): VisualPromptSource | undefined
 export function visualPromptText(document: JsonValue, field: VisualPromptSource['field'], path = ''): string {
   if (!isJsonObject(document)) return '';
   if (field === 'portrait_prompt') {
-    const view = (path.split('/').pop() || '').replace(/\.[^.]+$/, '').toLowerCase();
+    const view = (path.split('/').pop() || '').replace(/^removed_/i, '').replace(/\.[^.]+$/, '').toLowerCase();
     const prompt = document[view];
     return typeof prompt === 'string' ? prompt : '';
   }

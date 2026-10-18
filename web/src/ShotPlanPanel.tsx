@@ -1,20 +1,32 @@
 import {forwardRef, useEffect, useImperativeHandle, useRef, useState} from 'react';
-import {AlertTriangle, Save, User} from 'lucide-react';
+import {AlertTriangle, MapPin, Save, User} from 'lucide-react';
 import {updateShotPlan} from './api';
-import {characterChips, planDirty, toggleCharacter} from './timeline';
-import type {PlanFrame, ShotPlan} from './types';
+import {characterChips, planDirty, slotName, toggleCharacter} from './timeline';
+import type {AcceptanceStage, PlanFrame, ShotPlan} from './types';
 
-type PlanDraft = {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]};
+// Older stored drafts contain only frame fields; absent guidance stays at its saved value.
+type PlanDraft = {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]; brief?: string; motionDesc?: string; setIds?: string[]; reusePreviousLastFrame?: boolean; previousSlot?: string | null};
 type StoredDraft = {plan: PlanDraft; base: PlanDraft; notes: Record<string, string>; revision: number};
 const memoryDrafts = new Map<string, StoredDraft>();
 const draftKey = (session: string, root: string, slot: string) => `vimax:film-draft:${encodeURIComponent(session)}:${encodeURIComponent(root)}:${encodeURIComponent(slot)}`;
-const fields = (plan: ShotPlan): PlanDraft => ({ffDesc: plan.firstFrame.description, lfDesc: plan.lastFrame.description, ffVis: plan.firstFrame.visible, lfVis: plan.lastFrame.visible});
+const fields = (plan: ShotPlan): PlanDraft => ({ffDesc: plan.firstFrame.description, lfDesc: plan.lastFrame.description, ffVis: plan.firstFrame.visible, lfVis: plan.lastFrame.visible, brief: plan.brief, motionDesc: plan.motionDescription, setIds: plan.setIds, reusePreviousLastFrame: plan.reusePreviousLastFrame, previousSlot: plan.previousSlot});
+function changedFromBase(value: StoredDraft): boolean {
+  return planDirty({
+    firstFrame: {description: value.base.ffDesc, visible: value.base.ffVis},
+    lastFrame: {description: value.base.lfDesc, visible: value.base.lfVis},
+    brief: value.base.brief ?? '', motionDescription: value.base.motionDesc ?? '', setIds: value.base.setIds,
+    reusePreviousLastFrame: value.base.reusePreviousLastFrame, previousSlot: value.base.previousSlot,
+  }, value.plan);
+}
 function readDraft(key: string): StoredDraft | undefined {
   const cached = memoryDrafts.get(key);
   if (cached) return cached;
   try {
     const value = JSON.parse(localStorage.getItem(key) || 'null') as StoredDraft | null;
-    if (value && typeof value.plan?.ffDesc === 'string' && typeof value.plan?.lfDesc === 'string' && Array.isArray(value.plan.ffVis) && Array.isArray(value.plan.lfVis) && value.base && value.notes) {
+    if (value && typeof value.plan?.ffDesc === 'string' && typeof value.plan?.lfDesc === 'string' && Array.isArray(value.plan.ffVis) && Array.isArray(value.plan.lfVis)
+      && typeof value.base?.ffDesc === 'string' && typeof value.base?.lfDesc === 'string' && Array.isArray(value.base.ffVis) && Array.isArray(value.base.lfVis) && value.notes) {
+      const changed = changedFromBase(value) || Object.keys(value.notes).length > 0;
+      if (!changed) {storeDraft(key); return undefined;}
       memoryDrafts.set(key, value);
       return value;
     }
@@ -28,6 +40,28 @@ function storeDraft(key: string, value?: StoredDraft): boolean {
     return true;
   } catch { return false; }
 }
+/** Reconcile every saved shot, including drafts outside the mounted inspector. */
+export function reconcileFilmDrafts(session: string, root: string, plans: ShotPlan[], stages: AcceptanceStage[]): void {
+  function reconcile(slot: string, plan?: ShotPlan) {
+    const key = draftKey(session, root, slot);
+    const stored = readDraft(key);
+    if (!stored) return;
+    let notes = stored.notes;
+    for (const [stageName, value] of Object.entries(stored.notes)) {
+      const savedStage = stages.find((stage) => stage.stage === stageName);
+      const saved = savedStage?.slots.find((entry) => entry.shot === (slot.startsWith('@') ? null : slot));
+      if (saved && typeof value === 'string' && value.trim() === (saved.reason || '').trim()) {
+        if (notes === stored.notes) notes = {...stored.notes};
+        delete notes[stageName];
+      }
+    }
+    if ((!plan || !changedFromBase(stored) || !planDirty(plan, stored.plan)) && !Object.keys(notes).length) storeDraft(key);
+    else if (notes !== stored.notes) storeDraft(key, {...stored, notes});
+  }
+  for (const plan of plans) reconcile(plan.slot, plan);
+  for (const stage of stages) if (stage.scope === 'session') reconcile(`@${stage.stage}`);
+}
+
 /** Captured with a generation decision; a changed draft requires another explicit decision. */
 export function filmDraftToken(session: string, root: string, slots: string[]): string {
   return JSON.stringify(slots.map((slot) => readDraft(draftKey(session, root, slot)) ?? null));
@@ -39,7 +73,7 @@ export function hasSessionFilmDrafts(session: string): boolean {
   const prefix = `vimax:film-draft:${encodeURIComponent(session)}:`;
   for (const key of memoryDrafts.keys()) if (key.startsWith(prefix)) return true;
   try {
-    for (let index = 0; index < localStorage.length; index++) {
+    for (let index = localStorage.length - 1; index >= 0; index--) {
       const key = localStorage.key(index);
       if (key?.startsWith(prefix) && readDraft(key)) return true;
     }
@@ -73,7 +107,7 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
   const [error, setError] = useState('');
   const [storageFailed, setStorageFailed] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [editing, setEditing] = useState(() => Boolean(readDraft(key)));
+  const [editing, setEditing] = useState(() => Boolean(Object.keys(readDraft(key)?.notes || {}).length));
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const focusFeedback = useRef(false);
   const draftRef = useRef(draft);
@@ -81,11 +115,12 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
   current.current = {key, stage, plan, feedback, disabled, onRegenerate};
   const mounted = useRef(true);
   const operation = useRef(false);
+  const bindingsReady = Boolean(plan && Array.isArray(plan.sets) && Array.isArray(plan.setIds) && typeof plan.setRevision === 'string');
   const planChanged = Boolean(plan && draft && planDirty(plan, draft.plan));
   const note = draft?.notes[stage] ?? feedback;
   const noteChanged = note !== feedback;
   const dirty = planChanged || Boolean(draft && Object.keys(draft.notes).length);
-  const externalChange = Boolean(planChanged && plan && draft && JSON.stringify(fields(plan)) !== JSON.stringify(draft.base));
+  const externalChange = Boolean(planChanged && plan && draft && JSON.stringify(fields(plan)) !== JSON.stringify({...fields(plan), ...draft.base}));
 
   function commit(next: StoredDraft, savedPlan = plan) {
     const hasChanges = Boolean(savedPlan && planDirty(savedPlan, next.plan)) || Object.keys(next.notes).length > 0;
@@ -100,11 +135,18 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     return () => { mounted.current = false; };
   }, []);
   useEffect(() => {
-    if (!plan || readDraft(key) || operation.current) return;
-    const next = {plan: fields(plan), base: fields(plan), notes: {}, revision: (draftRef.current?.revision ?? 0) + 1};
+    if (operation.current) return;
+    const stored = readDraft(key);
+    if (stored && (!plan || planDirty(plan, stored.plan) || Object.keys(stored.notes).length > 0)) {
+      if (stored !== draftRef.current) {draftRef.current = stored; setDraft(stored);}
+      return;
+    }
+    if (stored) storeDraft(key);
+    const savedFields = plan ? fields(plan) : draftRef.current.base;
+    const next = {plan: savedFields, base: savedFields, notes: {}, revision: (draftRef.current?.revision ?? 0) + 1};
     draftRef.current = next;
     setDraft(next);
-  }, [key, plan]);
+  }, [key, plan, feedback, stage]);
   useEffect(() => {
     onDirtyChange(dirty);
     queueMicrotask(() => {
@@ -142,13 +184,32 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     const owner = current.current;
     if (!submitted || owner.disabled || operation.current) return false;
     const changed = mode !== 'feedback' && Boolean(owner.plan && planDirty(owner.plan, submitted.plan));
-    if (changed && !window.confirm(`${accepted ? 'This shot has accepted material. ' : ''}Saving frame descriptions or characters unlocks its frames, invalidates its clip and final-film approval, and makes the coverage review stale. No generation runs. Save this plan?`)) return false;
-    if (changed && externalChange && !window.confirm('The saved plan changed while this draft was open. Replace those newer descriptions and character choices with your draft?')) return false;
+    if (changed && (!owner.plan || !Array.isArray(owner.plan.sets) || !Array.isArray(owner.plan.setIds) || typeof owner.plan.setRevision !== 'string')) {
+      setError('Shot set bindings are unavailable. Restart the updated bridge when idle before saving this plan.');
+      return false;
+    }
+    const continuityChanged = typeof submitted.plan.reusePreviousLastFrame === 'boolean' && submitted.plan.reusePreviousLastFrame !== owner.plan?.reusePreviousLastFrame;
+    if (changed && submitted.plan.reusePreviousLastFrame && submitted.plan.previousSlot !== undefined && submitted.plan.previousSlot !== owner.plan?.previousSlot) {
+      setError(owner.plan?.previousSlot === null
+        ? 'This shot is now first in the timeline and cannot inherit a previous frame. Discard this draft or restore its timeline position before saving.'
+        : 'The previous shot changed while this draft was open. Turn the continuity checkbox off and on again to confirm its new source, or discard the draft.');
+      return false;
+    }
+    if (changed && !window.confirm(`${accepted ? 'This shot has accepted material. ' : ''}Saving shot guidance (brief, motion, frame descriptions, characters, sets or continuity) unlocks its frames, invalidates its clip and final-film approval and dependent continuity approvals, and makes the coverage review stale. No generation runs. Save this plan?`)) return false;
+    if (changed && externalChange && !window.confirm('The saved plan changed while this draft was open. Replace those newer shot guidance fields with your draft?')) return false;
     operation.current = true;
     setSaving(true);
     setError('');
     try {
-      const saved = changed ? await updateShotPlan({sessionId, root, slot, ...submitted.plan}) : owner.plan;
+      const saved = changed ? await updateShotPlan({
+        sessionId, root, slot, ...submitted.plan,
+        brief: submitted.plan.brief?.trim() !== owner.plan?.brief.trim() ? submitted.plan.brief : undefined,
+        motionDesc: submitted.plan.motionDesc?.trim() !== owner.plan?.motionDescription.trim() ? submitted.plan.motionDesc : undefined,
+        setIds: submitted.plan.setIds && (submitted.plan.setIds.length !== owner.plan?.setIds.length || submitted.plan.setIds.some((id) => !owner.plan?.setIds.includes(id))) ? submitted.plan.setIds : undefined,
+        setRevision: owner.plan?.setRevision,
+        reusePreviousLastFrame: continuityChanged ? submitted.plan.reusePreviousLastFrame : undefined,
+        previousSlot: continuityChanged ? owner.plan?.previousSlot : undefined,
+      }) : owner.plan;
       if (!mounted.current || current.current.key !== key) return false;
       if (draftRef.current?.revision !== submitted.revision) {
         await onChanged();
@@ -193,56 +254,106 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
       }
     },
   }));
-  return <details className="film-inspector-disclosure" open={editing} onToggle={(event) => setEditing(event.currentTarget.open)}>
-    <summary>Edit plan & feedback{dirty && <span>Unsaved draft</span>}</summary>
-    <section className="shot-plan film-inspector-plan" aria-label="Shot inspector">
-      {plan?.brief && <p className="plan-brief"><span>Shot brief</span>{plan.brief}</p>}
-      {externalChange && <p className="film-warning"><AlertTriangle size={14} /> The saved plan changed. Your local draft is protected; saving will require confirmation.</p>}
+  return <section className="shot-plan film-inspector-plan" aria-label="Shot inspector">
+    {externalChange && <p className="film-warning"><AlertTriangle size={14} /> The saved plan changed. Your local draft is protected; saving will require confirmation.</p>}
+    {plan && !bindingsReady && <p className="plan-error" role="alert">Shot set bindings are unavailable. Restart the updated bridge when idle before editing this plan.</p>}
+    {plan && bindingsReady && <section className="film-plan-fields" aria-label="Shot guidance">
+      <GuidanceField label="Shot brief" value={draft.plan.brief ?? plan.brief} savedValue={plan.brief} disabled={disabled} saving={saving}
+        onChange={(brief) => edit({brief})} onCancel={() => edit({brief: plan.brief})} />
+      {(['firstFrame', 'lastFrame'] as const).map((part) => <FramePlan
+        key={part} label={part === 'firstFrame' ? 'First frame' : 'Last frame'} frame={plan[part]} characters={plan.characters}
+        description={part === 'firstFrame' ? draft.plan.ffDesc : draft.plan.lfDesc}
+        visible={part === 'firstFrame' ? draft.plan.ffVis : draft.plan.lfVis} disabled={disabled} saving={saving}
+        sets={plan.sets} setIds={draft.plan.setIds ?? plan.setIds} savedSetIds={plan.setIds}
+        continuity={part === 'firstFrame' && typeof plan.previousSlot === 'string' ? {
+          previousSlot: plan.previousSlot, available: plan.previousLastFrameAvailable,
+          checked: draft.plan.reusePreviousLastFrame ?? plan.reusePreviousLastFrame,
+          onChange: (reusePreviousLastFrame) => edit({reusePreviousLastFrame, previousSlot: plan.previousSlot}),
+        } : undefined}
+        onToggleSet={(id, on) => edit({setIds: on ? [...new Set([...(draft.plan.setIds ?? plan.setIds), id])].sort() : (draft.plan.setIds ?? plan.setIds).filter((value) => value !== id)})}
+        onDescription={(value) => edit(part === 'firstFrame' ? {ffDesc: value} : {lfDesc: value})}
+        onToggle={(idx, on) => edit(part === 'firstFrame' ? {ffVis: toggleCharacter(draft.plan.ffVis, idx, on)} : {lfVis: toggleCharacter(draft.plan.lfVis, idx, on)})}
+        onCancel={() => edit({...(part === 'firstFrame' ? {ffDesc: plan.firstFrame.description, ffVis: plan.firstFrame.visible, reusePreviousLastFrame: plan.reusePreviousLastFrame, previousSlot: plan.previousSlot} : {lfDesc: plan.lastFrame.description, lfVis: plan.lastFrame.visible}), setIds: plan.setIds})}
+      />)}
+      <GuidanceField label="Motion description" value={draft.plan.motionDesc ?? plan.motionDescription} savedValue={plan.motionDescription} disabled={disabled} saving={saving}
+        onChange={(motionDesc) => edit({motionDesc})} onCancel={() => edit({motionDesc: plan.motionDescription})} />
+      {planChanged && <p className="film-warning">Saving shot guidance unlocks frames and invalidates downstream clip/final approval. It does not regenerate anything.</p>}
+      <button className="timeline-action" disabled={!planChanged || saving || disabled} onClick={() => void save('plan')}><Save size={13} />{saving ? 'Saving…' : 'Save plan'}</button>
+    </section>}
+    <details className="film-inspector-disclosure" open={editing} onToggle={(event) => setEditing(event.currentTarget.open)}>
+      <summary>Edit feedback{Object.keys(draft.notes).length > 0 && <span>Unsaved feedback</span>}</summary>
       <label className="film-feedback">
         <span>Feedback for {stage === 'clips' ? 'clip' : stage === 'keyframes' ? 'frames' : stage === 'portraits' ? 'portraits' : 'final film'}</span>
         <textarea ref={feedbackRef} rows={3} value={note} disabled={disabled} onChange={(event) => editNote(event.target.value)} placeholder="What should change in the next take?" />
       </label>
-      {plan && <details className="film-plan-fields" open={planChanged || undefined}>
-        <summary>Frame descriptions & characters</summary>
-        {(['firstFrame', 'lastFrame'] as const).map((part) => <FramePlan
-          key={part} label={part === 'firstFrame' ? 'First frame' : 'Last frame'} frame={plan[part]} characters={plan.characters}
-          description={part === 'firstFrame' ? draft.plan.ffDesc : draft.plan.lfDesc}
-          visible={part === 'firstFrame' ? draft.plan.ffVis : draft.plan.lfVis} disabled={disabled}
-          onDescription={(value) => edit(part === 'firstFrame' ? {ffDesc: value} : {lfDesc: value})}
-          onToggle={(idx, on) => edit(part === 'firstFrame' ? {ffVis: toggleCharacter(draft.plan.ffVis, idx, on)} : {lfVis: toggleCharacter(draft.plan.lfVis, idx, on)})}
-        />)}
-        {plan.motionDescription && <details className="plan-prompt"><summary>Motion description</summary><p>{plan.motionDescription}</p></details>}
-        {planChanged && <p className="film-warning">Saving the plan unlocks frames and invalidates downstream clip/final approval. It does not regenerate anything.</p>}
-        <button className="timeline-action" disabled={!planChanged || saving || disabled} onClick={() => void save('plan')}><Save size={13} />{saving ? 'Saving…' : 'Save plan'}</button>
-      </details>}
-      <div className="plan-actions">
-        <button className="timeline-action" disabled={!note.trim() || !noteChanged || saving || disabled} onClick={() => void save('feedback')}>Save feedback</button>
-        {(stage === 'keyframes' || stage === 'clips') && <button className="timeline-action is-primary" disabled={!canRegenerate || saving || disabled} onClick={() => void save('all').then((saved) => { if (saved && mounted.current) current.current.onRegenerate(); })}>Save & regenerate…</button>}
-        {dirty && <button className="timeline-action" disabled={saving} onClick={() => {
-          if (!window.confirm('Discard this shot’s unsaved descriptions, character choices, and feedback?')) return;
-          const restored = plan ? fields(plan) : draft.base;
-          commit({plan: restored, base: restored, notes: {}, revision: draft.revision + 1});
-          setError('');
-        }}>Discard draft</button>}
-      </div>
-      <p className="plan-hint">{dirty ? 'Local draft kept for this project' : 'Saved'} · never saves on blur. Feedback marks this take “Needs changes”; regeneration requires a separate scope, model and cost decision.</p>
-      {Object.keys(draft.notes).some((key) => key !== stage) && <p className="film-warning">There is also unsaved feedback in the other preview stage. Open that stage to save or discard it before generating.</p>}
-      {storageFailed && <p className="plan-error" role="alert">Browser storage is unavailable. Your draft is kept in this tab only; save before reloading.</p>}
-      {error && <p className="plan-error" role="alert">{error}</p>}
-    </section>
-  </details>;
+      <button className="timeline-action" disabled={!note.trim() || !noteChanged || saving || disabled} onClick={() => void save('feedback')}>Save feedback</button>
+    </details>
+    <div className="plan-actions">
+      {(stage === 'keyframes' || stage === 'clips') && <button className="timeline-action is-primary" disabled={!canRegenerate || saving || disabled || !bindingsReady} onClick={() => void save('all').then((saved) => { if (saved && mounted.current) current.current.onRegenerate(); })}>Save & regenerate…</button>}
+      {dirty && <button className="timeline-action" disabled={saving} onClick={() => {
+        if (!window.confirm('Discard this shot’s unsaved guidance, character and set choices, and feedback?')) return;
+        const restored = plan ? fields(plan) : draft.base;
+        commit({plan: restored, base: restored, notes: {}, revision: draft.revision + 1});
+        setError('');
+      }}>Discard draft</button>}
+    </div>
+    <p className="plan-hint">{dirty ? 'Local draft kept for this project' : 'Saved'} · never saves on blur. Feedback marks this take “Needs changes”; regeneration requires a separate scope, model and cost decision.</p>
+    {Object.keys(draft.notes).some((key) => key !== stage) && <p className="film-warning">There is also unsaved feedback in the other preview stage. Open that stage to save or discard it before generating.</p>}
+    {storageFailed && <p className="plan-error" role="alert">Browser storage is unavailable. Your draft is kept in this tab only; save before reloading.</p>}
+    {error && <p className="plan-error" role="alert">{error}</p>}
+  </section>;
 });
 
-function FramePlan({label, frame, characters, description, visible, disabled, onDescription, onToggle}: {
-  label: string; frame: PlanFrame; characters: {idx: number; name: string}[]; description: string; visible: number[]; disabled: boolean;
-  onDescription: (value: string) => void; onToggle: (idx: number, on: boolean) => void;
+function FramePlan({label, frame, characters, sets, setIds, savedSetIds, description, visible, disabled, saving, continuity, onDescription, onToggle, onToggleSet, onCancel}: {
+  label: string; frame: PlanFrame; characters: {idx: number; name: string}[]; sets: ShotPlan['sets']; setIds: string[]; savedSetIds: string[]; description: string; visible: number[]; disabled: boolean; saving: boolean;
+  onDescription: (value: string) => void; onToggle: (idx: number, on: boolean) => void; onToggleSet: (id: string, on: boolean) => void; onCancel: () => void;
+  continuity?: {previousSlot: string; available: boolean; checked: boolean; onChange: (checked: boolean) => void};
 }) {
-  return <div className="plan-frame">
-    <header><strong>{label}</strong><div className="plan-characters">
-      {characterChips(characters, visible).map((character) => <button key={character.idx} className={`plan-character${character.on ? ' is-on' : ''}`} aria-pressed={character.on} disabled={disabled} onClick={() => onToggle(character.idx, !character.on)}><User size={11} />{character.name}</button>)}
+  const changed = description !== frame.description || visible.length !== frame.visible.length || visible.some((idx) => !frame.visible.includes(idx))
+    || setIds.length !== savedSetIds.length || setIds.some((id) => !savedSetIds.includes(id));
+  const [editing, setEditing] = useState(changed);
+  const descriptionRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => { if (editing) descriptionRef.current?.focus(); }, [editing]);
+  return <div className="plan-frame" role="group" aria-label={`${label} description, characters and sets`}>
+    <header><strong>{label} description, characters & sets</strong>
+      {editing ? <button className="timeline-action" disabled={disabled || saving} onClick={() => { onCancel(); setEditing(false); }}>Cancel {label.toLowerCase()} edits</button>
+        : <button className="timeline-action" disabled={disabled || saving} onClick={() => setEditing(true)}>Edit {label.toLowerCase()}</button>}
+    </header>
+    {continuity && <div className="plan-frame-continuity">
+      <label><input type="checkbox" checked={continuity.checked} disabled={disabled || saving} onChange={(event) => continuity.onChange(event.target.checked)} />
+        <span>Use previous shot’s last frame as this shot’s first frame</span>
+      </label>
+      <p className="plan-hint">Source: {slotName('keyframes', continuity.previousSlot)}. When enabled, generation copies that image exactly; the first-frame description does not alter the copied image.</p>
+      {continuity.checked && !continuity.available && <p className="plan-hint">The previous shot’s last frame is missing. Generate and review it before generating this shot with continuity enabled.</p>}
+    </div>}
+    <div className="plan-characters">
+      {characterChips(characters, visible).map((character) => <button key={character.idx} className={`plan-character${character.on ? ' is-on' : ''}`} aria-pressed={character.on} disabled={disabled || !editing} onClick={() => onToggle(character.idx, !character.on)}><User size={11} />{character.name}</button>)}
       {!characters.length && <span className="plan-hint">No characters in this sequence</span>}
-    </div></header>
-    <textarea rows={3} aria-label={`${label} description`} value={description} disabled={disabled} onChange={(event) => onDescription(event.target.value)} />
-    {frame.prompt ? <details className="plan-prompt"><summary>Prompt sent for this frame</summary><pre>{frame.prompt}</pre></details> : <p className="plan-hint">No prompt recorded for this frame.</p>}
+    </div>
+    <div className="plan-characters" role="group" aria-label={`${label} set references`}>
+      {sets.map((set) => <button key={set.id} className={`plan-character plan-set${setIds.includes(set.id) ? ' is-on' : ''}`} aria-pressed={setIds.includes(set.id)} disabled={disabled || saving || !editing} title={`${set.id} · ${set.accepted ? 'Approved reference' : 'Approve a reference in Assets → Sets before generation'}`} onClick={() => onToggleSet(set.id, !setIds.includes(set.id))}><MapPin size={11} />{set.name}{!set.accepted && <AlertTriangle size={11} />}</button>)}
+      {!sets.length && <span className="plan-hint">Prepare locations in Assets → Sets.</span>}
+    </div>
+    {sets.length > 0 && <p className="plan-hint">Set buttons bind both frames of this shot. Refer to the selected set by name in the description; mentioning a name alone does not bind its image.</p>}
+    {editing ? <textarea ref={descriptionRef} rows={4} aria-label={`${label} description`} value={description} disabled={disabled} onChange={(event) => onDescription(event.target.value)} />
+      : <p className="plan-frame-description">{description || 'No description yet.'}</p>}
+    {frame.prompt ? <details className="plan-prompt"><summary>Prompt sent for this frame</summary><p className="plan-hint">This recorded provider prompt is read-only. Edit the frame description above; regeneration builds a new prompt from the saved guidance.</p><pre>{frame.prompt}</pre></details> : <p className="plan-hint">No prompt recorded for this frame.</p>}
+  </div>;
+}
+
+function GuidanceField({label, value, savedValue, disabled, saving, onChange, onCancel}: {
+  label: string; value: string; savedValue: string; disabled: boolean; saving: boolean;
+  onChange: (value: string) => void; onCancel: () => void;
+}) {
+  const [editing, setEditing] = useState(value !== savedValue);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => { if (editing) inputRef.current?.focus(); }, [editing]);
+  return <div className="plan-frame" role="group" aria-label={label}>
+    <header><strong>{label}</strong>
+      {editing ? <button className="timeline-action" disabled={disabled || saving} onClick={() => { onCancel(); setEditing(false); }}>Cancel {label.toLowerCase()} edits</button>
+        : <button className="timeline-action" disabled={disabled || saving} onClick={() => setEditing(true)}>Edit {label.toLowerCase()}</button>}
+    </header>
+    {editing ? <textarea ref={inputRef} rows={4} aria-label={label} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+      : <p className="plan-frame-description">{value || 'No description yet.'}</p>}
   </div>;
 }

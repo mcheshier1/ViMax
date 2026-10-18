@@ -23,6 +23,12 @@ const plans: ShotPlan[] = [
     firstFrame: {description: '', visible: [], prompt: ''},
     lastFrame: {description: '', visible: [], prompt: ''},
     motionDescription: '',
+    sets: [],
+    setIds: [],
+    setRevision: '',
+    reusePreviousLastFrame: false,
+    previousSlot: '3',
+    previousLastFrameAvailable: false,
   },
 ];
 

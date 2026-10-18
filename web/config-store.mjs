@@ -1,21 +1,24 @@
 import {readFile, rename, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {parse, stringify} from 'yaml';
+import {credentialProvider} from './provider-credentials.mjs';
 
 const SECTION_FIELDS = {
   llm: ['model_provider', 'model', 'base_url'],
-  image: ['model', 'base_url'],
+  image: ['model', 'base_url', 'resolution'],
   video: ['provider', 'model', 'base_url', 'resolution', 'clip_seconds', 'generate_audio'],
   embedding: ['model_provider', 'model', 'base_url'],
   reranker: ['model', 'base_url'],
 };
+
+const saveQueues = new Map();
 
 // Eight seconds is the shortest length that carries a spoken line without rushing it.
 const DEFAULT_CLIP_SECONDS = 8;
 
 export async function readAgentConfig(repoRoot) {
   const {payload} = await loadConfig(repoRoot);
-  return publicConfig(payload, effectiveClipSeconds(payload));
+  return publicConfig(payload, effectiveClipSeconds(payload), effectiveImageResolution(payload));
 }
 
 /**
@@ -51,31 +54,95 @@ function usableSeconds(value) {
 }
 
 export async function saveAgentConfig(repoRoot, input) {
-  if (!input || typeof input !== 'object' || !input.sections || typeof input.sections !== 'object') {
+  if (!input || typeof input !== 'object' || !isRecord(input.sections)) {
     throw new Error('Configuration sections are required');
   }
-  const {configPath, payload} = await loadConfig(repoRoot);
+
+  const updatesBySection = new Map();
   for (const [section, fields] of Object.entries(SECTION_FIELDS)) {
+    if (!Object.hasOwn(input.sections, section)) continue;
     const update = input.sections[section];
-    if (!update || typeof update !== 'object') continue;
-    const current = payload[section] && typeof payload[section] === 'object' ? payload[section] : {};
+    if (!isRecord(update)) continue;
+    const prepared = {fields: Object.create(null), apiKeyUpdates: [], apiKey: ''};
     for (const field of fields) {
-      if (!(field in update)) continue;
-      current[field] = validatedValue(update[field], `${section}.${field}`, 2_048);
+      if (Object.hasOwn(update, field)) {
+        prepared.fields[field] = validatedValue(update[field], `${section}.${field}`, 2_048);
+      }
     }
-    if (typeof update.api_key === 'string' && update.api_key.trim()) {
-      current.api_key = validatedValue(update.api_key, `${section}.api_key`, 8_192);
+    if (Object.hasOwn(update, 'api_key') && typeof update.api_key === 'string' && update.api_key.trim()) {
+      prepared.apiKey = validatedValue(update.api_key, `${section}.api_key`, 8_192);
     }
+    if (Object.hasOwn(update, 'api_key_updates')) {
+      if (!isRecord(update.api_key_updates)) throw new Error(`${section}.api_key_updates must be a mapping`);
+      for (const [identity, key] of Object.entries(update.api_key_updates)) {
+        if (!identity.trim() || identity !== identity.trim() || identity.length > 2_048) {
+          throw new Error(`${section}.api_key_updates contains an invalid provider identity`);
+        }
+        prepared.apiKeyUpdates.push([
+          identity,
+          validatedValue(key, `${section}.api_key_updates.${identity}`, 8_192),
+        ]);
+      }
+    }
+    updatesBySection.set(section, prepared);
+  }
+
+  const configPath = path.resolve(repoRoot, 'configs', 'agent.local.yaml');
+  const previous = saveQueues.get(configPath) || Promise.resolve();
+  const operation = previous.catch(() => {}).then(() => saveConfigFile(configPath, updatesBySection));
+  saveQueues.set(configPath, operation);
+  try {
+    return await operation;
+  } finally {
+    if (saveQueues.get(configPath) === operation) saveQueues.delete(configPath);
+  }
+}
+
+async function saveConfigFile(configPath, updatesBySection) {
+  const {payload} = await loadConfigFile(configPath);
+  for (const [section, prepared] of updatesBySection) {
+    const source = Object.hasOwn(payload, section) && isRecord(payload[section]) ? payload[section] : {};
+    const current = Object.assign(Object.create(null), source);
+    const previousIdentity = credentialProvider(current);
+    const apiKeys = copyApiKeys(current.api_keys);
+    const legacyKey = typeof current.api_key === 'string' && current.api_key.trim() ? current.api_key : '';
+    if (!Object.hasOwn(current, 'api_keys') && legacyKey) apiKeys[previousIdentity] = legacyKey;
+
+    for (const [field, value] of Object.entries(prepared.fields)) current[field] = value;
+    const selectedIdentity = credentialProvider(current);
+    for (const [identity, key] of prepared.apiKeyUpdates) {
+      if (key) apiKeys[identity] = key;
+    }
+    if (prepared.apiKey) apiKeys[selectedIdentity] = prepared.apiKey;
+    current.api_keys = apiKeys;
+    current.api_key = Object.hasOwn(apiKeys, selectedIdentity) ? apiKeys[selectedIdentity] : '';
     payload[section] = current;
   }
+
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, stringify(payload, {lineWidth: 0}), {mode: 0o600});
   await rename(temporaryPath, configPath);
-  return publicConfig(payload, effectiveClipSeconds(payload));
+  return publicConfig(payload, effectiveClipSeconds(payload), effectiveImageResolution(payload));
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function copyApiKeys(value) {
+  const result = Object.create(null);
+  if (!isRecord(value)) return result;
+  for (const [identity, key] of Object.entries(value)) {
+    if (typeof key === 'string' && key.trim()) result[identity] = key;
+  }
+  return result;
 }
 
 async function loadConfig(repoRoot) {
-  const configPath = path.join(repoRoot, 'configs', 'agent.local.yaml');
+  return loadConfigFile(path.join(repoRoot, 'configs', 'agent.local.yaml'));
+}
+
+async function loadConfigFile(configPath) {
   let text = '';
   try {
     text = await readFile(configPath, 'utf8');
@@ -86,27 +153,46 @@ async function loadConfig(repoRoot) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('configs/agent.local.yaml must be a YAML mapping');
   }
-  return {configPath, payload};
+  return {payload};
 }
 
-function publicConfig(payload, effectiveSeconds) {
+function publicConfig(payload, effectiveSeconds, effectiveResolution) {
   const sections = {};
   for (const [section, fields] of Object.entries(SECTION_FIELDS)) {
-    const source = payload[section] && typeof payload[section] === 'object' ? payload[section] : {};
+    const source = Object.hasOwn(payload, section) && isRecord(payload[section]) ? payload[section] : {};
     const result = {};
-    for (const field of fields) result[field] = typeof source[field] === 'string' ? source[field] : typeof source[field] === 'boolean' ? String(source[field]) : '';
+    for (const field of fields) {
+      const value = Object.hasOwn(source, field) ? source[field] : undefined;
+      result[field] = typeof value === 'string' ? value : typeof value === 'boolean' || (field === 'clip_seconds' && typeof value === 'number') ? String(value) : '';
+    }
     if (section === 'video' && !result.provider) {
       const baseUrl = String(source.base_url || '').toLowerCase();
       result.provider = baseUrl.includes('agnes-ai.com') ? 'agnes'
         : baseUrl.includes('ltx.io') ? 'ltx'
           : baseUrl.includes('yunwu.ai') ? 'yunwu' : 'openrouter';
     }
+    const apiKeys = copyApiKeys(source.api_keys);
+    const selectedIdentity = credentialProvider(source);
+    const hasScopedMap = Object.hasOwn(source, 'api_keys') && isRecord(source.api_keys);
+    const legacyKey = typeof source.api_key === 'string' && source.api_key.trim() ? source.api_key : '';
+    if (!hasScopedMap && legacyKey) apiKeys[selectedIdentity] = legacyKey;
     result.api_key = '';
-    result.has_api_key = Boolean(typeof source.api_key === 'string' && source.api_key.trim());
+    result.has_api_key = Boolean(Object.hasOwn(apiKeys, selectedIdentity) && apiKeys[selectedIdentity].trim());
+    result.configured_api_key_providers = Object.keys(apiKeys);
     sections[section] = result;
+    if (section === 'image') result.effective_resolution = effectiveResolution;
     if (section === 'video') result.effective_clip_seconds = String(effectiveSeconds);
   }
   return {sections};
+}
+
+function effectiveImageResolution(payload) {
+  const source = Object.hasOwn(payload, 'image') && isRecord(payload.image) ? payload.image : {};
+  const environment = process.env.VIMAX_IMAGE_RESOLUTION?.trim();
+  if (environment) return environment;
+  const configured = typeof source.resolution === 'string' ? source.resolution.trim() : '';
+  if (configured) return configured;
+  return (process.env.VIMAX_IMAGE_MODEL?.trim() || source.model) === 'bytedance-seed/seedream-5-0-flash' ? '1K' : 'auto';
 }
 
 function validatedValue(value, label, maxLength) {

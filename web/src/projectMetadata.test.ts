@@ -74,14 +74,15 @@ describe('manifest style mismatch', () => {
 
 describe('render output on disk', () => {
   it('reports a fully rendered project as ready', () => {
-    const checkpoints = describeArtifacts({portraits: 3, shots: 14, frames: 14, clips: 14, finalVideo: true});
-    expect(checkpoints.map((checkpoint) => checkpoint.state)).toEqual(['ready', 'ready', 'ready', 'ready']);
+    const checkpoints = describeArtifacts({portraits: 3, setReferences: 2, shots: 14, frames: 14, clips: 14, finalVideo: true});
+    expect(checkpoints.map((checkpoint) => checkpoint.state)).toEqual(['ready', 'ready', 'ready', 'ready', 'ready']);
   });
 
   it('shows a partially rendered project as in progress', () => {
-    const checkpoints = describeArtifacts({portraits: 1, shots: 14, frames: 9, clips: 0, finalVideo: false});
+    const checkpoints = describeArtifacts({portraits: 1, setReferences: 1, shots: 14, frames: 9, clips: 0, finalVideo: false});
     expect(checkpoints).toEqual([
       {label: 'Portraits', detail: '1 ready', state: 'ready'},
+      {label: 'Set references', detail: '1 generated', state: 'ready'},
       {label: 'Keyframes', detail: '9/14', state: 'partial'},
       {label: 'Clips', detail: '0/14', state: 'missing'},
       {label: 'Final video', detail: 'Missing', state: 'missing'},
@@ -89,13 +90,13 @@ describe('render output on disk', () => {
   });
 
   it('reports a style change as missing artifacts until the render rebuilds them', () => {
-    const checkpoints = describeArtifacts({portraits: 0, shots: 14, frames: 0, clips: 0, finalVideo: false});
+    const checkpoints = describeArtifacts({portraits: 0, setReferences: 0, shots: 14, frames: 0, clips: 0, finalVideo: false});
     expect(checkpoints.every((checkpoint) => checkpoint.state === 'missing')).toBe(true);
     expect(checkpoints[0].detail).toBe('None');
   });
 
   it('says so when no shots have been planned yet', () => {
-    const checkpoints = describeArtifacts({portraits: 0, shots: 0, frames: 0, clips: 0, finalVideo: false});
-    expect(checkpoints[1].detail).toBe('No shots planned');
+    const checkpoints = describeArtifacts({portraits: 0, setReferences: 0, shots: 0, frames: 0, clips: 0, finalVideo: false});
+    expect(checkpoints[2].detail).toBe('No shots planned');
   });
 });

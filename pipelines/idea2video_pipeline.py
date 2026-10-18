@@ -12,9 +12,11 @@ from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
 from utils.provider_presets import resolve_chat_model_config
 from utils.text import safe_path_component
+from pathlib import Path
 from utils.video import concatenate_video_files
 
 from .render_contract import DEFAULT_RENDER_PHASE, ModelScopedArtifacts, RenderOutcome, normalize_phase
+from pipelines.set_references import generate_set_references, validate_set_candidate_count
 
 
 def _pipeline_print(quiet: bool, message: str) -> None:
@@ -243,8 +245,12 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
         revision_notes: Dict[str, str] | None = None,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
         only_shots: Optional[List[str]] = None,
+        set_ids: Optional[List[str]] = None,
+        redo_sets: Optional[List[str]] = None,
+        set_candidate_count: int = 1,
     ) -> RenderOutcome:
         stop_after = normalize_phase(stop_after)
+        validate_set_candidate_count(set_candidate_count, stop_after)
         self.revision_notes = {str(shot): note for shot, note in (revision_notes or {}).items() if str(note).strip()}
 
         selected_by_scene: Dict[int, List[int]] | None = None
@@ -263,6 +269,39 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
 
         story = await self.develop_story(idea=idea, user_requirement=user_requirement, quiet=quiet)
         characters = await self.extract_characters(story=story, quiet=quiet)
+        if stop_after == "sets":
+            scene_scripts = await self.write_script_based_on_story(story=story, user_requirement=user_requirement, quiet=quiet)
+            for idx, scene_script in enumerate(scene_scripts):
+                scene_working_dir = os.path.join(self.working_dir, f"scene_{idx}")
+                if any((Path(scene_working_dir) / "shots").glob("*/shot_description.json")):
+                    continue
+                os.makedirs(scene_working_dir, exist_ok=True)
+                script2video_pipeline = Script2VideoPipeline(
+                    chat_model=self.chat_model,
+                    image_generator=self.image_generator,
+                    video_generator=self.video_generator,
+                    working_dir=scene_working_dir,
+                )
+                scene_text = scene_script if isinstance(scene_script, str) else json.dumps(scene_script, ensure_ascii=False, indent=2)
+                await script2video_pipeline.plan_text_artifacts(
+                    script=scene_text,
+                    user_requirement=user_requirement,
+                    style=style,
+                    characters=characters,
+                    progress=progress,
+                    quiet=quiet,
+                )
+            references = await generate_set_references(
+                self.working_dir,
+                self.image_generator,
+                style,
+                set_ids=set_ids,
+                redo_sets=redo_sets,
+                set_candidate_count=set_candidate_count,
+                progress=progress,
+            )
+            return self.render_outcome("sets", style, set_references=references, awaiting="stills")
+
         character_portraits_registry = await self.generate_character_portraits(
             characters=characters,
             character_portraits_registry=None,
@@ -272,7 +311,7 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
         if stop_after == "portraits":
             stills = self.portrait_stills(character_portraits_registry)
             _pipeline_print(quiet, f"🖼️ Character portraits ready for style review ({len(stills)} images).")
-            return self.render_outcome("portraits", style, stills=stills, awaiting="stills")
+            return self.render_outcome("portraits", style, stills=stills, awaiting="sets")
 
         scene_scripts = await self.write_script_based_on_story(story=story, user_requirement=user_requirement, quiet=quiet)
         all_video_paths: List[str] = []
@@ -316,7 +355,7 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
                 stop_after=stop_after,
                 progress=progress,
                 only_shots=scene_scope,
-                video_budget=video_budget,
+                continuity_scope=only_shots,
                 revision_notes={
                     slot.split("/", 1)[1]: note
                     for slot, note in (self.revision_notes or {}).items()

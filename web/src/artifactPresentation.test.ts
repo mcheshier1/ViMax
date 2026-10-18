@@ -236,11 +236,20 @@ describe('visual roles', () => {
     expect(visualRole('script2video/shots/1/x-ai_grok-imagine-video/new_camera_1.png')).toMatchObject({family: 'camera', kind: 'New camera angle'});
   });
 
-  it('names portraits from the character directory, with or without a model slug', () => {
-    expect(visualRole('script2video/character_portraits/qwen_qwen-image-3/1_Wife/side.png')).toMatchObject({family: 'review', kind: 'Wife · Side portrait', model: 'qwen_qwen-image-3'});
-    // Sessions rendered before artifacts were grouped by model keep the flat layout.
-    expect(visualRole('script2video/character_portraits/1_Wife/side.png')).toMatchObject({family: 'review', kind: 'Wife · Side portrait', model: undefined});
+  it('recognizes removed and nested backup portraits while preferring an indexed character title', () => {
+    expect(visualRole('script2video/character_portraits/1_Wife/REMOVED_back.png'))
+      .toMatchObject({family: 'review', kind: 'Wife · Back portrait'});
+    expect(visualArtifactTitle('script2video/character_portraits/1_Wife/REMOVED_back.png'))
+      .toBe('Wife · Back portrait');
+
+    const backup = 'script2video/character_portraits/archive/backup/REMOVED_back.png';
+    expect(visualRole(backup)).toMatchObject({family: 'review'});
+
+    const indexed = 'script2video/character_portraits/archive/4_Wife/REMOVED_back.png';
+    expect(visualRole(indexed)).toMatchObject({family: 'review', kind: 'Wife · Back portrait'});
+    expect(visualArtifactTitle(indexed)).toBe('Wife · Back portrait');
   });
+
 
   it('labels visuals with their shot, one-based like the rest of the UI', () => {
     expect(visualArtifactTitle('script2video/shots/0/x-ai_grok-imagine-video/video.mp4')).toBe('Shot 1 · Clip');
@@ -341,8 +350,12 @@ describe('portrait prompts', () => {
 
     expect(visualPromptText(document, 'portrait_prompt', 'script2video/character_portraits/qwen_qwen-image-3/0_Claude/side.png'))
       .toBe('a side-view portrait…');
+    expect(visualPromptText(document, 'portrait_prompt', 'script2video/character_portraits/qwen_qwen-image-3/0_Claude/REMOVED_front.png'))
+      .toBe('a front-view portrait…');
+
     expect(visualPromptText(document, 'portrait_prompt', 'script2video/character_portraits/qwen_qwen-image-3/0_Claude/back.png'))
       .toBe('a back-view portrait…');
+
   });
 
   it('returns nothing when the prompt for that view was not recorded', () => {

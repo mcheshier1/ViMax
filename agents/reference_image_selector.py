@@ -52,6 +52,7 @@ You need to select up to {max_reference_images} of the most relevant reference i
 
 [Guidelines]
 - Ensure that the language of all output values (not include keys) matches that used in the frame description.
+- Keep canonical character names in the supplied shot description and in reference bindings (e.g., "<Alice>'s appearance should reference Image 0"). Do not expand names into long physical profiles or substitute appearance-based labels. Portraits supply appearance; add only concise named reference bindings while preserving the supplied frame description verbatim.
 - The reference image descriptions may depict the same character from different angles, in different outfits, or in different scenes. Identify the description closest to the version described by the user
 - Prioritize image descriptions with similar compositions, i.e., shots taken by the same camera.
 - The images from prior frames are arranged in chronological order. Give higher priority to more recent images (those closer to the end of the sequence).
@@ -103,6 +104,7 @@ You need to select the most relevant reference images based on the user's descri
 
 [Guidelines]
 - Ensure that the language of all output values (not include keys) matches that used in the frame description.
+- Keep canonical character names in the supplied shot description and in reference bindings (e.g., "<Alice>'s appearance should reference Image 0"). Do not expand names into long physical profiles or substitute appearance-based labels. Portraits supply appearance; add only concise named reference bindings while preserving the supplied frame description verbatim.
 - The reference image descriptions may depict the same character from different angles, in different outfits, or in different scenes. Identify the description closest to the version described by the user
 - Prioritize image descriptions with similar compositions, i.e., shots taken by the same camera.
 - The images from prior frames are arranged in chronological order. Give higher priority to more recent images (those closer to the end of the sequence).
@@ -131,13 +133,13 @@ class RefImageIndicesAndTextPrompt(BaseModel):
         ]
     )
     text_prompt: str = Field(
-        description="Text description to guide the image generation. You need to describe the image to be generated, specifying which elements in the generated image should reference which image (and which elements within it). For example, 'Create an image following the given description: \nThe man is standing in the landscape. The man should reference Image 0. The landscape should reference Image 1.' Here, the index of the reference image should refer to its position in the ref_image_indices list, not the sequence number in the provided image list. Refer to the reference image must be in the format of Image N. Do not use any other word except Image."
+        description="Text description to guide image generation, specifying named characters and other elements bound to reference images. For example, '<Bob> stands in the landscape. <Bob>'s appearance should reference Image 0. The landscape should reference Image 1.' Reference indices are positions in ref_image_indices, not the original image sequence. Use the format Image N."
         " The description you were given is the instruction, not a summary of it: reproduce it in the prompt as it stands."
         " Every constraint in it — who is in the frame, what they hold, what they are doing, their expression and the framing —"
         " must survive word for word. Add the reference bindings to it; never reword, shorten or add to what was written.",
         examples=[
             "Create an image based on the following guidance: \n Make modifications based on Image 1: Bob's body turns to face the camera, while all other elements remain unchanged. Bob's appearance should refer to Image 0.",
-            "Create an image following the given description: \nThe man is standing in the landscape. The man should reference Image 0. The landscape should reference Image 1."
+            "Create an image following the given description: \n<Bob> stands in the landscape. <Bob>'s appearance should reference Image 0. The landscape should reference Image 1."
         ]
     )
 

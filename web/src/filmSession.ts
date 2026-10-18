@@ -1,7 +1,8 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {readFilmProgress, readFilmSnapshot} from './api';
 import {renderActivity} from './timeline';
-import type {Artifact, ContinuityPayload, JsonValue, RemovedShot, RenderAcceptance, ShotPlan} from './types';
+import {hasSessionFilmDrafts, reconcileFilmDrafts} from './ShotPlanPanel';
+import type {Artifact, ContinuityPayload, JsonValue, RemovedShot, RenderAcceptance, SetReferenceInventory, ShotPlan} from './types';
 
 export type FilmSnapshot = {
   acceptance: RenderAcceptance;
@@ -9,6 +10,7 @@ export type FilmSnapshot = {
   removed: RemovedShot[];
   continuity: ContinuityPayload;
   artifacts: Artifact[];
+  sets?: SetReferenceInventory;
 };
 
 export type FilmProgress = {
@@ -87,6 +89,8 @@ export function useFilmSession(sessionId: string): FilmSessionState {
         .then((data) => {
           if (disposed) return;
           root = data.acceptance.root;
+          reconcileFilmDrafts(sessionId, root, data.plans, data.acceptance.stages);
+          window.dispatchEvent(new CustomEvent('film-drafts-change', {detail: {sessionId, dirty: hasSessionFilmDrafts(sessionId)}}));
           lastMediaWrite = '';
           for (const artifact of data.artifacts) {
             if (artifact.kind !== 'document' && artifact.path.startsWith(`${root}/`)

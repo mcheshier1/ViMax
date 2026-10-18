@@ -1,6 +1,7 @@
 """Render phase gates, single-model pinning, and model-scoped artifact layout."""
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -71,17 +72,66 @@ def _shot(idx: int, variation_type: str = "small") -> ShotDescription:
     )
 
 
+
+def _approve_test_set(render_root: Path, slots: list[str]) -> str:
+    """Create a real, accepted set reference for phase tests without external generation."""
+    set_dir = render_root / "set_references" / "saloon"
+    set_dir.mkdir(parents=True)
+    spec = {
+        "id": "saloon",
+        "name": "Saloon",
+        "description": "A character-free western saloon interior.",
+        "shots": [str(slot) for slot in slots],
+    }
+    spec_path = set_dir / "set.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    image_path = set_dir / "test_image-model" / "reference.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (16, 9), "brown").save(image_path)
+    provenance_path = image_path.with_name("provenance.json")
+    provenance_path.write_text(json.dumps({
+        "image_model": IMAGE_MODEL,
+        "style": "cinematic",
+        "spec_sha256": hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+    }), encoding="utf-8")
+    project_dir = render_root.parent
+    artifacts = []
+    for path in (spec_path, image_path, provenance_path):
+        raw = path.read_bytes()
+        artifacts.append({
+            "path": path.relative_to(project_dir).as_posix(),
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+    (project_dir / "render_acceptance.json").write_text(json.dumps({
+        render_root.name: {
+            "sets": {"saloon": {"accepted_at": "test", "artifacts": artifacts}},
+        },
+    }), encoding="utf-8")
+    for slot in slots:
+        parts = str(slot).split("/")
+        shot_description = (render_root / parts[0] / "shots" / parts[1] / "shot_description.json"
+                            if render_root.name == "idea2video" else render_root / "shots" / str(slot) / "shot_description.json")
+        shot_description.parent.mkdir(parents=True, exist_ok=True)
+        shot_description.write_text(json.dumps({"idx": int(parts[-1])}), encoding="utf-8")
+    return str(image_path)
+
 def _pipeline(working_dir: str, *, shots=None) -> tuple[Script2VideoPipeline, _Generator, _Generator]:
-    """A pipeline with planning stubbed out, so tests exercise only the render phases."""
+    """A pipeline with planning stubbed out and one locally accepted set."""
     shots = shots or [_shot(0)]
+    render_root = Path(working_dir) / "script2video"
+    set_reference = _approve_test_set(render_root, [shot.idx for shot in shots])
     image_generator = _Generator(IMAGE_MODEL)
     video_generator = _Generator(VIDEO_MODEL)
     pipeline = Script2VideoPipeline(
         chat_model=MagicMock(),
         image_generator=image_generator,
         video_generator=video_generator,
-        working_dir=working_dir,
+        working_dir=str(render_root),
     )
+    pipeline.test_set_reference = set_reference
+    pipeline._active_style = "cinematic"
+    pipeline.camera_image_generator.set_reference_context(str(render_root), "cinematic")
     pipeline.design_storyboard = AsyncMock(return_value=[MagicMock(idx=shot.idx) for shot in shots])
     pipeline.decompose_visual_descriptions = AsyncMock(return_value=shots)
     pipeline.construct_camera_tree = AsyncMock(return_value=[Camera(idx=0, active_shot_idxs=[shot.idx for shot in shots])])
@@ -129,12 +179,12 @@ class ModelScopedLayoutTests(unittest.TestCase):
             pipeline, _, _ = _pipeline(tmp)
             self.assertEqual(pipeline.image_model_slug, "test_image-model")
             self.assertEqual(pipeline.video_model_slug, "test_video-model")
-            self.assertEqual(os.path.relpath(pipeline.portraits_dir(), tmp), os.path.join("character_portraits", "test_image-model"))
-            self.assertEqual(os.path.relpath(pipeline.portraits_registry_path(), tmp), os.path.join("character_portraits", "test_image-model", "registry.json"))
-            self.assertEqual(os.path.relpath(pipeline.frame_path(3, "first_frame"), tmp), os.path.join("shots", "3", "test_image-model", "first_frame.png"))
-            self.assertEqual(os.path.relpath(pipeline.clip_path(3), tmp), os.path.join("shots", "3", "test_video-model", "video.mp4"))
+            self.assertEqual(os.path.relpath(pipeline.portraits_dir(), tmp), os.path.join("script2video", "character_portraits", "test_image-model"))
+            self.assertEqual(os.path.relpath(pipeline.portraits_registry_path(), tmp), os.path.join("script2video", "character_portraits", "test_image-model", "registry.json"))
+            self.assertEqual(os.path.relpath(pipeline.frame_path(3, "first_frame"), tmp), os.path.join("script2video", "shots", "3", "test_image-model", "first_frame.png"))
+            self.assertEqual(os.path.relpath(pipeline.clip_path(3), tmp), os.path.join("script2video", "shots", "3", "test_video-model", "video.mp4"))
             # Prompts are inputs, not model output.
-            self.assertEqual(os.path.relpath(pipeline.selector_output_path(3, "first_frame"), tmp), os.path.join("shots", "3", "first_frame_selector_output.json"))
+            self.assertEqual(os.path.relpath(pipeline.selector_output_path(3, "first_frame"), tmp), os.path.join("script2video", "shots", "3", "first_frame_selector_output.json"))
 
 
 class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
@@ -150,14 +200,36 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(outcome.phase, "portraits")
-            self.assertEqual(outcome.awaiting_confirmation, "stills")
+            self.assertEqual(outcome.awaiting_confirmation, "sets")
             self.assertEqual(outcome.style, "cinematic")
             self.assertEqual(len(outcome.stills), 3)  # front, side, back
-            self.assertTrue(all(path.startswith(os.path.join(tmp, "character_portraits", "test_image-model")) for path in outcome.stills))
+            self.assertTrue(all(path.startswith(os.path.join(pipeline.working_dir, "character_portraits", "test_image-model")) for path in outcome.stills))
             self.assertEqual(video_generator.calls, [])
-            self.assertFalse(os.path.exists(os.path.join(tmp, "shots", "0", "test_image-model", "first_frame.png")))
+            self.assertFalse(os.path.exists(pipeline.frame_path(0, "first_frame")))
             # The portraits phase must not even load the storyboard.
             pipeline.design_storyboard.assert_not_awaited()
+
+    async def test_sets_phase_stops_before_portrait_and_shot_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, image_generator, video_generator = _pipeline(tmp)
+            pipeline._brackets_clips = AsyncMock(side_effect=AssertionError("sets phase must not probe video capabilities"))
+            outcome = await pipeline(
+                script="script",
+                user_requirement="req",
+                style="cinematic",
+                characters=[_character()],
+                stop_after="sets",
+                set_ids=["saloon"],
+            )
+
+            self.assertEqual(outcome.phase, "sets")
+            self.assertEqual(outcome.awaiting_confirmation, "stills")
+            self.assertEqual(outcome.set_references, [pipeline.test_set_reference])
+            self.assertEqual(image_generator.calls, [])
+            self.assertEqual(video_generator.calls, [])
+            self.assertFalse(os.path.exists(pipeline.frame_path(0, "first_frame")))
+            pipeline.design_storyboard.assert_not_awaited()
+            pipeline._brackets_clips.assert_not_awaited()
 
     async def test_stills_phase_stops_before_video_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,8 +246,8 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome.awaiting_confirmation, "video")
             # Both keyframes of every shot are shown, because both bracket the clip.
             expected = [
-                os.path.join(tmp, "shots", "0", "test_image-model", "first_frame.png"),
-                os.path.join(tmp, "shots", "0", "test_image-model", "last_frame.png"),
+                pipeline.frame_path(0, "first_frame"),
+                pipeline.frame_path(0, "last_frame"),
             ]
             self.assertEqual(outcome.stills, expected)
             self.assertTrue(all(os.path.exists(path) for path in expected))
@@ -200,8 +272,8 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_video_phase_generates_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
             # Rebuilding the clip invalidates the old film; keep this focused test off MoviePy's encoder.
-            Path(tmp, "final_video.mp4").write_bytes(b"stale film")
             pipeline, _, video_generator = _pipeline(tmp)
+            Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
             with patch("pipelines.script2video_pipeline.VideoFileClip", return_value=MagicMock()), \
                  patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=MagicMock()):
                 outcome = await pipeline(
@@ -221,8 +293,8 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_video_is_drawn_per_render_however_many_are_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             # A stale final film must not mask clips still pending this render.
-            Path(tmp, "final_video.mp4").write_bytes(b"stale film")
             pipeline, _, video_generator = _pipeline(tmp, shots=[_shot(0), _shot(1), _shot(2)])
+            Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
 
             outcome = await pipeline(
                 script="script",
@@ -239,7 +311,7 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(os.path.exists(pipeline.clip_path(1)))
             self.assertFalse(os.path.exists(pipeline.clip_path(2)))
             self.assertEqual(outcome.final_video_path, "")
-            self.assertFalse(Path(tmp, "final_video.mp4").exists())
+            self.assertFalse(Path(pipeline.working_dir, "final_video.mp4").exists())
 
 
     async def test_deferred_child_frame_does_not_leave_its_clip_waiting(self):
@@ -435,7 +507,7 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline, _, _ = _pipeline(tmp)
             pipeline.construct_camera_tree = AsyncMock(return_value=[Camera(idx=0, active_shot_idxs=[])])
-            stale_film = Path(tmp) / "final_video.mp4"
+            stale_film = Path(pipeline.working_dir) / "final_video.mp4"
             stale_film.write_bytes(b"old film")
 
             with patch("pipelines.script2video_pipeline.concatenate_videoclips") as concatenate:
@@ -459,7 +531,7 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
                 Camera(idx=0, active_shot_idxs=[0, 2]),
             ])
             self._prime_cached_shots(pipeline, [0, 1, 2])
-            film_path = Path(tmp) / "final_video.mp4"
+            film_path = Path(pipeline.working_dir) / "final_video.mp4"
             film_path.write_bytes(b"film containing removed shot 1")
             clip_order = []
 
@@ -552,8 +624,8 @@ class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_end_keyframe_is_generated_for_a_model_that_rejects_one(self):
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "final_video.mp4").write_bytes(b"stale film")
             pipeline, _, video_generator = _pipeline(tmp)
+            Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
 
             async def supports_last_frame():
                 return False
@@ -569,13 +641,13 @@ class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):
                     stop_after="video",
                 )
 
-            self.assertFalse(os.path.exists(os.path.join(tmp, "shots", "0", IMAGE_MODEL, "last_frame.png")))
+            self.assertFalse(os.path.exists(pipeline.frame_path(0, "last_frame")))
             self.assertEqual([os.path.basename(path) for path in video_generator.calls[0]["reference_image_paths"]], ["first_frame.png"])
 
     async def test_both_keyframes_reach_the_video_model_when_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "final_video.mp4").write_bytes(b"stale film")
             pipeline, _, video_generator = _pipeline(tmp)
+            Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
             with patch("pipelines.script2video_pipeline.VideoFileClip", return_value=MagicMock()), \
                  patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=MagicMock()):
                 await pipeline(
@@ -712,21 +784,6 @@ class RenderToolGateTests(unittest.IsolatedAsyncioTestCase):
         (root / "script2video" / "shots" / "0" / "shot_description.json").write_text("{}", encoding="utf-8")
         return ViMaxAdapters(__import__("pathlib").Path(tmp), index), record
 
-    async def test_gated_phase_asks_for_confirmation_instead_of_completing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._adapter(tmp)
-            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=_Generator(IMAGE_MODEL)), \
-                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=_Generator(VIDEO_MODEL)), \
-                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", _PhaseOutcomePipeline):
-                result = await adapter.vimax_render_video({"stop_after": "stills"})
-
-            self.assertTrue(result.ok)
-            self.assertEqual(result.metadata["phase"], "stills")
-            self.assertEqual(result.metadata["awaiting_confirmation"], "video")
-            self.assertFalse(result.metadata["render_completed"])
-            self.assertIn("stop_after=\"video\"", result.content)
-            self.assertIn("cinematic", result.content)
 
     async def test_model_change_is_refused_by_the_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -870,7 +927,9 @@ class IdeaSceneSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_video_call_is_shared_across_scene_transitions_and_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline = _idea_pipeline(tmp, ["scene zero", "scene one"])
+            render_root = Path(tmp) / "idea2video"
+            pipeline = _idea_pipeline(str(render_root), ["scene zero", "scene one"])
+            _approve_test_set(render_root, ["scene_0/0", "scene_0/1", "scene_1/0"])
             video_calls = []
 
             class TransitionOutput:
@@ -880,6 +939,9 @@ class IdeaSceneSchedulingTests(unittest.IsolatedAsyncioTestCase):
             class LocalCameraImageGenerator:
                 def __init__(self, video_generator):
                     self.video_generator = video_generator
+                def set_reference_context(self, working_dir, style):
+                    self.working_dir = working_dir
+                    self.style = style
 
                 async def generate_transition_video(self, **kwargs):
                     video_calls.append("transition")
@@ -943,6 +1005,172 @@ class IdeaSceneSchedulingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(pipeline.video_generator.calls), 1)
             self.assertEqual(outcome.final_video_path, "")
             concatenate.assert_not_called()
+
+class PortraitCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def characters(self):
+        return [_character()] + [
+            _character().model_copy(update={"idx": idx, "identifier_in_scene": name})
+            for idx, name in enumerate(("Woman1", "Woman2", "Bartender"), 1)
+        ]
+
+    async def test_missing_registry_character_and_changed_spec_regenerate_only_that_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, videos = _pipeline(tmp)
+            characters = self.characters()
+            await pipeline(script="script", user_requirement="", characters=characters, style="cinematic", stop_after="portraits")
+            registry_path = Path(pipeline.portraits_registry_path())
+            registry = json.loads(registry_path.read_text())
+            del registry["Claude"]
+            registry_path.write_text(json.dumps(registry))
+            images.calls.clear()
+            await pipeline(script="script", user_requirement="", characters=characters, style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 3)
+            self.assertTrue(all("character Claude" in call["prompt"] for call in images.calls))
+            restored = json.loads(registry_path.read_text())
+            self.assertEqual(set(restored), {c.identifier_in_scene for c in characters})
+            characters[0] = characters[0].model_copy(update={"dynamic_features": "a green shirt"})
+            images.calls.clear()
+            await pipeline(script="script", user_requirement="", characters=characters, style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 3)
+            self.assertIn("a green shirt", images.calls[0]["prompt"])
+            self.assertEqual(videos.calls, [])
+
+    async def test_dangling_view_regenerates_only_missing_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, _ = _pipeline(tmp)
+            await pipeline(script="script", user_requirement="", characters=[_character()], style="cinematic", stop_after="portraits")
+            registry = json.loads(Path(pipeline.portraits_registry_path()).read_text())
+            Path(registry["Claude"]["side"]["path"]).unlink()
+            images.calls.clear()
+            await pipeline(script="script", user_requirement="", characters=[_character()], style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 1)
+            self.assertIn("side-view", images.calls[0]["prompt"])
+
+    async def test_failure_drains_other_characters_and_resumes_partial_views(self):
+        from pipelines.render_contract import PortraitGenerationError
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, _ = _pipeline(tmp)
+            generate = images.generate_single_image
+
+            async def fail_side(**kwargs):
+                if "side-view portrait of character Claude" in kwargs["prompt"]:
+                    raise RuntimeError("controlled side failure")
+                await asyncio.sleep(0)
+                return await generate(**kwargs)
+
+            images.generate_single_image = fail_side
+            with self.assertRaises(PortraitGenerationError) as caught:
+                await pipeline(script="script", user_requirement="", characters=self.characters(), style="cinematic", stop_after="portraits")
+            self.assertEqual(set(caught.exception.failures), {"Claude"})
+            self.assertEqual({Path(path).name for path in caught.exception.missing}, {"side.png", "back.png"})
+            registry = json.loads(Path(pipeline.portraits_registry_path()).read_text())
+            self.assertEqual(set(registry), {"Woman1", "Woman2", "Bartender"})
+            images.generate_single_image = generate
+            images.calls.clear()
+            await pipeline(script="script", user_requirement="", characters=self.characters(), style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 2)
+            self.assertTrue(all("character Claude" in call["prompt"] for call in images.calls))
+
+    async def test_empty_entry_does_not_reuse_untracked_pngs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, _ = _pipeline(tmp)
+            directory = Path(pipeline.portraits_dir()) / "0_Claude"
+            directory.mkdir(parents=True)
+            for view in ("front", "side", "back"):
+                Image.new("RGB", (16, 9), "red").save(directory / f"{view}.png")
+            Path(pipeline.portraits_registry_path()).write_text(json.dumps({"Claude": {}}))
+            await pipeline(script="script", user_requirement="", characters=[_character()], style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 3)
+            with Image.open(directory / "front.png") as image:
+                self.assertEqual(image.getpixel((0, 0)), (0, 0, 255))
+
+    async def test_partial_shared_registry_preserves_external_views(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, _ = _pipeline(str(Path(tmp) / "scene_0"))
+            shared = Path(tmp) / "shared"
+            shared.mkdir()
+            entry = {}
+            for view in ("front", "back"):
+                path = shared / f"{view}.png"
+                Image.new("RGB", (16, 9), "red").save(path)
+                entry[view] = {"path": str(path), "description": view}
+            before = {path: path.read_bytes() for path in shared.iterdir()}
+            await pipeline(script="script", user_requirement="", characters=[_character()],
+                           character_portraits_registry={"Claude": entry}, style="cinematic", stop_after="portraits")
+            self.assertEqual(len(images.calls), 1)
+            self.assertIn("side-view", images.calls[0]["prompt"])
+            self.assertEqual(images.calls[0]["reference_image_paths"], [entry["front"]["path"]])
+            self.assertEqual({path: path.read_bytes() for path in shared.iterdir()}, before)
+
+
+
+class PredecessorFrameReferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_boundaries_follow_playback_order_and_use_end_caption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [_shot(idx) for idx in (0, 4, 2)]
+            pipeline, images, _ = _pipeline(tmp, shots=shots)
+            pipeline.frame_bracketing = True
+            generate = images.generate_single_image
+
+            async def require_existing_source(**kwargs):
+                for source in kwargs["reference_image_paths"]:
+                    self.assertTrue(Path(source).is_file(), source)
+                return await generate(**kwargs)
+
+            images.generate_single_image = require_existing_source
+            await asyncio.wait_for(pipeline.generate_frames_for_single_camera(
+                camera=Camera(idx=0, active_shot_idxs=[0, 4, 2]),
+                shot_descriptions=shots, characters=[], character_portraits_registry={},
+                priority_shot_idxs=[2],
+            ), timeout=2)
+            for shot, predecessor in ((4, 0), (2, 4)):
+                selector = pipeline.load_selector_output(shot, "first_frame")
+                self.assertEqual(selector["reference_image_path_and_text_pairs"], [
+                    [pipeline.test_set_reference, "Approved set reference: Saloon. Preserve its architecture, layout, props and lighting. A character-free western saloon interior."],
+                    [pipeline.frame_path(predecessor, "last_frame"), f"last frame {predecessor}"],
+                ])
+                sent = next(call for call in images.calls if f"last frame {predecessor}\n" in call["prompt"])
+                self.assertEqual(sent["reference_image_paths"], [pipeline.test_set_reference, pipeline.frame_path(predecessor, "last_frame")])
+            for shot in (0, 4, 2):
+                self.assertEqual(pipeline.load_selector_output(shot, "last_frame")["reference_image_path_and_text_pairs"], [
+                    [pipeline.test_set_reference, "Approved set reference: Saloon. Preserve its architecture, layout, props and lighting. A character-free western saloon interior."],
+                    [pipeline.frame_path(shot, "first_frame"), f"first frame {shot}"],
+                ])
+
+    async def test_scoped_redraw_replaces_wrong_cached_boundary_without_drawing_predecessor(self):
+        await self._check_scoped_redraw("first_frame")
+
+    async def test_cached_end_image_with_opening_caption_is_reselected(self):
+        await self._check_scoped_redraw("last_frame")
+
+    async def _check_scoped_redraw(self, cached_source_frame):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = [_shot(0), _shot(1)]
+            pipeline, images, _ = _pipeline(tmp, shots=shots)
+            pipeline.frame_bracketing = True
+            for frame in ("first_frame", "last_frame"):
+                file = Path(pipeline.frame_path(0, frame))
+                file.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (16, 9), "red" if frame == "first_frame" else "green").save(file)
+            before = {frame: Path(pipeline.frame_path(0, frame)).read_bytes() for frame in ("first_frame", "last_frame")}
+            cached = Path(pipeline.selector_output_path(1, "first_frame"))
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_text(json.dumps({
+                "reference_image_path_and_text_pairs": [[pipeline.frame_path(0, cached_source_frame), "first frame 0"]],
+                "text_prompt": "old opening-state prompt",
+                "sent_prompt": "old opening-state prompt",
+            }))
+            await asyncio.wait_for(pipeline.generate_frames_for_single_camera(
+                camera=Camera(idx=0, active_shot_idxs=[0, 1]),
+                shot_descriptions=shots, characters=[], character_portraits_registry={},
+                priority_shot_idxs=[], only_shots=[1],
+            ), timeout=2)
+            self.assertEqual(len(images.calls), 2)
+            self.assertEqual(images.calls[0]["reference_image_paths"], [pipeline.test_set_reference, pipeline.frame_path(0, "last_frame")])
+            self.assertIn("Image 1: last frame 0", images.calls[0]["prompt"])
+            self.assertNotIn("old opening-state prompt", images.calls[0]["prompt"])
+            self.assertEqual(before, {frame: Path(pipeline.frame_path(0, frame)).read_bytes() for frame in before})
+
 
 if __name__ == "__main__":
     unittest.main()

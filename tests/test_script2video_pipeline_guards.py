@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -12,6 +13,70 @@ from agents.storyboard_artist import StoryboardArtist
 from interfaces import Camera, CharacterInScene, ShotBriefDescription, ShotDescription
 from PIL import Image
 from pipelines.script2video_pipeline import Script2VideoPipeline, _group_shots_into_cameras
+from pipelines.set_references import canonical_render_root
+from utils.text import safe_path_component
+
+
+def approve_sets(working_dir, specs, *, style="western", image_model="unknown-image-model"):
+    root = canonical_render_root(working_dir)
+    session_dir = root.parent
+    for spec in specs.values():
+        for slot in spec["shots"]:
+            parts = slot.split("/")
+            if root.name == "idea2video" and len(parts) == 2:
+                shot_dir = root / parts[0] / "shots" / parts[1]
+            elif root.name == "novel2video" and len(parts) == 4:
+                shot_dir = root / "videos" / parts[1] / parts[2] / "shots" / parts[3]
+            else:
+                shot_dir = root / "shots" / parts[-1]
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            (shot_dir / "shot_description.json").write_text(
+                json.dumps({"visual_desc": f"shot {slot}", "ff_desc": "frame"}),
+                encoding="utf-8",
+            )
+
+    acceptance_path = session_dir / "render_acceptance.json"
+    try:
+        acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        acceptance = {}
+    root_record = acceptance.setdefault(root.name, {})
+    set_records = root_record.setdefault("sets", {})
+    references = {}
+    for set_id, fields in specs.items():
+        descriptor = {
+            "id": set_id,
+            "name": fields["name"],
+            "description": fields["description"],
+            "shots": fields["shots"],
+        }
+        descriptor_path = root / "set_references" / set_id / "set.json"
+        descriptor_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor_bytes = json.dumps(descriptor, ensure_ascii=False, indent=2).encode("utf-8")
+        descriptor_path.write_bytes(descriptor_bytes)
+        spec_hash = hashlib.sha256(descriptor_bytes).hexdigest()
+        image_path = descriptor_path.parent / safe_path_component(image_model) / "reference.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (2, 2), "tan").save(image_path)
+        provenance_path = image_path.with_name("provenance.json")
+        provenance_path.write_text(json.dumps({
+            "image_model": image_model,
+            "style": style,
+            "spec_sha256": spec_hash,
+        }), encoding="utf-8")
+        artifacts = []
+        for path in (descriptor_path, image_path, provenance_path):
+            raw = path.read_bytes()
+            artifacts.append({
+                "path": path.relative_to(session_dir).as_posix(),
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            })
+        set_records[set_id] = {"accepted_at": "approved", "artifacts": artifacts}
+        references[set_id] = str(image_path)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    acceptance_path.write_text(json.dumps(acceptance), encoding="utf-8")
+    return references
 
 
 class FailingImageGenerator:
@@ -46,20 +111,38 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plan_text_artifacts_retries_bad_camera_tree_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=tmp)
+            class SetPlannerChat:
+                def __init__(self):
+                    self.prompt = ""
+
+                async def ainvoke(self, prompt):
+                    self.prompt = prompt
+                    return type("Response", (), {"content": json.dumps({"sets": [{
+                        "id": "saloon",
+                        "name": "Saloon",
+                        "description": "Character-free western saloon interior, bar along the north wall.",
+                        "shots": ["0"],
+                    }]})})()
+
+            chat_model = SetPlannerChat()
+            pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=object(), video_generator=object(), working_dir=tmp)
             pipeline.camera_image_generator = FlakyCameraImageGenerator()
 
             async def design_storyboard(script, characters, user_requirement, quiet=False, clip_seconds=None):
                 return [{"idx": 0, "is_last": True, "cam_idx": 3, "visual_desc": "wide shot", "audio_desc": "waves"}]
 
             async def decompose_visual_descriptions(shot_brief_descriptions, characters, quiet=False):
-                return [{"idx": 0, "is_last": True, "cam_idx": 3, "visual_desc": "wide shot", "variation_type": "small", "variation_reason": "simple", "ff_desc": "start", "ff_vis_char_idxs": [], "lf_desc": "end", "lf_vis_char_idxs": [], "motion_desc": "walk", "audio_desc": "waves"}]
+                shot = {"idx": 0, "is_last": True, "cam_idx": 3, "visual_desc": "wide shot", "variation_type": "small", "variation_reason": "simple", "ff_desc": "start", "ff_vis_char_idxs": [], "lf_desc": "end", "lf_vis_char_idxs": [], "motion_desc": "walk", "audio_desc": "waves"}
+                shot_dir = Path(tmp) / "shots" / "0"
+                shot_dir.mkdir(parents=True, exist_ok=True)
+                (shot_dir / "shot_description.json").write_text(json.dumps(shot), encoding="utf-8")
+                return [shot]
 
             pipeline.design_storyboard = design_storyboard
             pipeline.decompose_visual_descriptions = decompose_visual_descriptions
             events = []
             result = await pipeline.plan_text_artifacts(
-                "script",
+                "script source",
                 "req",
                 "style",
                 characters=[{"idx": 0, "identifier_in_scene": "Man", "is_visible": True, "static_features": "adult", "dynamic_features": "coat"}],
@@ -71,11 +154,22 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("construct_camera_tree_retry", events)
             self.assertEqual(result["camera_tree"][0].idx, 3)
             self.assertTrue((Path(tmp) / "camera_tree.json").exists())
+            self.assertTrue((Path(tmp) / "set_references" / "saloon" / "set.json").exists())
+            self.assertIn("script source", chat_model.prompt)
 
     async def test_frame_failure_names_the_shot_and_frame_type(self):
         with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(Path(tmp) / "shots" / "13")
-            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=FailingImageGenerator(), video_generator=object(), working_dir=tmp)
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["13"],
+            }})
+            source = working_dir / "reference.png"
+            Image.new("RGB", (2, 2), "tan").save(source)
+            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=FailingImageGenerator(), video_generator=object(), working_dir=str(working_dir))
+            pipeline._active_style = "western"
             pipeline.reference_image_selector = MagicMock(select_reference_images_and_generate_prompt=AsyncMock(
                 return_value={"reference_image_path_and_text_pairs": [], "text_prompt": "a prompt"}
             ))
@@ -84,7 +178,7 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
                 await pipeline.generate_frame_for_single_shot(
                     shot_idx=13,
                     frame_type="first_frame",
-                    first_shot_ff_path_and_text_pair=("reference.png", "a reference"),
+                    source_frame_pair=(str(source), "a scene source"),
                     frame_desc="the frame",
                     visible_characters=[],
                     character_portraits_registry={},
@@ -92,6 +186,284 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("first_frame of shot 13", str(caught.exception))
             self.assertIn("filtered", str(caught.exception))
+    async def test_accepted_location_binding_is_first_capped_and_cached_without_other_sets(self):
+        class Images:
+            model = "test-image-model"
+            reference_limit = 3
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            set_paths = approve_sets(working_dir, {
+                "saloon": {
+                    "name": "Saloon",
+                    "description": "Character-free western saloon interior with a bar on the north wall.",
+                    "shots": ["0"],
+                },
+                "street": {
+                    "name": "Street",
+                    "description": "Character-free dusty street exterior with a boardwalk.",
+                    "shots": ["1"],
+                },
+            }, image_model="test-image-model")
+            source = working_dir / "source.png"
+            portrait = working_dir / "bartender.png"
+            Image.new("RGB", (2, 2), "tan").save(source)
+            Image.new("RGB", (2, 2), "white").save(portrait)
+            character = CharacterInScene(
+                idx=0,
+                identifier_in_scene="Bartender",
+                is_visible=True,
+                static_features="",
+                dynamic_features="",
+            )
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, object(), str(working_dir))
+            pipeline._active_style = "western"
+            pipeline.revision_notes = {}
+            pipeline.frame_events = {0: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}}
+            selector = MagicMock(select_reference_images_and_generate_prompt=AsyncMock(return_value={
+                "reference_image_path_and_text_pairs": [(str(portrait), "Bartender's portrait.")],
+                "selected_indices": [0],
+                "text_prompt": "Use Image 0 for the bartender while keeping the described saloon layout.",
+            }))
+            pipeline.reference_image_selector = selector
+
+            await pipeline.generate_frame_for_single_shot(
+                shot_idx=0,
+                frame_type="first_frame",
+                source_frame_pair=(str(source), "Mandatory scene source."),
+                frame_desc="The bartender stands behind the saloon bar.",
+                visible_characters=[character],
+                character_portraits_registry={"Bartender": {"front": {"path": str(portrait)}}},
+            )
+
+            call = images.calls[0]
+            self.assertEqual(
+                call["reference_image_paths"],
+                [set_paths["saloon"], str(source), str(portrait)],
+            )
+            self.assertNotIn(set_paths["street"], call["reference_image_paths"])
+            self.assertIn("Image 0: Approved set reference: Saloon.", call["prompt"])
+            self.assertIn("Image 1: Mandatory scene source.", call["prompt"])
+            self.assertIn("Image 2", call["prompt"])
+            cache = json.loads(Path(pipeline.selector_output_path(0, "first_frame")).read_text())
+            self.assertEqual(
+                [pair[0] for pair in cache["reference_image_path_and_text_pairs"]],
+                call["reference_image_paths"],
+            )
+            self.assertEqual(cache["mandatory_references"][0][0], set_paths["saloon"])
+
+            Path(pipeline.frame_path(0, "first_frame")).unlink()
+            descriptor_path = working_dir / "set_references" / "saloon" / "set.json"
+            descriptor = json.loads(descriptor_path.read_text())
+            descriptor["description"] += " with a changed layout."
+            descriptor_path.write_text(json.dumps(descriptor, ensure_ascii=False, indent=2), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "provenance.*stale"):
+                await pipeline.generate_frame_for_single_shot(
+                    shot_idx=0,
+                    frame_type="first_frame",
+                    source_frame_pair=(str(source), "Mandatory scene source."),
+                    frame_desc="The bartender stands behind the saloon bar.",
+                    visible_characters=[character],
+                    character_portraits_registry={"Bartender": {"front": {"path": str(portrait)}}},
+                )
+            self.assertEqual(len(images.calls), 1)
+            selector.select_reference_images_and_generate_prompt.assert_awaited_once()
+
+    async def test_mandatory_set_and_scene_references_fail_before_the_image_post_if_they_do_not_fit(self):
+        class Images:
+            model = "test-image-model"
+            reference_limit = 1
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0"],
+            }}, image_model="test-image-model")
+            source = working_dir / "source.png"
+            Image.new("RGB", (2, 2), "tan").save(source)
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, object(), str(working_dir))
+            pipeline._active_style = "western"
+            selector = MagicMock(select_reference_images_and_generate_prompt=AsyncMock())
+            pipeline.reference_image_selector = selector
+
+            with self.assertRaisesRegex(RuntimeError, "needs 2 mandatory set/scene references"):
+                await pipeline.generate_frame_for_single_shot(
+                    shot_idx=0,
+                    frame_type="first_frame",
+                    source_frame_pair=(str(source), "Mandatory scene source."),
+                    frame_desc="A saloon frame.",
+                    visible_characters=[],
+                    character_portraits_registry={},
+                )
+
+            self.assertEqual(images.calls, [])
+            selector.select_reference_images_and_generate_prompt.assert_not_awaited()
+
+    async def test_sets_phase_does_not_generate_portraits_or_probe_video_catalog(self):
+        class Images:
+            model = "new-image-model"
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "tan")
+
+        class UnusedVideo:
+            async def supports_last_frame(self):
+                raise AssertionError("sets phase must not query the video catalog")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            original_references = approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0"],
+            }}, image_model="old-image-model")
+            canonical_before = Path(original_references["saloon"]).read_bytes()
+            acceptance_path = working_dir.parent / "render_acceptance.json"
+            acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+            acceptance["script2video"].pop("sets")
+            acceptance_path.write_text(json.dumps(acceptance), encoding="utf-8")
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, UnusedVideo(), str(working_dir))
+            pipeline.generate_character_portraits = AsyncMock(
+                side_effect=AssertionError("sets phase must not generate portraits")
+            )
+
+            outcome = await pipeline(
+                script="source script",
+                user_requirement="",
+                style="western",
+                stop_after="sets",
+                set_ids=["saloon"],
+            )
+
+            self.assertEqual(outcome.phase, "sets")
+            self.assertEqual(outcome.stills, [])
+            self.assertEqual(len(outcome.set_references), 1)
+            candidate = Path(outcome.set_references[0])
+            expected_directory = working_dir / "set_references" / "saloon" / safe_path_component("new-image-model")
+            self.assertEqual(candidate.parent, expected_directory)
+            self.assertRegex(candidate.name, r"candidate_[0-9a-f]{32}\.png")
+            self.assertTrue(candidate.with_suffix(".json").exists())
+            self.assertEqual(Path(original_references["saloon"]).read_bytes(), canonical_before)
+            self.assertEqual(len(images.calls), 1)
+            self.assertIn("No people, characters", images.calls[0]["prompt"])
+            pipeline.generate_character_portraits.assert_not_awaited()
+
+    async def test_script_render_preflights_every_missing_shot_before_any_image_post(self):
+        class Images:
+            model = "test-image-model"
+            reference_limit = 4
+
+            def __init__(self):
+                self.calls = []
+
+            async def prepare(self):
+                return None
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        class Video:
+            async def supports_last_frame(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0"],
+            }}, image_model="test-image-model")
+            shot_zero, shot_one = self._shot_description(0), self._shot_description(1)
+            shot_one_dir = working_dir / "shots" / "1"
+            shot_one_dir.mkdir(parents=True)
+            (shot_one_dir / "shot_description.json").write_text(
+                json.dumps(shot_one.model_dump()), encoding="utf-8"
+            )
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, Video(), str(working_dir))
+            pipeline.design_storyboard = AsyncMock(return_value=[])
+            pipeline.decompose_visual_descriptions = AsyncMock(return_value=[shot_zero, shot_one])
+            pipeline.construct_camera_tree = AsyncMock(return_value=[
+                Camera(idx=0, active_shot_idxs=[0]),
+                Camera(idx=1, active_shot_idxs=[1]),
+            ])
+
+            with self.assertRaisesRegex(RuntimeError, "Assign a set reference"):
+                await pipeline(
+                    script="source script",
+                    user_requirement="",
+                    style="western",
+                    characters=[],
+                    stop_after="stills",
+                )
+
+            self.assertEqual(images.calls, [])
+
+
+    def test_invalid_or_empty_shot_set_overrides_block_frame_preflight_before_image_requests(self):
+        class Images:
+            model = "test-image-model"
+            reference_limit = 4
+
+        for set_ids, error in (
+            (["missing"], "unknown set references"),
+            (["saloon", "saloon"], "duplicates"),
+            ([], "Assign a set reference"),
+        ):
+            with self.subTest(set_ids=set_ids), tempfile.TemporaryDirectory() as tmp:
+                working_dir = Path(tmp) / "project" / "script2video"
+                working_dir.mkdir(parents=True)
+                approve_sets(working_dir, {"saloon": {
+                    "name": "Saloon",
+                    "description": "Character-free western saloon interior.",
+                    "shots": ["0"],
+                }}, image_model="test-image-model")
+                description_path = working_dir / "shots" / "0" / "shot_description.json"
+                description = json.loads(description_path.read_text(encoding="utf-8"))
+                description["set_ids"] = set_ids
+                description_path.write_text(json.dumps(description), encoding="utf-8")
+                images = Images()
+                images.generate_single_image = AsyncMock()
+                pipeline = Script2VideoPipeline(object(), images, object(), str(working_dir))
+                pipeline._active_style = "western"
+                pipeline.frame_bracketing = False
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    pipeline._preflight_pending_frame_sets(
+                        [Camera(idx=0, active_shot_idxs=[0])],
+                        [self._shot_description(0)],
+                    )
+
+                images.generate_single_image.assert_not_awaited()
+
 
 
     async def test_a_camera_whose_shots_have_all_left_is_skipped(self):
@@ -132,7 +504,16 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scoped_child_redraw_uses_a_cached_parent_frame(self):
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=tmp)
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["1"],
+            }})
+            pipeline = Script2VideoPipeline(chat_model=object(), image_generator=object(), video_generator=object(), working_dir=str(working_dir))
+            pipeline._active_style = "western"
+            pipeline.camera_image_generator.set_reference_context(str(working_dir), "western")
             pipeline.revision_notes = {}
             pipeline.frame_bracketing = True
             pipeline.frame_events = {
@@ -339,97 +720,6 @@ class ReferenceImageSelectorLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["reference_image_path_and_text_pairs"]), 4)
 
 
-class SceneContextTests(unittest.TestCase):
-    """A close-up must not inherit a portrait's plain studio background."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.working_dir = Path(self.tmp.name)
-        self.pipeline = Script2VideoPipeline.__new__(Script2VideoPipeline)
-        self.pipeline.working_dir = str(self.working_dir)
-        self.pipeline.image_generator = type("Generator", (), {"model": "qwen/qwen-image-3"})()
-
-    def write_frame(self, shot_idx):
-        path = Path(self.pipeline.frame_path(shot_idx, "first_frame"))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"\x89PNG\r\n\x1a\n")
-        return str(path)
-
-    def portrait_pair(self):
-        return ("/session/script2video/character_portraits/qwen_qwen-image-3/1_Wife/front.png", "A front view portrait of Wife.")
-
-    def test_an_earlier_keyframe_is_added_when_only_portraits_were_selected(self):
-        earlier = self.write_frame(3)
-        pairs, prompt = self.pipeline._add_scene_context(4, [self.portrait_pair()], "Use Image 0 for her appearance.")
-
-        self.assertEqual([path for path, _ in pairs], [self.portrait_pair()[0], earlier])
-        self.assertIn("Image 1 shows the setting", prompt)
-        self.assertIn("never their plain studio background", prompt)
-
-    def test_the_nearest_earlier_keyframe_that_exists_is_used(self):
-        self.write_frame(1)
-        nearest = self.write_frame(3)
-        pairs, _ = self.pipeline._add_scene_context(4, [self.portrait_pair()], "prompt")
-
-        self.assertEqual(pairs[-1][0], nearest)
-
-    def test_a_selected_scene_frame_leaves_the_prompt_alone(self):
-        pairs = [self.portrait_pair(), (self.write_frame(1), "The living room.")]
-        returned_pairs, prompt = self.pipeline._add_scene_context(4, pairs, "unchanged")
-
-        self.assertEqual(returned_pairs, pairs)
-        self.assertEqual(prompt, "unchanged")
-
-    def test_a_first_shot_keeps_the_instruction_without_a_scene_frame(self):
-        returned_pairs, prompt = self.pipeline._add_scene_context(0, [self.portrait_pair()], "prompt")
-
-        self.assertEqual(returned_pairs, [self.portrait_pair()])
-        self.assertIn("render the setting described above, not their plain studio background", prompt)
-
-
-class RecordedPromptTests(unittest.IsolatedAsyncioTestCase):
-    """What the render sent is recorded, and a resumed run reuses it unchanged."""
-
-    async def test_a_recorded_prompt_is_reused_rather_than_rebuilt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pipeline = Script2VideoPipeline.__new__(Script2VideoPipeline)
-            pipeline.working_dir = tmp
-            generator = MagicMock(model="qwen/qwen-image-3")
-            generator.generate_single_image = AsyncMock(return_value=MagicMock())
-            pipeline.image_generator = generator
-
-            reference = os.path.join(tmp, "character_portraits", "qwen_qwen-image-3", "0_Cat", "front.png")
-            os.makedirs(os.path.dirname(reference), exist_ok=True)
-            open(reference, "wb").close()
-            os.makedirs(os.path.join(tmp, "shots", "0"), exist_ok=True)
-            cache_path = os.path.join(tmp, "shots", "0", "first_frame_selector_output.json")
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "reference_image_path_and_text_pairs": [[reference, "A front view portrait of Cat."]],
-                    "text_prompt": "the selector prompt",
-                    "sent_prompt": "the prompt actually sent, Image 0 for appearance",
-                }, f)
-
-            events = {"first_frame": asyncio.Event()}
-            events["first_frame"].set()
-            pipeline.frame_events = {0: events}
-
-            await pipeline.generate_frame_for_single_shot(
-                shot_idx=0,
-                frame_type="first_frame",
-                first_shot_ff_path_and_text_pair=(reference, "desc"),
-                frame_desc="a frame",
-                visible_characters=[],
-                character_portraits_registry={},
-            )
-
-            sent = generator.generate_single_image.await_args.kwargs["prompt"]
-            self.assertEqual(sent, "Image 0: A front view portrait of Cat.\n\nthe prompt actually sent, Image 0 for appearance")
-            with open(cache_path, encoding="utf-8") as f:
-                self.assertEqual(json.load(f)["sent_prompt"], "the prompt actually sent, Image 0 for appearance")
-
-
 class ReferenceMentionAlignmentTests(unittest.TestCase):
     """The prompt's `Image N` mentions must address the images actually sent."""
 
@@ -624,33 +914,6 @@ class CharacterPortraitGuaranteeTests(unittest.TestCase):
         self.assertEqual(pipeline._ensure_character_portraits([claude], self._registry("Claude"), full, "p")[0], full)
 
 
-class PortraitReferenceTextTests(unittest.TestCase):
-    """A portrait is offered to the selector in the words the frame uses for that character."""
-
-    def test_the_characters_features_are_offered_beside_their_name(self):
-        pipeline = Script2VideoPipeline.__new__(Script2VideoPipeline)
-        character = CharacterInScene(
-            idx=2, identifier_in_scene="DeepSeek", is_visible=True,
-            static_features="A younger, fitter man with short black hair and rectangular glasses.",
-            dynamic_features="Wearing a t-shirt with a purple whale on it; carrying a laptop.",
-        )
-
-        text = pipeline._portrait_reference_text(character, {"path": "x", "description": "A front view portrait of DeepSeek."})
-
-        # The frame that introduces him says "the younger, fitter man with short black hair and
-        # rectangular glasses (wearing a t-shirt with a purple whale ...)": the features are the
-        # only words the two descriptions share, and without them the selector drops the portrait.
-        self.assertIn("A front view portrait of DeepSeek.", text)
-        self.assertIn("A younger, fitter man with short black hair and rectangular glasses.", text)
-        self.assertIn("Wearing a t-shirt with a purple whale on it; carrying a laptop.", text)
-
-    def test_a_character_without_features_keeps_its_description(self):
-        pipeline = Script2VideoPipeline.__new__(Script2VideoPipeline)
-        character = CharacterInScene(idx=0, identifier_in_scene="Claude", is_visible=True, static_features="", dynamic_features="")
-
-        self.assertEqual(pipeline._portrait_reference_text(character, {"path": "x", "description": "A front view portrait of Claude."}), "A front view portrait of Claude.")
-
-
 class ShotLookupTests(unittest.TestCase):
     """A shot is found by its number, not by where it sits in a list."""
 
@@ -828,9 +1091,16 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
                 return Image.new("RGB", (2, 2), "blue")
 
         with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            set_paths = approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0", "15", "2"],
+            }})
             images = ControlledImages()
-            pipeline = Script2VideoPipeline(object(), images, BracketVideo(), tmp)
-            pipeline.revision_notes = {}
+            pipeline = Script2VideoPipeline(object(), images, BracketVideo(), str(working_dir))
+            pipeline._active_style = "western"
             shots = [self._shot(0, 0), self._shot(15, 0), self._shot(2, 2)]
             pipeline.frame_events = {
                 idx: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}
@@ -855,20 +1125,13 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(Path(pipeline.frame_path(0, "first_frame")).read_bytes(), b"root-end")
             self.assertEqual(
                 images.calls[1]["reference_image_paths"],
-                [pipeline.frame_path(0, "last_frame")],
+                [set_paths["saloon"], pipeline.frame_path(0, "last_frame")],
             )
-            self.assertEqual(images.calls[0]["reference_image_paths"], [pipeline.frame_path(0, "first_frame")])
-            self.assertTrue(all(len(call["reference_image_paths"]) <= 3 for call in images.calls))
-            selector = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())
             self.assertEqual(
-                selector["continuity_source"],
-                {
-                    "shot_idx": 0,
-                    "frame_type": "last_frame",
-                    "sha256": pipeline._sha256_file(pipeline.frame_path(0, "last_frame")),
-                    "mode": "reframe",
-                },
+                images.calls[0]["reference_image_paths"],
+                [set_paths["saloon"], pipeline.frame_path(0, "first_frame")],
             )
+            self.assertTrue(all(len(call["reference_image_paths"]) <= 3 for call in images.calls))
 
     async def test_scoped_missing_predecessor_and_first_only_provider_fail_before_generation(self):
         class FirstOnlyVideo:
@@ -911,7 +1174,14 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             root = project / "script2video"
+            root.mkdir(parents=True)
+            set_paths = approve_sets(root, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0", "15", "2"],
+            }})
             pipeline = Script2VideoPipeline(object(), Images(), Video(), str(root))
+            pipeline._active_style = "western"
             pipeline.revision_notes = {}
             shots = [self._shot(0, 0), self._shot(15, 0), self._shot(2, 2)]
             cameras = [Camera(idx=0, active_shot_idxs=[0, 15]), Camera(idx=2, active_shot_idxs=[2])]
@@ -945,13 +1215,248 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
                     character_portraits_registry={}, only_shots=[2],
                 )
 
+    async def test_explicit_false_overrides_same_camera_automatic_reuse(self):
+        class Images:
+            reference_limit = 3
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        class Video:
+            async def supports_last_frame(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp) / "project" / "script2video"
+            working.mkdir(parents=True)
+            approve_sets(working, {"saloon": {"name": "Saloon", "description": "Western saloon.", "shots": ["0", "1"]}})
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, Video(), str(working))
+            pipeline._active_style = "western"
+            pipeline.revision_notes = {}
+            shots = [self._shot(0, 0), self._shot(1, 0)]
+            shots[1].reuse_previous_last_frame = False
+            camera = Camera(idx=0, active_shot_idxs=[0, 1])
+
+            async def root_frames(**kwargs):
+                for kind, content in (("first_frame", b"root-start"), ("last_frame", b"root-end")):
+                    path = Path(pipeline.frame_path(0, kind))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+
+            pipeline.generate_frames_for_single_camera = root_frames
+            await pipeline.generate_chained_frames(
+                camera_tree=[camera],
+                shot_descriptions=shots,
+                characters=[],
+                character_portraits_registry={},
+            )
+
+            source = Path(pipeline.frame_path(0, "last_frame")).read_bytes()
+            target = Path(pipeline.frame_path(1, "first_frame"))
+            self.assertNotEqual(target.read_bytes(), source)
+            self.assertEqual(len(images.calls), 2)
+            provenance = json.loads(Path(pipeline.selector_output_path(1, "first_frame")).read_text())["continuity_source"]
+            self.assertEqual(provenance["mode"], "reframe")
+            self.assertEqual(provenance["slot"], "0")
+
+    def _reuse_test_pipeline(self, working_dir, shots, camera_tree):
+        class Images:
+            reference_limit = None
+
+            def __init__(self):
+                self.calls = []
+
+            async def prepare(self):
+                return None
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), "blue")
+
+        class Video:
+            async def supports_last_frame(self):
+                return True
+
+        images = Images()
+        pipeline = Script2VideoPipeline(object(), images, Video(), str(working_dir))
+        pipeline._active_style = "western"
+        approve_sets(working_dir, {"saloon": {
+            "name": "Saloon", "description": "Western saloon.",
+            "shots": [pipeline._shot_slot(shot.idx) for shot in shots],
+        }})
+        for shot in shots:
+            description_path = Path(working_dir) / "shots" / str(shot.idx) / "shot_description.json"
+            description_path.write_text(json.dumps(shot.model_dump()), encoding="utf-8")
+        pipeline.frame_bracketing = True
+        pipeline.revision_notes = {}
+        pipeline.frame_events = {
+            shot.idx: {kind: asyncio.Event() for kind in ("first_frame", "last_frame")}
+            for shot in shots
+        }
+        pipeline._playback_predecessors = pipeline._build_playback_predecessors(camera_tree, shots)
+        generated = []
+
+        async def record_frame(**kwargs):
+            generated.append((kwargs["shot_idx"], kwargs["frame_type"]))
+            pipeline.frame_events[kwargs["shot_idx"]][kwargs["frame_type"]].set()
+            return pipeline.frame_path(kwargs["shot_idx"], kwargs["frame_type"])
+
+        pipeline.generate_frame_for_single_shot = record_frame
+        return pipeline, images, generated
+
+    async def test_copy_waits_for_selected_predecessor_redraw_instead_of_copying_old_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp) / "project" / "script2video"
+            working.mkdir(parents=True)
+            shots = [self._shot(15, 0), self._shot(2, 2)]
+            shots[1].reuse_previous_last_frame = True
+            cameras = [Camera(idx=0, active_shot_idxs=[15]), Camera(idx=2, active_shot_idxs=[2])]
+            pipeline, _images, _generated = self._reuse_test_pipeline(working, shots, cameras)
+            pipeline.revision_notes = {"15": "New ending"}
+            source = pipeline._playback_predecessors[2]
+            source_path = Path(source["path"])
+            source_path.parent.mkdir(parents=True)
+            source_path.write_bytes(b"old ending")
+            pending = asyncio.create_task(pipeline._reuse_previous_last_frame(2, source, only_shots={15, 2}))
+            await asyncio.sleep(0)
+            self.assertFalse(Path(pipeline.frame_path(2, "first_frame")).exists())
+            self.assertFalse(source["event"].is_set())
+            source_path.write_bytes(b"new ending")
+            pipeline._mark_frame_fresh(15, "last_frame")
+            source["event"].set()
+            await pending
+            self.assertEqual(Path(pipeline.frame_path(2, "first_frame")).read_bytes(), b"new ending")
+
+    async def test_first_frame_only_provider_can_copy_existing_ending_but_cannot_wait_for_missing_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp) / "project" / "script2video"
+            working.mkdir(parents=True)
+            shots = [self._shot(15, 0), self._shot(2, 2)]
+            shots[1].reuse_previous_last_frame = True
+            cameras = [Camera(idx=0, active_shot_idxs=[15]), Camera(idx=2, active_shot_idxs=[2])]
+            pipeline, images, _generated = self._reuse_test_pipeline(working, shots, cameras)
+            pipeline.frame_bracketing = False
+            source = pipeline._playback_predecessors[2]
+            with self.assertRaisesRegex(RuntimeError, "does not generate ending keyframes"):
+                await pipeline._reuse_previous_last_frame(2, source, only_shots={15, 2})
+            source_path = Path(source["path"])
+            source_path.parent.mkdir(parents=True)
+            source_path.write_bytes(b"existing ending")
+            await pipeline._reuse_previous_last_frame(2, source, only_shots={2})
+            self.assertEqual(Path(pipeline.frame_path(2, "first_frame")).read_bytes(), b"existing ending")
+            self.assertEqual(images.calls, [])
+
+    async def test_per_shot_copy_is_byte_identical_cross_camera_and_skips_first_image_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp) / "project" / "script2video"
+            working.mkdir(parents=True)
+            predecessor = self._shot(15, 0)
+            target = self._shot(2, 2)
+            target.reuse_previous_last_frame = True
+            shots = [predecessor, target]
+            cameras = [Camera(idx=0, active_shot_idxs=[15]), Camera(idx=2, active_shot_idxs=[2])]
+            pipeline, images, generated = self._reuse_test_pipeline(working, shots, cameras)
+            source = Path(pipeline.frame_path(15, "last_frame"))
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"previous ending bytes\x00")
+            pipeline.frame_events[15]["last_frame"].set()
+
+            await pipeline.generate_frames_for_single_camera(
+                camera=cameras[1], shot_descriptions=shots, characters=[],
+                character_portraits_registry={}, priority_shot_idxs=[], only_shots=[2],
+            )
+
+            target_path = Path(pipeline.frame_path(2, "first_frame"))
+            self.assertEqual(target_path.read_bytes(), source.read_bytes())
+            self.assertEqual(images.calls, [])
+            continuity = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())["continuity_source"]
+            self.assertEqual(continuity["slot"], "15")
+            self.assertEqual(continuity["path"], source.relative_to(working.parent).as_posix())
+            self.assertEqual(continuity["sha256"], pipeline._sha256_file(str(source)))
+
+            preserved = target_path.read_bytes()
+            source.write_bytes(b"changed predecessor ending")
+            with self.assertRaisesRegex(RuntimeError, "stale predecessor continuity"):
+                await pipeline.generate_frames_for_single_camera(
+                    camera=cameras[1], shot_descriptions=shots, characters=[],
+                    character_portraits_registry={}, priority_shot_idxs=[], only_shots=[2],
+                )
+            self.assertEqual(target_path.read_bytes(), preserved)
+
+    async def test_per_shot_copy_refuses_missing_excluded_predecessor_before_image_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp) / "project" / "script2video"
+            working.mkdir(parents=True)
+            predecessor = self._shot(15, 0)
+            target = self._shot(2, 2)
+            target.reuse_previous_last_frame = True
+            shots = [predecessor, target]
+            cameras = [Camera(idx=0, active_shot_idxs=[15]), Camera(idx=2, active_shot_idxs=[2])]
+            pipeline, images, generated = self._reuse_test_pipeline(working, shots, cameras)
+
+            with self.assertRaisesRegex(RuntimeError, "predecessor shot 15.*last frame is missing"):
+                await pipeline.generate_frames_for_single_camera(
+                    camera=cameras[1], shot_descriptions=shots, characters=[],
+                    character_portraits_registry={}, priority_shot_idxs=[], only_shots=[2],
+                )
+
+            self.assertEqual(images.calls, [])
+            self.assertEqual(generated, [])
+
+    async def test_per_shot_copy_uses_previous_scene_active_ending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idea_root = Path(tmp) / "project" / "idea2video"
+            previous_scene = idea_root / "scene_0"
+            current_scene = idea_root / "scene_1"
+            previous_scene.mkdir(parents=True)
+            current_scene.mkdir(parents=True)
+            previous = self._shot(15, 0)
+            (previous_scene / "camera_tree.json").write_text(
+                json.dumps([{"idx": 0, "active_shot_idxs": [15]}]), encoding="utf-8",
+            )
+            previous_description = previous_scene / "shots" / "15" / "shot_description.json"
+            previous_description.parent.mkdir(parents=True)
+            previous_description.write_text(json.dumps(previous.model_dump()), encoding="utf-8")
+            target = self._shot(2, 0)
+            target.reuse_previous_last_frame = True
+            cameras = [Camera(idx=0, active_shot_idxs=[2])]
+            pipeline, images, generated = self._reuse_test_pipeline(current_scene, [target], cameras)
+            source = previous_scene / "shots" / "15" / pipeline.image_model_slug / "last_frame.png"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"prior scene ending")
+
+            await pipeline.generate_frames_for_single_camera(
+                camera=cameras[0], shot_descriptions=[target], characters=[],
+                character_portraits_registry={}, priority_shot_idxs=[], only_shots=[2],
+            )
+
+            target_path = Path(pipeline.frame_path(2, "first_frame"))
+            self.assertEqual(target_path.read_bytes(), source.read_bytes())
+            self.assertEqual(images.calls, [])
+            continuity = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())["continuity_source"]
+            self.assertEqual(continuity["slot"], "scene_0/15")
+            self.assertEqual(continuity["path"], source.relative_to(idea_root.parent).as_posix())
+
     async def test_offscreen_name_does_not_override_declared_frame_visibility(self):
         class Images:
             async def generate_single_image(self, **kwargs):
                 return Image.new("RGB", (2, 2), "blue")
 
         with tempfile.TemporaryDirectory() as tmp:
-            pipeline = Script2VideoPipeline(object(), Images(), object(), tmp)
+            working_dir = Path(tmp) / "project" / "script2video"
+            working_dir.mkdir(parents=True)
+            set_paths = approve_sets(working_dir, {"saloon": {
+                "name": "Saloon",
+                "description": "Character-free western saloon interior.",
+                "shots": ["0", "2"],
+            }})
+            pipeline = Script2VideoPipeline(object(), Images(), object(), str(working_dir))
+            pipeline._active_style = "western"
             characters = [
                 CharacterInScene(idx=idx, identifier_in_scene=name, is_visible=True,
                                  static_features="approved identity", dynamic_features="same clothes")
@@ -978,9 +1483,8 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
             selector = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())
             self.assertEqual(
                 [pair[0] for pair in selector["reference_image_path_and_text_pairs"]],
-                [str(source_path), registry["Claude"]["front"]["path"]],
+                [set_paths["saloon"], str(source_path), registry["Claude"]["front"]["path"]],
             )
-
 
 if __name__ == "__main__":
     unittest.main()

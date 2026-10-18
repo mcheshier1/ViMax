@@ -2,7 +2,7 @@ import {mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile} from 'node:fs/pr
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {listStyleDerivedArtifacts, readProjectMetadata, rerenderPrompt, updateProjectMetadata} from './server-lib.mjs';
+import {listSessionArtifacts, listStyleDerivedArtifacts, readProjectMetadata, rerenderPrompt, updateProjectMetadata} from './server-lib.mjs';
 
 const roots = [];
 const SESSION_ID = 'session-1';
@@ -85,7 +85,7 @@ describe('project metadata', () => {
         style: 'cartoon',
         created_at: '2026-07-17T10:00:00',
       },
-      artifacts: {portraits: 1, shots: 1, frames: 1, clips: 1, finalVideo: true},
+      artifacts: {portraits: 1, setReferences: 0, shots: 1, frames: 1, clips: 1, finalVideo: true},
     });
     expect(await readProjectMetadata(root, 'unknown-session')).toBeNull();
   });
@@ -101,6 +101,16 @@ describe('project metadata', () => {
   it('lists only style-derived artifacts that exist on disk', async () => {
     const {root} = await fixture();
     expect(await listStyleDerivedArtifacts(root, SESSION_ID)).toEqual(STYLE_DERIVED);
+  });
+  it('counts and surfaces generated set reference images as project assets', async () => {
+    const {root, working} = await fixture();
+    const reference = 'script2video/set_references/saloon/qwen_qwen-image-3/reference.png';
+    const absolute = path.join(working, 'set_references', 'saloon', 'qwen_qwen-image-3', 'reference.png');
+    await mkdir(path.dirname(absolute), {recursive: true});
+    await writeFile(absolute, 'reference');
+
+    expect((await readProjectMetadata(root, SESSION_ID)).artifacts.setReferences).toBe(1);
+    expect((await listSessionArtifacts(root, SESSION_ID)).some((artifact) => artifact.path === reference)).toBe(true);
   });
 
   it('persists a style change but touches no files without invalidate', async () => {
@@ -147,7 +157,7 @@ describe('project metadata', () => {
     expect((await readProjectMetadata(root, SESSION_ID)).manifest.style).toBe('photorealistic cinematic');
     // The Project page reports render output from disk, so the invalidation is
     // visible there instead of still being described by the stale flags.
-    expect((await readProjectMetadata(root, SESSION_ID)).artifacts).toEqual({portraits: 0, shots: 1, frames: 0, clips: 0, finalVideo: false});
+    expect((await readProjectMetadata(root, SESSION_ID)).artifacts).toEqual({portraits: 0, setReferences: 0, shots: 1, frames: 0, clips: 0, finalVideo: false});
   });
 
   it('never follows a symlink out of the session working dir', async () => {

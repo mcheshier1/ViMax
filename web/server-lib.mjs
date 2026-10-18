@@ -2,12 +2,14 @@ import {createHash, randomUUID} from 'node:crypto';
 import {createReadStream} from 'node:fs';
 import {lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile} from 'node:fs/promises';
 import path from 'node:path';
-import {readClipSettings} from './config-store.mjs';
+import {crc32} from 'node:zlib';
+import {readAgentConfig, readClipSettings} from './config-store.mjs';
 import {withProjectWriteLock} from './project-lock.mjs';
 import {assembleClips} from './film-assembly.mjs';
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
+const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
 const TEXT_EXTENSIONS = new Set(['.txt', '.md', '.json']);
 
 const historyCache = new Map();
@@ -269,6 +271,542 @@ export async function listSessionArtifacts(repoRoot, sessionId) {
   return collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, createFilmReadContext());
 }
 
+export async function getAssetDeletionPlan(repoRoot, sessionId, requestedPath) {
+  const plan = await readAssetDeletionPlan(repoRoot, sessionId, [requestedPath]);
+  return plan ? {path: plan.paths[0], revision: plan.revision, impacts: plan.impacts} : null;
+}
+
+export async function getAssetsDeletionPlan(repoRoot, sessionId, requestedPaths) {
+  if (typeof sessionId !== 'string') throw acceptanceError('sessionId is required');
+  const plan = await readAssetDeletionPlan(repoRoot, sessionId, requestedPaths);
+  return plan ? {paths: plan.paths, revision: plan.revision, impacts: plan.impacts} : null;
+}
+
+async function readAssetDeletionPlan(repoRoot, sessionId, requestedPaths) {
+  validateAssetPaths(requestedPaths);
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    return assetDeletionPlanUnlocked(workingDir, requestedPaths);
+  });
+}
+
+export async function deleteAsset(repoRoot, input = {}, isBusy = () => false) {
+  if (!isPlainObject(input) || typeof input.sessionId !== 'string'
+    || typeof input.path !== 'string' || typeof input.revision !== 'string' || !input.revision) {
+    throw acceptanceError('sessionId, path, and revision are required');
+  }
+  const result = await deleteAssets(repoRoot, {
+    sessionId: input.sessionId,
+    paths: [input.path],
+    revision: input.revision,
+  }, isBusy);
+  return result && {deletedPath: result.deletedPaths[0], artifacts: result.artifacts};
+}
+
+export async function deleteAssets(repoRoot, input = {}, isBusy = () => false) {
+  if (!isPlainObject(input) || typeof input.sessionId !== 'string'
+    || typeof input.revision !== 'string' || !input.revision) {
+    throw acceptanceError('sessionId, paths, and revision are required');
+  }
+  validateAssetPaths(input.paths);
+  const record = sessionRecord(await readSessionsPayload(repoRoot), input.sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, input.sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    if (isBusy()) throw conflictError(`Wait for active and queued requests to finish before deleting ${input.paths.length === 1 ? 'an asset' : 'assets'}`);
+    const plan = await assetDeletionPlanUnlocked(workingDir, input.paths);
+    if (plan.revision !== input.revision) {
+      throw conflictError('Assets or related metadata changed; refresh the deletion confirmation');
+    }
+    const changedAcceptance = invalidateAssetApprovals(
+      plan.acceptance,
+      plan.assetPlans,
+      plan.continuityEnabled,
+      plan.dependencyDirectories,
+      plan.cameraTrees,
+      plan.shotDescriptions,
+    );
+    if (isBusy()) throw conflictError(`A request started or was queued before ${input.paths.length === 1 ? 'the asset could' : 'the assets could'} be deleted; wait for requests to finish`);
+    const registryUpdates = new Map();
+    for (const asset of plan.assetPlans) {
+      for (const reference of asset.registryRefs) {
+        let registry = registryUpdates.get(reference.file);
+        if (!registry) {
+          registry = plan.registries.get(reference.file);
+          registryUpdates.set(reference.file, registry);
+        }
+        const entry = registry[reference.character];
+        if (isPlainObject(entry) && isPlainObject(entry[reference.view])
+          && typeof entry[reference.view].path === 'string'
+          && safeRegistryPortraitPath(workingDir, entry[reference.view].path) === asset.path) {
+          delete entry[reference.view];
+        }
+      }
+    }
+    await withMutationTransaction(async (transaction) => {
+      for (const asset of plan.assetPlans) {
+        await assertSafeRegularFile(workingDir, path.resolve(workingDir, asset.path));
+      }
+      for (const [file, registry] of registryUpdates) {
+        await transaction.write(file, `${JSON.stringify(registry, null, 2)}\n`, plan.registryBytes.get(file));
+      }
+      if (changedAcceptance) {
+        await transaction.write(
+          plan.acceptancePath,
+          `${JSON.stringify(plan.acceptance, null, 2)}\n`,
+          plan.acceptanceBytes,
+        );
+      }
+      for (const asset of plan.assetPlans) {
+        await transaction.remove(path.resolve(workingDir, asset.path));
+      }
+    });
+    return {
+      deletedPaths: plan.paths,
+      artifacts: await collectSessionArtifacts(workingDir, input.sessionId, createFilmReadContext()),
+    };
+  });
+}
+
+function validateAssetPaths(requestedPaths) {
+  if (!Array.isArray(requestedPaths) || requestedPaths.length === 0
+    || requestedPaths.some((requestedPath) => typeof requestedPath !== 'string')) {
+    throw acceptanceError('paths must be a non-empty array of session-relative asset paths');
+  }
+}
+
+async function assetDeletionPlanUnlocked(workingDir, requestedPaths) {
+  const paths = [...new Set(requestedPaths.map((requestedPath) => {
+    const relative = safeSessionRelativePath(requestedPath);
+    if (!MEDIA_EXTENSIONS.has(path.extname(relative).toLowerCase())) {
+      throw acceptanceError('Only image and video assets can be deleted');
+    }
+    return relative;
+  }))].sort();
+  const assetPlans = [];
+  for (const relative of paths) {
+    const absolute = path.resolve(workingDir, relative);
+    if (!isPathInside(workingDir, absolute)) throw acceptanceError('Asset path escapes the project');
+    try { await assertSafeRegularFile(workingDir, absolute); }
+    catch (error) {
+      if (error.code === 'ENOENT') {
+        const missing = new Error('Asset not found');
+        missing.statusCode = 404;
+        throw missing;
+      }
+      throw error;
+    }
+    const [info, hash] = await Promise.all([lstat(absolute), sha256File(absolute)]);
+    assetPlans.push({path: relative, info, hash, registryRefs: [], portraitRoots: new Set(), activeShot: false, referencedShots: []});
+  }
+
+  const assetsByPath = new Map(assetPlans.map((asset) => [asset.path, asset]));
+  const referencedShots = new Map(paths.map((relative) => [relative, new Map()]));
+  const [manifestBytes, continuityBytes, frameContinuityBytes] = await Promise.all([
+    readSafeMetadata(workingDir, path.join(workingDir, 'render_manifest.json')),
+    readSafeMetadata(workingDir, path.join(workingDir, CONTINUITY_FILENAME)),
+    readSafeMetadata(workingDir, path.join(workingDir, 'frame_continuity.json')),
+  ]);
+  const manifest = manifestBytes === null ? {} : parseJson(manifestBytes, 'Invalid render manifest');
+  const dependencySnapshot = await listAssetDependencyFiles(workingDir);
+  const dependencyFiles = dependencySnapshot.files;
+  const registryHashes = [];
+  const registries = new Map();
+  const registryBytes = new Map();
+  const cameraTrees = new Map();
+  const shotDescriptions = new Map();
+  for (const file of dependencyFiles) {
+    const bytes = await readSafeMetadata(workingDir, file);
+    if (bytes === null) continue;
+    const relative = relativeArtifactPath(workingDir, file);
+    registryHashes.push([relative, createHash('sha256').update(bytes).digest('hex')]);
+    if (path.basename(file) === 'camera_tree.json') {
+      try { cameraTrees.set(relative, JSON.parse(bytes.toString('utf8'))); }
+      catch { cameraTrees.set(relative, null); }
+      continue;
+    }
+    const shotDescription = shotDescriptionDependency(relative);
+    if (shotDescription) {
+      try { shotDescriptions.set(`${shotDescription.root}::${shotDescription.slot}`, JSON.parse(bytes.toString('utf8'))); }
+      catch { shotDescriptions.set(`${shotDescription.root}::${shotDescription.slot}`, null); }
+      continue;
+    }
+    if (/^(?:first|last)_frame_selector_output\.json$/.test(path.basename(file))) {
+      const selector = parseJson(bytes, 'Invalid frame reference metadata');
+      const sources = [
+        ...(Array.isArray(selector?.reference_image_path_and_text_pairs)
+          ? selector.reference_image_path_and_text_pairs.map((pair) => Array.isArray(pair) ? pair[0] : null) : []),
+        selector?.source_frame?.path,
+        selector?.continuity_source?.path,
+      ];
+      for (const source of sources) {
+        if (typeof source !== 'string') continue;
+        const asset = assetsByPath.get(safeRegistryPortraitPath(workingDir, source));
+        if (!asset) continue;
+        const shot = shotPathDependency(relative
+          .replace(/(?:first|last)_frame_selector_output\.json$/, 'first_frame.png'));
+        if (shot) referencedShots.get(asset.path).set(`${shot.root}::${shot.slot}`, {root: shot.root, slot: shot.slot});
+      }
+      continue;
+    }
+    if (path.basename(file) !== 'registry.json') continue;
+    registryBytes.set(file, bytes);
+    const registry = parseJson(bytes, 'Invalid portrait registry metadata');
+    if (!isPlainObject(registry)) throw acceptanceError('Portrait registry metadata must be an object');
+    registries.set(file, registry);
+    for (const [character, record] of Object.entries(registry)) {
+      if (!isPlainObject(record)) continue;
+      for (const [view, value] of Object.entries(record)) {
+        if (!isPlainObject(value) || typeof value.path !== 'string') continue;
+        const asset = assetsByPath.get(safeRegistryPortraitPath(workingDir, value.path));
+        if (asset) asset.registryRefs.push({file, character, view});
+      }
+    }
+  }
+  const acceptancePath = path.join(workingDir, ACCEPTANCE_FILENAME);
+  const acceptanceBytes = await readSafeMetadata(workingDir, acceptancePath);
+  const acceptance = acceptanceBytes === null ? {} : parseJson(acceptanceBytes, 'Invalid render approval metadata');
+  if (!isPlainObject(acceptance)) throw acceptanceError('Render approval metadata must be an object');
+  const manifestHash = manifestBytes === null ? null : createHash('sha256').update(manifestBytes).digest('hex');
+  const continuityHash = continuityBytes === null ? null : createHash('sha256').update(continuityBytes).digest('hex');
+  const frameContinuityHash = frameContinuityBytes === null ? null : createHash('sha256').update(frameContinuityBytes).digest('hex');
+  let continuityEnabled = false;
+  if (frameContinuityBytes !== null) {
+    try {
+      continuityEnabled = parseJson(frameContinuityBytes, 'Invalid frame continuity metadata')?.mode === 'chained_keyframes';
+    } catch {
+      continuityEnabled = false;
+    }
+  }
+  const acceptanceHash = acceptanceBytes === null ? null : createHash('sha256').update(acceptanceBytes).digest('hex');
+  const approvalIndex = indexAssetApprovalPaths(acceptance);
+  const impacts = [];
+  for (const asset of assetPlans) {
+    asset.referencedShots = [...referencedShots.get(asset.path).values()];
+    asset.portraitRoots = new Set(asset.registryRefs.filter(({file}) =>
+      !manifest?.image_model || path.basename(path.dirname(file)) === safePathComponent(manifest.image_model))
+      .map(({file}) => relativeArtifactPath(workingDir, file).split('/')[0]));
+    asset.approvalPortraitRoots = approvalIndex.portraitRootsByPath.get(asset.path) || new Set();
+    const selectedPortrait = asset.approvalPortraitRoots.size > 0 || asset.portraitRoots.size > 0;
+    if (asset.registryRefs.length) {
+      const count = asset.registryRefs.length;
+      impacts.push(`${paths.length === 1 ? '' : `${asset.path}: `}Remove ${count} selected portrait reference${count === 1 ? '' : 's'}; the portrait set becomes incomplete${selectedPortrait ? ' and portrait approvals/dependent outputs will be invalidated' : ''}`);
+    }
+    if (approvalIndex.selectedPaths.has(asset.path)) {
+      impacts.push(`${paths.length === 1 ? '' : `${asset.path}: `}Invalidate approvals that selected this media`);
+    }
+    const shotDependency = shotPathDependency(asset.path);
+    const activeModel = shotDependency?.stages.includes('keyframes') ? manifest?.image_model : manifest?.video_model;
+    asset.activeShot = Boolean(shotDependency && (
+      !shotDependency.modelDirectory || !activeModel || shotDependency.modelDirectory === safePathComponent(activeModel)
+      || approvalIndex.selectedPaths.has(asset.path)
+    ));
+    const linkedSuccessors = !continuityEnabled && asset.activeShot && shotDependency?.lastFrame
+      ? linkedContinuitySuccessors(
+        filmOrderFromDependencySnapshot(shotDependency.root, dependencySnapshot.directories, cameraTrees),
+        [shotDependency.slot],
+        shotReuseChoicesFromSnapshot(shotDependency.root, shotDescriptions),
+      )
+      : [];
+    if (asset.activeShot) {
+      const continuityDependents = (continuityEnabled && shotDependency.stages.includes('keyframes'))
+        || linkedSuccessors.length > 0;
+      impacts.push(`${paths.length === 1 ? '' : `${asset.path}: `}Invalidate ${shotDependency.stages.join(' and ')} approvals and dependent final video${continuityDependents ? ' plus continuity successors' : ''}`);
+    }
+    if (asset.referencedShots.length) {
+      const count = asset.referencedShots.length;
+      impacts.push(`${paths.length === 1 ? '' : `${asset.path}: `}Invalidate keyframe, clip, and final approvals for ${count} shot${count === 1 ? '' : 's'} with a recorded reference to this asset.`);
+    }
+  }
+  const revision = createHash('sha256').update(JSON.stringify(paths.length === 1 ? {
+    path: paths[0],
+    size: assetPlans[0].info.size,
+    mtimeMs: assetPlans[0].info.mtimeMs,
+    ctimeMs: assetPlans[0].info.ctimeMs,
+    hash: assetPlans[0].hash,
+    registries: registryHashes,
+    acceptance: acceptanceHash,
+    manifest: manifestHash,
+    continuity: continuityHash,
+    frameContinuity: frameContinuityHash,
+  } : {
+    paths,
+    assets: assetPlans.map(({path: assetPath, info, hash}) => ({
+      path: assetPath,
+      size: info.size,
+      mtimeMs: info.mtimeMs,
+      ctimeMs: info.ctimeMs,
+      hash,
+    })),
+    registries: registryHashes,
+    acceptance: acceptanceHash,
+    manifest: manifestHash,
+    continuity: continuityHash,
+    frameContinuity: frameContinuityHash,
+  })).digest('hex');
+  return {
+    paths,
+    revision,
+    impacts,
+    assetPlans,
+    registries,
+    acceptance,
+    acceptancePath,
+    acceptanceBytes,
+    registryBytes,
+    continuityEnabled,
+    dependencyDirectories: dependencySnapshot.directories,
+    cameraTrees,
+    shotDescriptions,
+  };
+}
+
+async function listAssetDependencyFiles(root) {
+  const found = [];
+  const directories = [];
+  async function walk(directory) {
+    const entries = await readdir(directory, {withFileTypes: true}).catch(() => []);
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        directories.push(relativeArtifactPath(root, file));
+        await walk(file);
+      } else if (entry.isFile() && (entry.name === 'camera_tree.json'
+        || entry.name === SHOT_DESCRIPTION_FILENAME
+        || /^(?:first|last)_frame_selector_output\.json$/.test(entry.name)
+        || (entry.name === 'registry.json' && path.relative(root, file).split(path.sep).includes('character_portraits')))) {
+        found.push(file);
+      }
+    }
+  }
+  await walk(root);
+  return {files: found.sort(), directories};
+}
+
+function shotDescriptionDependency(relative) {
+  const match = /^(script2video|idea2video|novel2video)\/(?:scenes\/)?(scene_\d+\/)?shots\/([^/]+)\/shot_description\.json$/i.exec(relative);
+  if (!match) return null;
+  return {root: match[1], slot: `${match[2] || ''}${match[3]}`};
+}
+
+function indexAssetApprovalPaths(store) {
+  const selectedPaths = new Set();
+  const portraitRootsByPath = new Map();
+  function addPaths(record, paths) {
+    if (!isPlainObject(record) || !Array.isArray(record.artifacts)) return;
+    for (const artifact of record.artifacts) if (typeof artifact?.path === 'string') paths.add(artifact.path);
+  }
+  for (const [rootName, root] of Object.entries(store)) {
+    if (!isPlainObject(root)) continue;
+    const portraitPaths = new Set();
+    addPaths(root.portraits, portraitPaths);
+    if (isPlainObject(root.portrait_characters)) {
+      for (const record of Object.values(root.portrait_characters)) addPaths(record, portraitPaths);
+    }
+    for (const relative of portraitPaths) {
+      selectedPaths.add(relative);
+      let roots = portraitRootsByPath.get(relative);
+      if (!roots) {
+        roots = new Set();
+        portraitRootsByPath.set(relative, roots);
+      }
+      roots.add(rootName);
+    }
+    addPaths(root.final_video, selectedPaths);
+    if (isPlainObject(root.shots)) {
+      for (const shot of Object.values(root.shots)) if (isPlainObject(shot)) {
+        addPaths(shot.keyframes, selectedPaths);
+        addPaths(shot.clips, selectedPaths);
+      }
+    }
+  }
+  return {selectedPaths, portraitRootsByPath};
+}
+
+function shotPathDependency(relative) {
+  const match = /^(script2video|idea2video|novel2video)\/(?:scenes\/)?(scene_\d+\/)?shots\/([^/]+)\/(?:([^/]+)\/)?([^/]+)$/i.exec(relative);
+  if (!match) return null;
+  const root = match[1];
+  const slot = `${match[2] || ''}${match[3]}`;
+  const file = match[5].toLowerCase();
+  const modelDirectory = match[4] || '';
+  const isKeyframe = KEYFRAME_NAMES.has(file) || /(?:^|\/)keyframes?\//i.test(relative);
+  const isClip = VIDEO_EXTENSIONS.has(path.extname(file));
+  if (!isKeyframe && !isClip) return null;
+  return {root, slot, stages: isKeyframe ? ['keyframes', 'clips'] : ['clips'], modelDirectory, lastFrame: file === 'last_frame.png'};
+}
+
+function filmOrderFromDependencySnapshot(root, directories, cameraTrees) {
+  const prefix = `${root}/`;
+  const scenes = directories
+    .filter((directory) => directory.startsWith(prefix) && /^scene_\d+$/.test(directory.slice(prefix.length)))
+    .sort((left, right) => Number(left.slice(prefix.length + 6)) - Number(right.slice(prefix.length + 6)));
+  const containers = scenes.length
+    ? scenes.map((directory) => ({name: directory.slice(prefix.length), directory}))
+    : [{name: '', directory: root}];
+  const order = [];
+  for (const {name, directory} of containers) {
+    const cameras = cameraTrees.get(`${directory}/camera_tree.json`);
+    if (!Array.isArray(cameras)) continue;
+    order.push(...cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx))
+      .flatMap((camera) => (camera.active_shot_idxs || []).map((shot) => `${name ? `${name}/` : ''}${shot}`)));
+  }
+  return order;
+}
+
+function invalidateAssetApprovals(store, assets, continuityEnabled, dependencyDirectories, cameraTrees, shotDescriptions) {
+  let changed = false;
+  const now = isoSeconds();
+  const targetPaths = new Set(assets.map((asset) => asset.path));
+  const dependenciesByRoot = new Map();
+  const selectedPortraitRoots = new Set();
+  for (const asset of assets) {
+    for (const root of asset.portraitRoots) selectedPortraitRoots.add(root);
+    for (const root of asset.approvalPortraitRoots) selectedPortraitRoots.add(root);
+    const dependencies = [];
+    const dependency = shotPathDependency(asset.path);
+    if (asset.activeShot && dependency) dependencies.push(dependency);
+    dependencies.push(...asset.referencedShots.map((shot) => ({...shot, stages: ['keyframes', 'clips'], lastFrame: true})));
+    for (const item of dependencies) {
+      let slots = dependenciesByRoot.get(item.root);
+      if (!slots) {
+        slots = new Map();
+        dependenciesByRoot.set(item.root, slots);
+      }
+      let existing = slots.get(item.slot);
+      if (!existing) {
+        existing = {slot: item.slot, stages: new Set(), keyframes: false, lastFrame: false};
+        slots.set(item.slot, existing);
+      }
+      for (const stage of item.stages) existing.stages.add(stage);
+      if (item.stages.includes('keyframes')) existing.keyframes = true;
+      existing.lastFrame ||= item.lastFrame;
+    }
+  }
+
+  const orders = new Map();
+  const reuseChoices = new Map();
+  for (const [root, slots] of dependenciesByRoot) {
+    if ([...slots.values()].some((item) => item.keyframes)) {
+      orders.set(root, filmOrderFromDependencySnapshot(root, dependencyDirectories, cameraTrees));
+      reuseChoices.set(root, shotReuseChoicesFromSnapshot(root, shotDescriptions));
+    }
+  }
+
+  for (const [rootName, root] of Object.entries(store)) {
+    if (!isPlainObject(root)) continue;
+    let selectedPortrait = selectedPortraitRoots.has(rootName);
+    if (isPlainObject(root.portrait_characters)) {
+      for (const approval of Object.values(root.portrait_characters)) {
+        if (!isPlainObject(approval) || !approvalHasAnyPath(approval, targetPaths)) continue;
+        Object.assign(approval, {
+          invalidated_at: now,
+          invalidation_reason: 'A selected portrait was deleted; choose and review portraits again.',
+        });
+        selectedPortrait = true;
+        changed = true;
+      }
+    }
+    if (isPlainObject(root.portraits) && approvalHasAnyPath(root.portraits, targetPaths)) {
+      Object.assign(root.portraits, {
+        invalidated_at: now,
+        invalidation_reason: 'A selected portrait was deleted; review the portrait set again.',
+      });
+      selectedPortrait = true;
+      changed = true;
+    }
+    if (selectedPortrait) {
+      if (isPlainObject(root.portraits)) {
+        Object.assign(root.portraits, {
+          invalidated_at: now,
+          invalidation_reason: 'A selected portrait was deleted; review the portrait set again.',
+        });
+      }
+      invalidatePortraitDependents(root);
+      changed = true;
+    }
+
+    const slots = dependenciesByRoot.get(rootName);
+    if (slots) {
+      const order = orders.get(rootName) || [];
+      const choices = reuseChoices.get(rootName) || new Map();
+      for (const dependency of slots.values()) {
+        const targetSlots = [dependency.slot];
+        if (continuityEnabled && dependency.keyframes) {
+          targetSlots.push(...continuitySuccessors(order, [dependency.slot], new Set([dependency.slot])));
+        } else if (dependency.lastFrame && dependency.keyframes) {
+          targetSlots.push(...linkedContinuitySuccessors(order, [dependency.slot], choices));
+        }
+        for (const slot of targetSlots) {
+          const shot = root.shots?.[slot];
+          if (!isPlainObject(shot)) continue;
+          for (const stage of dependency.stages) if (isPlainObject(shot[stage])) {
+            Object.assign(shot[stage], {
+              invalidated_at: now,
+              invalidation_reason: `A selected ${stage} asset was deleted.`,
+            });
+            changed = true;
+          }
+          if (slot !== dependency.slot) {
+            for (const stage of ['keyframes', 'clips']) if (isPlainObject(shot[stage])) {
+              Object.assign(shot[stage], {
+                invalidated_at: now,
+                invalidation_reason: 'An earlier keyframe was deleted; review continuous handoffs.',
+              });
+              changed = true;
+            }
+          }
+        }
+        if (isPlainObject(root.final_video)) {
+          Object.assign(root.final_video, {
+            invalidated_at: now,
+            invalidation_reason: 'A selected shot asset was deleted; review the final video again.',
+          });
+          changed = true;
+        }
+      }
+    }
+    if (isPlainObject(root.shots)) {
+      for (const record of Object.values(root.shots)) {
+        if (!isPlainObject(record)) continue;
+        for (const stage of ['keyframes', 'clips']) {
+          if (!approvalHasAnyPath(record[stage], targetPaths)) continue;
+          Object.assign(record[stage], {
+            invalidated_at: now,
+            invalidation_reason: `An approved ${stage} asset was deleted.`,
+          });
+          changed = true;
+        }
+      }
+    }
+    if (isPlainObject(root.final_video) && approvalHasAnyPath(root.final_video, targetPaths)) {
+      Object.assign(root.final_video, {
+        invalidated_at: now,
+        invalidation_reason: 'An approved final video asset was deleted.',
+      });
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function shotReuseChoicesFromSnapshot(root, shotDescriptions) {
+  const prefix = `${root}::`;
+  const choices = new Map();
+  for (const [key, description] of shotDescriptions) {
+    if (key.startsWith(prefix)) choices.set(key.slice(prefix.length), description?.reuse_previous_last_frame);
+  }
+  return choices;
+}
+
+function approvalHasAnyPath(record, paths) {
+  return isPlainObject(record) && Array.isArray(record.artifacts)
+    && record.artifacts.some((item) => paths.has(item?.path));
+}
+
 async function collectSessionArtifacts(sessionRoot, sessionId, context, referenced = []) {
   const artifacts = new Map();
 
@@ -312,7 +850,57 @@ async function collectSessionArtifacts(sessionRoot, sessionId, context, referenc
   // Browsing is bounded, but the film must never lose a preview because an unrelated
   // folder filled that budget. These paths came from symlink-free stage discovery.
   for (const absolute of referenced) await add(absolute);
+  await annotatePortraitArtifacts(sessionRoot, artifacts, context);
   return [...artifacts.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+async function annotatePortraitArtifacts(sessionRoot, artifacts, context) {
+  const portraits = [...artifacts.entries()].filter(([, artifact]) =>
+    /(?:^|\/)character_portraits\/.*\/(?:REMOVED_)?(?:front|side|back)\.png$/i.test(artifact.path));
+  if (!portraits.length) return;
+  const manifest = await context.json(path.join(sessionRoot, 'render_manifest.json')).catch(() => null);
+  const root = PORTRAIT_WORKFLOW_ROOTS.has(manifest?.render_mode) ? manifest.render_mode : '';
+  const model = manifest?.image_model ? safePathComponent(manifest.image_model) : '';
+  const discovery = root && model ? await discoverPortraits(sessionRoot, root, model) : {
+    characters: [], byCharacter: new Map(), portraits: [], complete: false,
+  };
+  const selected = new Map();
+  const store = await readAcceptanceFile(sessionRoot, context);
+  const rootStore = isPlainObject(store[root]) ? store[root] : {};
+  const legacyAccepted = root && await legacyPortraitApproval(sessionRoot, discovery, rootStore.portraits);
+  for (const character of discovery.characters) {
+    const accepted = await portraitCharacterApproved(
+      sessionRoot,
+      rootStore.portrait_characters,
+      character,
+    ) || Boolean(legacyAccepted);
+    for (const [view, relative] of Object.entries(character.pathsByView)) {
+      const absolute = path.resolve(sessionRoot, relative);
+      selected.set(absolute, {
+        character: character.identifier,
+        scope: character.scope,
+        view,
+        registryPath: relativeArtifactPath(sessionRoot, path.join(sessionRoot, character.scope, 'character_portraits', model, 'registry.json')),
+        accepted,
+      });
+    }
+  }
+  for (const [absolute, artifact] of portraits) {
+    const view = artifact.name.toLowerCase().replace(/^removed_/, '').replace('.png', '');
+    const active = selected.get(absolute);
+    artifact.portrait = {
+      ...(active || {}),
+      view,
+      active: Boolean(active),
+      accepted: Boolean(active?.accepted),
+    };
+    const directory = path.dirname(absolute);
+    const standardPrompt = path.join(directory, 'prompts.json');
+    const alternatives = [...artifacts.keys()].filter((candidate) =>
+      path.dirname(candidate) === directory && /^prompts[^/]*\.json$/i.test(path.basename(candidate)));
+    const prompt = artifacts.has(standardPrompt) ? standardPrompt : alternatives.length === 1 ? alternatives[0] : null;
+    if (prompt) artifact.promptPath = relativeArtifactPath(sessionRoot, prompt);
+  }
 }
 
 export async function readProjectMetadata(repoRoot, sessionId) {
@@ -415,7 +1003,7 @@ export function rerenderPrompt(style) {
  * when its artifacts are deleted and climb back as the render rebuilds them.
  */
 export async function readProjectArtifacts(repoRoot, sessionId) {
-  const inventory = {portraits: 0, shots: 0, frames: 0, clips: 0, finalVideo: false};
+  const inventory = {portraits: 0, setReferences: 0, shots: 0, frames: 0, clips: 0, finalVideo: false};
   await collectRenderInventory(resolveSessionRoot(repoRoot, sessionId), inventory);
   return inventory;
 }
@@ -439,7 +1027,24 @@ async function collectRenderInventory(directory, inventory) {
       await collectPortraitInventory(absolute, inventory);
       continue;
     }
+    if (entry.name === 'set_references') {
+      await collectSetReferenceInventory(absolute, inventory);
+      continue;
+    }
     await collectRenderInventory(absolute, inventory);
+  }
+}
+async function collectSetReferenceInventory(directory, inventory) {
+  const sets = await readdir(directory, {withFileTypes: true}).catch(() => []);
+  for (const set of sets) {
+    if (!set.isDirectory() || !SET_ID_PATTERN.test(set.name)) continue;
+    const modelDirectories = await readdir(path.join(directory, set.name), {withFileTypes: true}).catch(() => []);
+    for (const model of modelDirectories) {
+      if (!model.isDirectory()) continue;
+      const image = path.join(directory, set.name, model.name, 'reference.png');
+      const info = await lstat(image).catch(() => null);
+      if (info?.isFile()) inventory.setReferences += 1;
+    }
   }
 }
 
@@ -592,11 +1197,31 @@ async function collectStyleDerivedArtifacts(root, directory, artifacts) {
         await collectContainerEntries(root, absolute, entry.name === 'shots', artifacts);
         continue;
       }
+      if (entry.name === 'set_references') {
+        await collectSetReferenceArtifacts(root, absolute, artifacts);
+        continue;
+      }
       await collectStyleDerivedArtifacts(root, absolute, artifacts);
       continue;
     }
     if (entry.isFile() && entry.name === 'final_video.mp4') {
       artifacts.push(relativeArtifactPath(root, absolute));
+    }
+  }
+}
+async function collectSetReferenceArtifacts(root, directory, artifacts) {
+  const ids = await readdir(directory, {withFileTypes: true}).catch(() => []);
+  for (const id of ids) {
+    if (!id.isDirectory() || !SET_ID_PATTERN.test(id.name)) continue;
+    const models = await readdir(path.join(directory, id.name), {withFileTypes: true}).catch(() => []);
+    for (const model of models) {
+      if (!model.isDirectory()) continue;
+      const modelDir = path.join(directory, id.name, model.name);
+      for (const name of ['reference.png', 'provenance.json']) {
+        const absolute = path.join(modelDir, name);
+        const info = await lstat(absolute).catch(() => null);
+        if (info?.isFile()) artifacts.push(relativeArtifactPath(root, absolute));
+      }
     }
   }
 }
@@ -724,6 +1349,714 @@ export async function readRenderAcceptance(repoRoot, sessionId, root = '') {
   const context = createFilmReadContext();
   return acceptancePayload(repoRoot, workingDir, await resolveRenderRoot(repoRoot, workingDir, root, context), context);
 }
+const PORTRAIT_VIEWS = ['front', 'side', 'back'];
+const PORTRAIT_WORKFLOW_ROOTS = new Set(['script2video', 'idea2video']);
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function isCompletePng(bytes) {
+  if (bytes.length < 57 || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) return false;
+  let offset = PNG_SIGNATURE.length;
+  let hasImageData = false;
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const end = offset + length + 12;
+    if (end > bytes.length) return false;
+    const type = bytes.toString('ascii', offset + 4, offset + 8);
+    if (crc32(bytes.subarray(offset + 4, end - 4)) !== bytes.readUInt32BE(end - 4)) return false;
+    if (offset === PNG_SIGNATURE.length
+      && (type !== 'IHDR' || length !== 13 || !bytes.readUInt32BE(offset + 8) || !bytes.readUInt32BE(offset + 12))) return false;
+    if (type === 'IDAT') hasImageData = true;
+    if (type === 'IEND') return length === 0 && hasImageData && end === bytes.length;
+    offset = end;
+  }
+  return false;
+}
+
+/**
+ * Preview the sibling portrait set containing the clicked image. Paths returned
+ * here are session-relative, just like Artifact.path; no disk paths cross the API.
+ */
+export async function readPortraitOptions(repoRoot, sessionId, sourcePath) {
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return portraitOptions(workingDir, sessionId, sourcePath);
+}
+
+/** Select one visible character's source trio as its current model-scoped portraits. */
+export async function selectPortraitCharacter(repoRoot, input = {}) {
+  const body = input && typeof input === 'object' ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    const request = portraitRequest(body);
+    const current = await portraitWorkflow(workingDir, request.root, request.sourcePath);
+    if (current.scope !== request.scope) throw acceptanceError('The source portrait is not in the requested workflow scope');
+    const source = await portraitSourceSet(workingDir, request.sourcePath);
+    const selectedCharacter = current.scopeState.characters.find((character) =>
+      character.identifier_in_scene === request.character && character.is_visible === true);
+    if (!selectedCharacter) throw acceptanceError(`Unknown visible character in ${request.scope}: ${request.character}`);
+    const revision = await portraitRevision(workingDir, current, source);
+    if (revision !== request.revision) throw conflictError('Portrait options changed; refresh and try again');
+    if (!source.complete) throw acceptanceError('The selected source set must contain valid front, side, and back PNG images');
+    if (!Number.isSafeInteger(selectedCharacter.idx) || selectedCharacter.idx < 0) {
+      throw acceptanceError(`Character ${request.character} has an invalid index`);
+    }
+
+    const target = await canonicalPortraitSet(workingDir, current, selectedCharacter);
+    const selectedKey = `${request.scope}::${request.character}`;
+    const active = current.discovery.byCharacter.get(selectedKey);
+    const targetMatches = await sameImageSet(workingDir, source.paths, target.paths);
+    const activeMatches = active?.complete && samePaths(active.paths, target.pathsArray);
+    if (targetMatches && activeMatches) {
+      return {
+        artifacts: await collectSessionArtifacts(workingDir, sessionId, createFilmReadContext()),
+        options: await portraitOptions(workingDir, sessionId, target.paths.front),
+      };
+    }
+
+    const acceptance = await readAcceptanceFile(workingDir);
+    const priorRoot = isPlainObject(acceptance[current.root]) ? acceptance[current.root] : {};
+    const legacyPortraits = priorRoot.portraits;
+    const legacyApproved = await legacyPortraitApproval(workingDir, current.discovery, legacyPortraits);
+    const nextStore = structuredClone(acceptance);
+    const nextRoot = isPlainObject(nextStore[current.root]) ? nextStore[current.root] : {};
+    const portraitRecords = isPlainObject(nextRoot.portrait_characters) ? nextRoot.portrait_characters : {};
+    const oldHashes = active?.complete ? await imageSetHashes(workingDir, active.pathsByView) : null;
+    const nextHashes = await imageSetHashes(workingDir, source.paths);
+    const bytesChanged = !oldHashes || JSON.stringify(oldHashes) !== JSON.stringify(nextHashes);
+    const canonicalChanged = !activeMatches;
+
+    // Promote a valid legacy aggregate before a changed selection invalidates it.
+    // Identical bytes remain approved, including the character being re-homed.
+    if (legacyApproved) {
+      for (const character of current.discovery.characters) {
+        const key = `${character.scope}::${character.identifier}`;
+        if ((key === selectedKey && bytesChanged) || !character.complete) continue;
+        if (!await isExactPortraitApproval(workingDir, portraitRecords[key], character.paths)) {
+          portraitRecords[key] = {
+            accepted_at: String(legacyPortraits.accepted_at),
+            artifacts: await acceptanceArtifacts(workingDir, character.paths),
+          };
+        }
+      }
+    }
+
+    await withMutationTransaction(async (transaction) => {
+      await ensureSafeParentDirectory(workingDir, target.directory, transaction);
+      for (const view of PORTRAIT_VIEWS) {
+        await transaction.write(
+          path.resolve(workingDir, target.paths[view]),
+          await readSafePortrait(workingDir, source.paths[view]),
+        );
+      }
+      const prompts = await savedPortraitPrompts(workingDir, source.directory);
+      if (prompts) await transaction.write(path.join(target.directory, 'prompts.json'), Buffer.from(prompts));
+      else await transaction.remove(path.join(target.directory, 'prompts.json'));
+
+      const provenance = await portraitProvenance(current.manifest, {
+        idx: selectedCharacter.idx ?? null,
+        identifier: selectedCharacter.identifier_in_scene,
+        visible: selectedCharacter.is_visible === true,
+        static_features: selectedCharacter.static_features ?? null,
+        dynamic_features: selectedCharacter.dynamic_features ?? null,
+      });
+      await transaction.write(path.join(target.directory, 'provenance.json'), Buffer.from(JSON.stringify({
+        fingerprint: provenance,
+        complete: true,
+      })));
+
+      const registry = current.scopeState.registry;
+      const priorEntry = isPlainObject(registry[request.character]) ? registry[request.character] : {};
+      registry[request.character] = Object.fromEntries(PORTRAIT_VIEWS.map((view) => [view, {
+        ...(isPlainObject(priorEntry[view]) ? priorEntry[view] : {}),
+        path: path.resolve(workingDir, target.paths[view]),
+      }]));
+      await transaction.write(current.scopeState.registryPath, Buffer.from(`${JSON.stringify(registry, null, 4)}\n`));
+
+      if (bytesChanged) {
+        for (const character of current.discovery.characters) {
+          if (character.paths.some((relative) => target.pathsArray.includes(relative))) {
+            delete portraitRecords[`${character.scope}::${character.identifier}`];
+          }
+        }
+        delete portraitRecords[selectedKey];
+        delete nextRoot.portraits;
+        invalidatePortraitDependents(nextRoot);
+      } else if (canonicalChanged && active?.complete
+        && await isExactPortraitApproval(workingDir, portraitRecords[selectedKey], active.paths)) {
+        portraitRecords[selectedKey] = {
+          accepted_at: portraitRecords[selectedKey].accepted_at,
+          artifacts: await acceptanceArtifacts(workingDir, target.pathsArray),
+        };
+      }
+      if (Object.keys(portraitRecords).length) nextRoot.portrait_characters = portraitRecords;
+      else delete nextRoot.portrait_characters;
+      nextStore[current.root] = nextRoot;
+
+      const updated = await portraitWorkflow(workingDir, current.root, target.paths.front);
+      await syncPortraitAggregate(workingDir, updated, nextStore);
+      await transaction.write(
+        path.join(workingDir, ACCEPTANCE_FILENAME),
+        Buffer.from(`${JSON.stringify(nextStore, null, 2)}\n`),
+      );
+    });
+
+    return {
+      artifacts: await collectSessionArtifacts(workingDir, sessionId, createFilmReadContext()),
+      options: await portraitOptions(workingDir, sessionId, target.paths.front),
+    };
+  });
+}
+
+/** Approve only the active trio for one visible character. */
+export async function approvePortraitCharacter(repoRoot, input = {}) {
+  const body = input && typeof input === 'object' ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    const request = portraitRequest(body);
+    const current = await portraitWorkflow(workingDir, request.root, request.sourcePath);
+    if (current.scope !== request.scope) throw acceptanceError('The source portrait is not in the requested workflow scope');
+    const source = await portraitSourceSet(workingDir, request.sourcePath);
+    const character = current.discovery.byCharacter.get(`${request.scope}::${request.character}`);
+    if (!character?.visible) throw acceptanceError(`Unknown visible character in ${request.scope}: ${request.character}`);
+    const revision = await portraitRevision(workingDir, current, source);
+    if (revision !== request.revision) throw conflictError('Portrait options changed; refresh and try again');
+    if (!source.complete || !character.complete || !samePaths(source.pathsArray, character.paths)) {
+      throw acceptanceError('Approval requires the source front, side, and back trio to match the active selected trio');
+    }
+
+    const store = await readAcceptanceFile(workingDir);
+    const rootStore = isPlainObject(store[current.root]) ? store[current.root] : {};
+    const portraitRecords = isPlainObject(rootStore.portrait_characters) ? rootStore.portrait_characters : {};
+    portraitRecords[`${request.scope}::${request.character}`] = {
+      accepted_at: isoSeconds(),
+      artifacts: await acceptanceArtifacts(workingDir, character.paths),
+    };
+    rootStore.portrait_characters = portraitRecords;
+    store[current.root] = rootStore;
+    await syncPortraitAggregate(workingDir, current, store);
+    await withMutationTransaction((transaction) =>
+      transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`));
+    return {
+      artifacts: await collectSessionArtifacts(workingDir, sessionId, createFilmReadContext()),
+      options: await portraitOptions(workingDir, sessionId, character.pathsByView.front),
+    };
+  });
+}
+
+function portraitRequest(body) {
+  const root = typeof body.root === 'string' ? body.root : '';
+  const scope = typeof body.scope === 'string' ? body.scope : '';
+  const character = typeof body.character === 'string' ? body.character : '';
+  const sourcePath = typeof body.sourcePath === 'string' ? body.sourcePath : '';
+  const revision = typeof body.revision === 'string' ? body.revision : '';
+  if (!root || !scope || !character || !sourcePath || !revision) {
+    throw acceptanceError('root, scope, character, sourcePath, and revision are required');
+  }
+  return {root, scope, character, sourcePath, revision};
+}
+
+async function portraitOptions(workingDir, sessionId, sourcePath) {
+  const workflow = await portraitWorkflow(workingDir, '', sourcePath);
+  const source = await portraitSourceSet(workingDir, sourcePath);
+  const revision = await portraitRevision(workingDir, workflow, source);
+  const store = await readAcceptanceFile(workingDir);
+  const legacyAccepted = await legacyPortraitApproval(workingDir, workflow.discovery, store[workflow.root]?.portraits);
+  const characters = [];
+  for (const item of workflow.scopeState.characters) {
+    if (item?.is_visible !== true || typeof item.identifier_in_scene !== 'string') continue;
+    const selected = workflow.discovery.byCharacter.get(`${workflow.scope}::${item.identifier_in_scene}`);
+    const accepted = await portraitCharacterApproved(
+      workingDir,
+      store[workflow.root]?.portrait_characters,
+      selected,
+    ) || Boolean(legacyAccepted && selected?.complete);
+    characters.push({
+      identifier: item.identifier_in_scene,
+      idx: item.idx ?? null,
+      scope: workflow.scope,
+      active: Boolean(selected?.complete),
+      accepted,
+    });
+  }
+  return {
+    root: workflow.root,
+    revision,
+    sourcePath: source.sourcePath,
+    paths: source.paths,
+    complete: source.complete,
+    characters,
+  };
+}
+
+async function portraitWorkflow(workingDir, requestedRoot, sourcePath) {
+  const manifest = await readPortraitJson(workingDir, path.join(workingDir, 'render_manifest.json'), 'render manifest');
+  const root = requestedRoot || String(manifest.render_mode || '');
+  if (!PORTRAIT_WORKFLOW_ROOTS.has(root)) {
+    throw acceptanceError(`Portrait selection is unavailable for render root ${root || '(not pinned)'}`);
+  }
+  if (manifest.render_mode !== root) throw conflictError('The requested render root is no longer active');
+  const model = typeof manifest.image_model === 'string' ? manifest.image_model : '';
+  if (!model) throw acceptanceError('The active render has no pinned image model');
+  const modelSlug = safePathComponent(model);
+  const scope = portraitScopeFromPath(root, sourcePath);
+  const scopeState = await readPortraitScope(workingDir, scope, modelSlug);
+  if (!scopeState) throw acceptanceError(`Portrait workflow scope is unavailable: ${scope}`);
+  const discovery = await discoverPortraits(workingDir, root, modelSlug);
+  return {root, manifest, model, modelSlug, scope, scopeState, discovery};
+}
+
+function portraitScopeFromPath(root, sourcePath) {
+  const relative = safeSessionRelativePath(sourcePath);
+  const marker = '/character_portraits/';
+  const markerAt = relative.indexOf(marker);
+  if (markerAt < 0) throw acceptanceError('sourcePath must identify a portrait image');
+  const scope = relative.slice(0, markerAt);
+  const suffix = relative.slice(markerAt + marker.length).split('/');
+  const validScope = root === 'script2video'
+    ? scope === root
+    : scope === root || /^idea2video\/scene_\d+$/.test(scope);
+  if (!validScope || ![2, 3].includes(suffix.length)
+    || !/^(?:REMOVED_)?(?:front|side|back)\.png$/i.test(suffix.at(-1))) {
+    throw acceptanceError('sourcePath must identify a front, side, or back portrait in the active render scope');
+  }
+  return scope;
+}
+
+async function readPortraitScope(workingDir, scope, modelSlug) {
+  if (!validPortraitScope(scope)) return null;
+  const scopeDir = path.join(workingDir, scope);
+  const charactersPath = path.join(scopeDir, 'characters.json');
+  const charactersRaw = await readSafeMetadata(workingDir, charactersPath);
+  const registryPath = path.join(scopeDir, 'character_portraits', modelSlug, 'registry.json');
+  const registryRaw = await readSafeMetadata(workingDir, registryPath);
+  let registry = {};
+  if (registryRaw !== null) {
+    registry = parseJson(registryRaw, `Invalid portrait registry in ${scope}`);
+    if (!isPlainObject(registry)) throw acceptanceError(`Portrait registry in ${scope} must be an object`);
+  }
+  if (charactersRaw === null) {
+    if (registryRaw === null) return null;
+    return {scope, scopeDir, charactersPath, charactersRaw, registryPath, registryRaw, registry, characters: [], invalidCharacters: true};
+  }
+  const characters = parseJson(charactersRaw, `Invalid character metadata in ${scope}`);
+  if (!Array.isArray(characters)) throw acceptanceError(`Character metadata in ${scope} must be a list`);
+  return {scope, scopeDir, charactersPath, charactersRaw, registryPath, registryRaw, registry, characters};
+}
+
+function validPortraitScope(scope) {
+  return scope === 'script2video' || scope === 'idea2video' || /^idea2video\/scene_\d+$/.test(scope);
+}
+
+async function discoverPortraits(workingDir, root, modelSlug) {
+  const rootScope = await readPortraitScope(workingDir, root, modelSlug);
+  const scopes = rootScope ? [rootScope] : [];
+  if (root === 'idea2video') {
+    const entries = await readdir(path.join(workingDir, root), {withFileTypes: true}).catch(() => []);
+    const scenes = entries.filter((entry) => entry.isDirectory() && /^scene_\d+$/.test(entry.name))
+      .sort((left, right) => Number(left.name.slice(6)) - Number(right.name.slice(6)));
+    for (const entry of scenes) {
+      const scene = await readPortraitScope(workingDir, `${root}/${entry.name}`, modelSlug);
+      // Planned scenes share the global set until their renderer owns a registry.
+      if (scene && scene.registryRaw !== null) scopes.push(scene);
+    }
+  }
+  const characters = [];
+  const inventoryCharacters = [];
+  const byCharacter = new Map();
+  const portraits = new Set();
+  let complete = Boolean(rootScope) && scopes.length > 0 && !scopes.some((scope) => scope.invalidCharacters);
+  for (const scopeState of scopes) {
+    for (const item of scopeState.characters) {
+      if (!item || typeof item.identifier_in_scene !== 'string' || !item.identifier_in_scene) continue;
+      const visible = item.is_visible === true;
+      const entry = isPlainObject(scopeState.registry[item.identifier_in_scene])
+        ? scopeState.registry[item.identifier_in_scene] : {};
+      const pathsByView = {};
+      const viewStates = {};
+      const valid = [];
+      for (const view of PORTRAIT_VIEWS) {
+        const stored = entry[view]?.path;
+        if (typeof stored !== 'string' || !stored) {
+          viewStates[view] = 'missing';
+          valid.push(false);
+          continue;
+        }
+        const relative = safeRegistryPortraitPath(workingDir, stored);
+        if (!relative || !relative.toLowerCase().endsWith('.png')) {
+          viewStates[view] = 'invalid';
+          valid.push(false);
+          continue;
+        }
+        pathsByView[view] = relative;
+        let bytes;
+        try {
+          bytes = await readSafeMetadata(workingDir, path.resolve(workingDir, relative));
+        } catch {
+          viewStates[view] = 'invalid';
+          valid.push(false);
+          continue;
+        }
+        if (bytes !== null && visible) portraits.add(relative);
+        const ready = Boolean(bytes && bytes.length > PNG_SIGNATURE.length
+          && bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE));
+        viewStates[view] = bytes === null ? 'missing' : ready ? 'ready' : 'invalid';
+        valid.push(ready);
+      }
+      const paths = PORTRAIT_VIEWS.map((view) => pathsByView[view]).filter(Boolean).sort();
+      const isComplete = visible && valid.length === PORTRAIT_VIEWS.length && valid.every(Boolean);
+      const character = {
+        identifier: item.identifier_in_scene,
+        idx: item.idx ?? null,
+        scope: scopeState.scope,
+        visible,
+        description: [item.static_features, item.dynamic_features].filter((value) => typeof value === 'string' && value.trim()).join('\n'),
+        paths,
+        pathsByView,
+        viewStates,
+        complete: isComplete,
+      };
+      inventoryCharacters.push(character);
+      if (visible) {
+        characters.push(character);
+        byCharacter.set(`${scopeState.scope}::${character.identifier}`, character);
+      }
+      if (visible && !isComplete) complete = false;
+    }
+  }
+  return {scopes, characters, inventoryCharacters, byCharacter, portraits: [...portraits].sort(), complete};
+}
+async function portraitSourceSet(workingDir, sourcePath) {
+  const sourceRelative = safeSessionRelativePath(sourcePath);
+  const sourceFile = path.resolve(workingDir, sourceRelative);
+  if (!isPathInside(workingDir, sourceFile)) throw acceptanceError('sourcePath escapes the project');
+  const name = path.basename(sourceRelative);
+  const match = /^(REMOVED_)?(front|side|back)\.png$/i.exec(name);
+  if (!match) throw acceptanceError('sourcePath must identify a portrait PNG');
+  const prefix = match[1] || '';
+  const directory = path.dirname(sourceRelative);
+  const paths = Object.fromEntries(PORTRAIT_VIEWS.map((view) => [view, path.join(directory, `${prefix}${view}.png`).split(path.sep).join('/')]));
+  const complete = await Promise.all(PORTRAIT_VIEWS.map((view) => validPortraitPng(workingDir, paths[view])));
+  return {
+    sourcePath: sourceRelative,
+    directory: path.resolve(workingDir, directory),
+    paths,
+    pathsArray: PORTRAIT_VIEWS.map((view) => paths[view]).sort(),
+    complete: complete.every(Boolean),
+  };
+}
+
+async function canonicalPortraitSet(workingDir, workflow, character) {
+  const directory = path.join(
+    workingDir,
+    workflow.scope,
+    'character_portraits',
+    workflow.modelSlug,
+    `${character.idx}_${pythonSafePathComponent(character.identifier ?? character.identifier_in_scene)}`,
+  );
+  const paths = Object.fromEntries(PORTRAIT_VIEWS.map((view) => [
+    view,
+    relativeArtifactPath(workingDir, path.join(directory, `${view}.png`)),
+  ]));
+  const pathsArray = PORTRAIT_VIEWS.map((view) => paths[view]).sort();
+  return {directory, paths, pathsArray};
+}
+
+async function portraitRevision(workingDir, workflow, source) {
+  const approvals = await readAcceptanceFile(workingDir);
+  const rootStore = isPlainObject(approvals[workflow.root]) ? approvals[workflow.root] : {};
+  const relevantApprovals = {
+    portraits: rootStore.portraits ?? null,
+    portrait_characters: rootStore.portrait_characters ?? null,
+  };
+  const sourceHashes = {};
+  for (const [view, relative] of Object.entries(source.paths)) {
+    const bytes = await readSafePortrait(workingDir, relative).catch(() => null);
+    sourceHashes[view] = bytes ? createHash('sha256').update(bytes).digest('hex') : null;
+  }
+  const revisionScopes = new Map(workflow.discovery.scopes.map((scope) => [scope.scope, scope]));
+  revisionScopes.set(workflow.scopeState.scope, workflow.scopeState);
+  const scopes = [...revisionScopes.values()].sort((left, right) => left.scope.localeCompare(right.scope)).map((scope) => ({
+    scope: scope.scope,
+    characters: scope.charactersRaw === null ? null : createHash('sha256').update(scope.charactersRaw).digest('hex'),
+    registry: scope.registryRaw === null ? null : createHash('sha256').update(scope.registryRaw).digest('hex'),
+  }));
+  const activeHashes = {};
+  for (const relative of workflow.discovery.portraits) {
+    const bytes = await readSafePortrait(workingDir, relative).catch(() => null);
+    activeHashes[relative] = bytes ? createHash('sha256').update(bytes).digest('hex') : null;
+  }
+  const digestInput = {
+    root: workflow.root,
+    scope: workflow.scope,
+    sourcePath: source.sourcePath,
+    sourceHashes,
+    activeHashes,
+    scopes,
+    style: workflow.manifest.style || '',
+    model: workflow.modelSlug,
+    renderMode: workflow.manifest.render_mode,
+    approvals: relevantApprovals,
+  };
+  return createHash('sha256').update(JSON.stringify(digestInput)).digest('hex');
+}
+
+async function portraitProvenance(manifest, character) {
+  const normalizedCharacter = {
+    idx: character.idx ?? null,
+    identifier_in_scene: character.identifier ?? null,
+    is_visible: character.visible ?? null,
+    static_features: character.static_features ?? null,
+    dynamic_features: character.dynamic_features ?? null,
+  };
+  const fingerprintInput = {
+    character: normalizedCharacter,
+    style: manifest.style || '',
+    model: safePathComponent(manifest.image_model || ''),
+  };
+  return createHash('sha256').update(pythonJson(fingerprintInput), 'utf8').digest('hex');
+}
+
+function pythonJson(value) {
+  if (Array.isArray(value)) return `[${value.map(pythonJson).join(', ')}]`;
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}: ${pythonJson(value[key])}`).join(', ')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function pythonSafePathComponent(value) {
+  return safePathComponent(value);
+}
+
+function safeSessionRelativePath(value) {
+  const relative = String(value ?? '');
+  if (!relative || relative.includes('\\') || path.posix.isAbsolute(relative)
+    || path.posix.normalize(relative) !== relative || relative.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw acceptanceError('Portrait paths must be normalized session-relative paths');
+  }
+  return relative;
+}
+
+function safeRegistryPortraitPath(workingDir, stored) {
+  const absolute = path.isAbsolute(stored) ? path.resolve(stored)
+    : stored.startsWith('.working_dir/') ? path.resolve(workingDir, '../..', stored)
+      : path.resolve(workingDir, stored);
+  if (!isPathInside(workingDir, absolute)) return null;
+  return relativeArtifactPath(workingDir, absolute);
+}
+
+function isPathInside(root, absolute) {
+  return absolute !== root && absolute.startsWith(`${root}${path.sep}`);
+}
+
+async function readSafeMetadata(workingDir, absolute) {
+  if (!isPathInside(workingDir, absolute)) throw acceptanceError('Portrait metadata escapes the project');
+  try {
+    await assertSafeRegularFile(workingDir, absolute);
+    return await readFile(absolute);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function readPortraitJson(workingDir, absolute, label) {
+  try {
+    await assertSafeRegularFile(workingDir, absolute);
+    return parseJson(await readFile(absolute), `Invalid ${label}`);
+  } catch (error) {
+    if (error.code === 'ENOENT') throw acceptanceError(`The ${label} is unavailable`);
+    throw error;
+  }
+}
+
+function parseJson(value, message) {
+  try { return JSON.parse(Buffer.isBuffer(value) ? value.toString('utf8') : String(value)); }
+  catch { throw acceptanceError(message); }
+}
+
+async function validPortraitPng(workingDir, relative) {
+  try {
+    const bytes = await readSafePortrait(workingDir, relative);
+    return bytes.length > PNG_SIGNATURE.length && bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE);
+  } catch {
+    return false;
+  }
+}
+
+async function readSafePortrait(workingDir, relative) {
+  const normalized = safeSessionRelativePath(relative);
+  const absolute = path.resolve(workingDir, normalized);
+  if (!isPathInside(workingDir, absolute)) throw acceptanceError('Portrait path escapes the project');
+  await assertSafeRegularFile(workingDir, absolute);
+  const bytes = await readFile(absolute);
+  if (bytes.length <= PNG_SIGNATURE.length || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    throw acceptanceError(`Portrait is not a nonempty PNG image: ${normalized}`);
+  }
+  return bytes;
+}
+
+async function assertSafeRegularFile(root, filePath) {
+  const relative = path.relative(root, filePath);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw acceptanceError('Portrait file escapes the project');
+  }
+  let current = root;
+  const parts = relative.split(path.sep);
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]);
+    const info = await lstat(current);
+    if (info.isSymbolicLink()) throw acceptanceError(`Symbolic links are not allowed in portrait paths: ${relative}`);
+    if (index < parts.length - 1 ? !info.isDirectory() : !info.isFile()) {
+      throw acceptanceError(`Portrait path is not a regular file: ${relative}`);
+    }
+  }
+  const resolved = await realpath(filePath);
+  if (!isPathInside(root, resolved)) throw acceptanceError('Portrait file escapes the project');
+}
+
+async function ensureSafeParentDirectory(root, directory, transaction) {
+  const relative = path.relative(root, directory);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw acceptanceError('Portrait destination escapes the project');
+  }
+  let current = root;
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    try {
+      const info = await lstat(current);
+      if (info.isSymbolicLink() || !info.isDirectory()) throw acceptanceError(`Unsafe portrait destination: ${path.relative(root, current)}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      await transaction.mkdir(current);
+    }
+  }
+}
+
+async function sameImageSet(workingDir, sourcePaths, targetPaths) {
+  for (const view of PORTRAIT_VIEWS) {
+    const source = await readSafePortrait(workingDir, sourcePaths[view]).catch(() => null);
+    const target = await readSafePortrait(workingDir, targetPaths[view]).catch(() => null);
+    if (!source || !target || !source.equals(target)) return false;
+  }
+  return true;
+}
+
+async function imageSetHashes(workingDir, pathsByView) {
+  const hashes = {};
+  for (const view of PORTRAIT_VIEWS) {
+    const bytes = await readSafePortrait(workingDir, pathsByView[view]);
+    hashes[view] = createHash('sha256').update(bytes).digest('hex');
+  }
+  return hashes;
+}
+
+function samePaths(left, right) {
+  return Array.isArray(left) && Array.isArray(right)
+    && JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+}
+
+async function savedPortraitPrompts(workingDir, sourceDirectory) {
+  const entries = await readdir(sourceDirectory, {withFileTypes: true}).catch(() => []);
+  const standard = entries.find((entry) => entry.isFile() && entry.name === 'prompts.json');
+  const alternatives = entries.filter((entry) => entry.isFile() && /^prompts[^/]*\.json$/i.test(entry.name));
+  const selected = standard || (alternatives.length === 1 ? alternatives[0] : null);
+  if (!selected) return null;
+  const absolute = path.join(sourceDirectory, selected.name);
+  try {
+    const content = parseJson(await readSafeMetadata(workingDir, absolute), 'Invalid saved portrait prompts');
+    if (!isPlainObject(content)) return null;
+    const prompts = Object.fromEntries(PORTRAIT_VIEWS.filter((view) => typeof content[view] === 'string' && content[view])
+      .map((view) => [view, content[view]]));
+    return Object.keys(prompts).length ? `${JSON.stringify(prompts, null, 2)}\n` : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isExactPortraitApproval(workingDir, record, paths) {
+  if (!Array.isArray(paths) || paths.length === 0 || !isPlainObject(record)
+    || typeof record.accepted_at !== 'string' || !record.accepted_at
+    || record.invalidated_at || record.rejected_at
+    || !Array.isArray(record.artifacts) || record.artifacts.length !== paths.length) return false;
+  const expected = [...paths].sort();
+  const actual = record.artifacts.map((artifact) => artifact?.path).sort();
+  if (!samePaths(expected, actual)) return false;
+  return acceptanceLockMatches(workingDir, record, createFilmReadContext());
+}
+async function portraitCharacterApproved(workingDir, records, character) {
+  if (!character?.complete || !isPlainObject(records)) return false;
+  const ownKey = `${character.scope}::${character.identifier}`;
+  if (await isExactPortraitApproval(workingDir, records[ownKey], character.paths)) return true;
+  for (const [key, record] of Object.entries(records)) {
+    if (key !== ownKey && key.endsWith(`::${character.identifier}`)
+      && await isExactPortraitApproval(workingDir, record, character.paths)) return true;
+  }
+  return false;
+}
+
+
+async function legacyPortraitApproval(workingDir, discovery, record) {
+  return discovery.complete && discovery.portraits.length > 0
+    && await isExactPortraitApproval(workingDir, record, discovery.portraits);
+}
+
+async function syncPortraitAggregate(workingDir, workflow, store) {
+  const rootStore = isPlainObject(store[workflow.root]) ? store[workflow.root] : {};
+  const records = isPlainObject(rootStore.portrait_characters) ? rootStore.portrait_characters : {};
+  if (!workflow.discovery.complete || !workflow.discovery.characters.length) {
+    delete rootStore.portraits;
+  } else {
+    let allAccepted = true;
+    for (const character of workflow.discovery.characters) {
+      if (!await portraitCharacterApproved(workingDir, records, character)) {
+        allAccepted = false;
+        break;
+      }
+    }
+    if (allAccepted) {
+      rootStore.portraits = {
+        accepted_at: isoSeconds(),
+        artifacts: await acceptanceArtifacts(workingDir, workflow.discovery.portraits),
+      };
+    } else {
+      delete rootStore.portraits;
+    }
+  }
+  store[workflow.root] = rootStore;
+}
+
+function invalidatePortraitDependents(rootStore) {
+  const now = isoSeconds();
+  if (isPlainObject(rootStore.final_video)) {
+    rootStore.final_video = {
+      ...rootStore.final_video,
+      invalidated_at: now,
+      invalidation_reason: 'A selected character portrait changed; review the final video again.',
+    };
+  }
+  if (isPlainObject(rootStore.shots)) {
+    for (const shot of Object.values(rootStore.shots)) {
+      if (!isPlainObject(shot)) continue;
+      for (const stage of ['keyframes', 'clips']) {
+        if (isPlainObject(shot[stage])) {
+          shot[stage] = {
+            ...shot[stage],
+            invalidated_at: now,
+            invalidation_reason: 'A selected character portrait changed; review this output again.',
+          };
+        }
+      }
+    }
+  }
+}
 
 /** One coherent read budget for the film, without re-entering mutation locks. */
 export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
@@ -733,19 +2066,26 @@ export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
   const context = createFilmReadContext();
   const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
   const discovery = await collectAcceptanceState(workingDir, resolved, context);
+  const sets = await readSetReferences(repoRoot, sessionId, resolved);
+  const setArtifacts = (sets?.sets ?? []).flatMap((set) => {
+    const base = path.join(workingDir, resolved, 'set_references', set.id);
+    return [path.join(base, 'set.json'), ...(['reference.png', 'provenance.json'].map((name) =>
+      path.join(base, safePathComponent(sets.imageModel), name)))];
+  });
   const referenced = [
     ...discovery.portraits,
     ...discovery.finalVideo,
     ...discovery.shots.flatMap((shot) => [...shot.keyframes, ...shot.clips]),
-  ].map((relative) => path.resolve(workingDir, relative));
+    ...setArtifacts,
+  ].map((relative) => path.isAbsolute(relative) ? relative : path.resolve(workingDir, relative));
   const [acceptance, plans, removed, continuity, artifacts] = await Promise.all([
     acceptancePayload(repoRoot, workingDir, resolved, context, discovery),
-    shotPlansPayload(workingDir, resolved, discovery, context),
+    shotPlansPayload(workingDir, resolved, discovery, context, sets),
     listRemoved(workingDir, resolved, context),
     continuityPayload(repoRoot, workingDir, resolved, record, context, discovery),
     collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, context, referenced),
   ]);
-  return {acceptance, plans, removed, continuity, artifacts};
+  return {acceptance, plans, removed, continuity, artifacts, sets};
 }
 
 /** Stitch the accepted active clips for a film, without involving the render agent. */
@@ -989,17 +2329,42 @@ async function updateRenderAcceptanceUnlocked(repoRoot, input = {}) {
   const slot = scope === 'session' ? null : shot;
   if (body.accepted) {
     if (!paths.length) throw acceptanceError(`Cannot accept ${stage}${shot === null ? '' : ` for shot ${shot}`}: no artifacts on disk`);
-    recordSlot(store, root, slot, stage, {
-      accepted_at: isoSeconds(),
-      artifacts: await acceptanceArtifacts(workingDir, paths),
-    });
+    if (stage === 'portraits') {
+      if (!discovery.portraitComplete || !discovery.portraitCharacters.length) {
+        throw acceptanceError('Cannot accept portraits: every visible character needs a complete active front, side, and back set');
+      }
+      const acceptedAt = isoSeconds();
+      recordSlot(store, root, null, stage, {
+        accepted_at: acceptedAt,
+        artifacts: await acceptanceArtifacts(workingDir, paths),
+      });
+      const rootStore = isPlainObject(store[root]) ? store[root] : {};
+      const portraitCharacters = isPlainObject(rootStore.portrait_characters) ? rootStore.portrait_characters : {};
+      for (const character of discovery.portraitCharacters) {
+        portraitCharacters[`${character.scope}::${character.identifier}`] = {
+          accepted_at: acceptedAt,
+          artifacts: await acceptanceArtifacts(workingDir, character.paths),
+        };
+      }
+      rootStore.portrait_characters = portraitCharacters;
+      store[root] = rootStore;
+    } else {
+      recordSlot(store, root, slot, stage, {
+        accepted_at: isoSeconds(),
+        artifacts: await acceptanceArtifacts(workingDir, paths),
+      });
+    }
   } else if (reason) {
     if (reason.length > REASON_MAX_LENGTH) throw acceptanceError(`reason must be at most ${REASON_MAX_LENGTH} characters`);
-    // A rejection overwrites the slot's record, so it can never carry both an
-    // acceptance and a rejection.
     recordSlot(store, root, slot, stage, {rejected_at: isoSeconds(), reason});
   } else {
     removeAcceptance(store, root, slot, stage);
+    if (stage === 'portraits') {
+      const rootStore = isPlainObject(store[root]) ? store[root] : {};
+      delete rootStore.portrait_characters;
+      if (Object.keys(rootStore).length) store[root] = rootStore;
+      else delete store[root];
+    }
   }
   await writeAcceptanceFile(workingDir, store);
   return acceptancePayload(repoRoot, workingDir, root);
@@ -1018,7 +2383,15 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
     if (scope === 'session') {
       const paths = stage === 'portraits' ? discovery.portraits : discovery.finalVideo;
       const slotRecord = rootStore[stage];
-      slots = [slotPayload(null, await slotState(workingDir, slotRecord, paths, context), paths, slotRecord)];
+      let state = await slotState(workingDir, slotRecord, paths, context);
+      if (stage === 'portraits') {
+        if (!discovery.portraitComplete) state = paths.length ? 'stale' : 'planned';
+        else if (state === 'accepted' && !await legacyPortraitApproval(workingDir, {
+          complete: discovery.portraitComplete,
+          portraits: paths,
+        }, slotRecord)) state = 'stale';
+      }
+      slots = [slotPayload(null, state, paths, slotRecord)];
     } else {
       slots = [];
       for (const shot of discovery.shots) {
@@ -1045,6 +2418,8 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
   return {
     root,
     stages,
+    characters: discovery.characters,
+    portraitImageModel: discovery.portraitImageModel,
     totals: {
       acceptedKeyframes,
       keyframes,
@@ -1128,7 +2503,7 @@ async function acceptanceLockMatches(workingDir, record, context) {
 
 /** Mirror of `utils.text.safe_path_component`, so a model names the same directory on both sides. */
 function safePathComponent(name) {
-  const cleaned = String(name ?? '').replace(/[^\w\-. ]/g, '_').replace(/^\.+/, '').trim();
+  const cleaned = String(name ?? '').replace(/[^\p{L}\p{N}\p{M}\p{Pc}\-. ]/gu, '_').trim().replace(/^\.+/, '');
   return cleaned || 'unnamed';
 }
 
@@ -1156,13 +2531,15 @@ async function collectAcceptanceState(workingDir, root, context = createFilmRead
   } catch {
     manifest = null;
   }
-  const imageModelDir = safePathComponent(manifest?.image_model ?? '');
+  const configured = manifest?.image_model ? null : await readAgentConfig(path.resolve(workingDir, '..', '..')).catch(() => null);
+  const imageModel = manifest?.image_model || configured?.sections?.image?.model || '';
+  const imageModelDir = safePathComponent(imageModel);
   const videoModelDir = safePathComponent(manifest?.video_model ?? '');
 
-  const portraits = [];
-  await collectAcceptanceFiles(workingDir, path.join(rootDir, 'character_portraits'), (name) => name.toLowerCase().endsWith('.png'), portraits, context);
-  portraits.sort();
-  portraits.splice(0, portraits.length, ...currentModelArtifacts(portraits, imageModelDir));
+  const portraitState = PORTRAIT_WORKFLOW_ROOTS.has(root)
+    ? await discoverPortraits(workingDir, root, imageModelDir)
+    : {portraits: [], characters: [], inventoryCharacters: [], complete: false};
+  const portraits = portraitState.portraits;
 
   const finalVideo = [];
   const finalPath = path.join(rootDir, 'final_video.mp4');
@@ -1204,7 +2581,43 @@ async function collectAcceptanceState(workingDir, root, context = createFilmRead
     return compareShotNames(left.shot, right.shot);
   });
 
-  return {portraits, finalVideo, shots, order: playing};
+  const acceptance = await readAcceptanceFile(workingDir, context);
+  const approvalRoot = isPlainObject(acceptance[root]) ? acceptance[root] : {};
+  const approvalRecords = isPlainObject(approvalRoot.portrait_characters) ? approvalRoot.portrait_characters : {};
+  const legacyApproved = await legacyPortraitApproval(workingDir, portraitState, approvalRoot.portraits);
+  const characters = [];
+  for (const character of portraitState.inventoryCharacters) {
+    const key = `${character.scope}::${character.identifier}`;
+    const record = approvalRecords[key];
+    const approved = character.visible && (await portraitCharacterApproved(workingDir, approvalRecords, character)
+      || Boolean(legacyApproved && character.complete));
+    const rejected = Boolean(record?.rejected_at);
+    const views = Object.fromEntries(PORTRAIT_VIEWS.map((view) => [view, {
+      ...(character.pathsByView[view] ? {path: character.pathsByView[view]} : {}),
+      state: character.viewStates[view],
+    }]));
+    characters.push({
+      identifier: character.identifier,
+      scope: character.scope,
+      description: character.description,
+      visible: character.visible,
+      complete: character.complete,
+      state: !character.visible ? 'planned' : rejected ? 'rejected' : approved ? 'accepted'
+        : !character.paths.length ? 'planned'
+          : character.complete ? 'rendered' : 'stale',
+      views,
+    });
+  }
+  return {
+    portraits,
+    portraitCharacters: portraitState.characters,
+    portraitComplete: portraitState.complete,
+    characters,
+    portraitImageModel: imageModel,
+    finalVideo,
+    shots,
+    order: playing,
+  };
 }
 
 /** Where a render root keeps its shots: flat, or one directory per scene. */
@@ -1503,18 +2916,22 @@ async function withMutationTransaction(operation) {
   const undo = [];
   const backups = [];
   const transaction = {
-    async write(filePath, contents) {
+    async write(filePath, contents, previousSnapshot) {
       let previous = null;
       let previousMode;
       let previousTimes;
       try {
         const info = await lstat(filePath);
         if (!info.isFile()) throw acceptanceError(`Cannot replace non-file metadata: ${path.basename(filePath)}`);
-        previous = await readFile(filePath);
+        if (previousSnapshot === null) throw conflictError('Related metadata changed; refresh the deletion confirmation');
+        previous = previousSnapshot === undefined ? await readFile(filePath) : previousSnapshot;
         previousMode = info.mode & 0o777;
         previousTimes = {atime: info.atime, mtime: info.mtime};
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
+        if (previousSnapshot !== undefined && previousSnapshot !== null) {
+          throw conflictError('Related metadata changed; refresh the deletion confirmation');
+        }
       }
       await writeAtomic(filePath, contents);
       undo.push(async () => {
@@ -1594,7 +3011,7 @@ async function writeAtomic(filePath, contents, mode) {
  * the order the film plays in — the camera tree is. Anything comparing the timeline against
  * a review has to use this, or a review that is current reads as out of date.
  */
-async function filmOrder(workingDir, root, context = createFilmReadContext()) {
+async function filmPlaybackContext(workingDir, root, context = createFilmReadContext(), includeCameraOwners = true) {
   const rootDir = path.join(workingDir, root);
   const entries = await context.entries(rootDir).catch(() => []);
   const scenes = entries.filter((entry) => entry.isDirectory() && /^scene_\d+$/.test(entry.name))
@@ -1602,14 +3019,26 @@ async function filmOrder(workingDir, root, context = createFilmReadContext()) {
   const containers = scenes.length ? scenes.map((entry) => ({name: entry.name, dir: path.join(rootDir, entry.name)}))
     : [{name: '', dir: rootDir}];
   const order = [];
+  const cameraBySlot = includeCameraOwners ? new Map() : null;
   for (const {name, dir} of containers) {
     let cameras;
     try { cameras = await context.json(path.join(dir, CAMERA_TREE_FILENAME)); } catch { continue; }
     if (!Array.isArray(cameras)) continue;
-    order.push(...cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx))
-      .flatMap((camera) => (camera.active_shot_idxs || []).map((shot) => `${name ? `${name}/` : ''}${shot}`)));
+    const orderedCameras = cameras.slice().sort((left, right) => Number(left.idx) - Number(right.idx));
+    for (const [index, camera] of orderedCameras.entries()) {
+      const owner = includeCameraOwners ? `${name}/${String(camera.idx ?? index)}` : '';
+      for (const shot of camera.active_shot_idxs || []) {
+        const slot = `${name ? `${name}/` : ''}${shot}`;
+        order.push(slot);
+        if (cameraBySlot) cameraBySlot.set(slot, owner);
+      }
+    }
   }
-  return order;
+  return {order, cameraBySlot};
+}
+
+async function filmOrder(workingDir, root, context = createFilmReadContext()) {
+  return (await filmPlaybackContext(workingDir, root, context, false)).order;
 }
 
 /**
@@ -1653,6 +3082,9 @@ async function continuityPayload(repoRoot, workingDir, root, record, context, di
 async function reviewStaleness(workingDir, root, review, shots, userRequirement, context) {
   if (!review) return {stale: true, reason: 'No review yet.'};
   if (review.root !== undefined && review.root !== root) return {stale: true, reason: 'The reviewed render root no longer matches.'};
+  if (typeof review.set_references_invalidated_at === 'string' && review.set_references_invalidated_at) {
+    return {stale: true, reason: review.set_references_invalidation_reason || 'A set reference changed; review continuity again.'};
+  }
   const reviewed = (Array.isArray(review.shots_reviewed) ? review.shots_reviewed : []).map(String);
   const added = shots.filter((shot) => !reviewed.includes(shot));
   const removed = reviewed.filter((shot) => !shots.includes(shot));
@@ -1739,6 +3171,18 @@ async function continuityInputPaths(workingDir, root, shots, context) {
       await collectJsonInputs(kept, add, context);
     }
   }
+  const setDirectory = path.join(rootDir, 'set_references');
+  const setEntries = await context.entries(setDirectory).catch(() => []);
+  for (const entry of setEntries) {
+    if (!entry.isDirectory() || !SET_ID_PATTERN.test(entry.name)) continue;
+    const setDir = path.join(setDirectory, entry.name);
+    add(path.join(setDir, 'set.json'));
+    const modelDirs = await context.entries(setDir).catch(() => []);
+    for (const model of modelDirs) {
+      if (!model.isDirectory() || model.name === 'set.json') continue;
+      for (const name of ['reference.png', 'provenance.json']) add(path.join(setDir, model.name, name));
+    }
+  }
   return paths;
 }
 
@@ -1759,14 +3203,17 @@ export async function readShotPlans(repoRoot, sessionId, root = '') {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const context = createFilmReadContext();
   const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
+  const playback = await filmPlaybackContext(workingDir, resolved, context);
+  const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
   const discovery = await collectAcceptanceState(workingDir, resolved, context);
-  return {root: resolved, plans: await shotPlansPayload(workingDir, resolved, discovery, context)};
+  const setInventory = await readSetReferences(repoRoot, sessionId, resolved);
+  return {root: resolved, plans: await shotPlansPayload(workingDir, resolved, discovery, context, setInventory, reuseContext)};
 }
 
-async function shotPlansPayload(workingDir, root, discovery, context) {
+async function shotPlansPayload(workingDir, root, discovery, context, setInventory, reuseContext) {
   const plans = [];
   for (const {shot} of discovery.shots) {
-    try { plans.push(await shotPlanPayload(workingDir, root, shot, context)); }
+    try { plans.push(await shotPlanPayload(workingDir, root, shot, context, setInventory, reuseContext)); }
     catch { /* A shot with no readable plan is simply not part of what can be shown. */ }
   }
   return plans;
@@ -1818,10 +3265,14 @@ export async function readShotPlan(repoRoot, sessionId, root = '', slot = '') {
   if (!record) return null;
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const resolved = await resolveRenderRoot(repoRoot, workingDir, root);
-  return shotPlanPayload(workingDir, resolved, slot);
+  const context = createFilmReadContext();
+  const playback = await filmPlaybackContext(workingDir, resolved, context);
+  const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
+  const inventory = await readSetReferences(repoRoot, sessionId, resolved);
+  return shotPlanPayload(workingDir, resolved, slot, context, inventory, reuseContext);
 }
 
-/** Rewrite one shot's plan: its frame descriptions and the characters each frame shows. */
+/** Rewrite one shot's plan: guidance, frame descriptions, and visible characters. */
 export async function updateShotPlan(repoRoot, input = {}) {
   return withTimelineMutation(repoRoot, input, () => updateShotPlanUnlocked(repoRoot, input));
 }
@@ -1834,11 +3285,56 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
   const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
   const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
   const slot = String(body.slot ?? '');
-  const discovery = await collectAcceptanceState(workingDir, root);
+  const context = createFilmReadContext();
+  const playback = await filmPlaybackContext(workingDir, root, context);
+  const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
+  const discovery = await collectAcceptanceState(workingDir, root, context);
   if (!discovery.shots.some((entry) => entry.shot === slot)) throw acceptanceError(`Unknown shot: ${slot || '(missing)'}`);
+  if (Object.hasOwn(body, 'reusePreviousLastFrame')) {
+    if (typeof body.reusePreviousLastFrame !== 'boolean') {
+      throw acceptanceError('reusePreviousLastFrame must be a boolean');
+    }
+    if (!Object.hasOwn(body, 'previousSlot')
+      || (body.previousSlot !== null && typeof body.previousSlot !== 'string')) {
+      throw acceptanceError('previousSlot must be a string or null when changing previous-frame reuse');
+    }
+    const index = playback.order.indexOf(slot);
+    const actualPreviousSlot = index > 0 ? playback.order[index - 1] : null;
+    if (body.previousSlot !== actualPreviousSlot) {
+      throw conflictError('Film playback order changed; refresh the shot before changing previous-frame reuse');
+    }
+    if (body.reusePreviousLastFrame && actualPreviousSlot === null) {
+      throw acceptanceError('The first shot in the film has no previous last frame to reuse');
+    }
+  }
+  const setInventory = await readSetReferences(repoRoot, sessionId, root);
+  if (Object.hasOwn(body, 'setIds')) {
+    if (body.setRevision !== setInventory?.revision) throw conflictError('Set references changed; refresh before saving shot bindings');
+    if (!Array.isArray(body.setIds) || !body.setIds.every((id) => typeof id === 'string') || new Set(body.setIds).size !== body.setIds.length) {
+      throw acceptanceError('setIds must be a unique list of set identifiers');
+    }
+    const known = new Set((setInventory?.sets ?? []).map(({id}) => id));
+    const unknown = body.setIds.filter((id) => !SET_ID_PATTERN.test(id) || !known.has(id));
+    if (unknown.length) throw acceptanceError(`Unknown set identifier: ${unknown.join(', ')}`);
+  }
+  const plan = await shotPlanPayload(workingDir, root, slot, context, setInventory, reuseContext);
 
-  const plan = await shotPlanPayload(workingDir, root, slot);
   const edits = {};
+  if (Object.hasOwn(body, 'setIds')) edits.set_ids = [...body.setIds];
+  if (Object.hasOwn(body, 'reusePreviousLastFrame')) {
+    edits.reuse_previous_last_frame = body.reusePreviousLastFrame;
+  }
+  for (const field of ['brief', 'motionDesc']) {
+    if (!Object.hasOwn(body, field)) continue;
+    if (typeof body[field] !== 'string') throw acceptanceError(`${field === 'brief' ? 'Brief' : 'Motion description'} must be text`);
+    const value = body[field].trim();
+    const limit = field === 'brief' ? MAX_BRIEF_LENGTH : MAX_DESCRIPTION_LENGTH;
+    const label = field === 'brief' ? 'Brief' : 'Motion description';
+    if (!value) throw acceptanceError(`${label} cannot be empty`);
+    if (value.length > limit) throw acceptanceError(`${label} must be at most ${limit} characters`);
+    if (field === 'brief') edits.visual_desc = value;
+    if (field === 'motionDesc') edits.motion_desc = value;
+  }
   for (const frame of ['ff', 'lf']) {
     if (typeof body[`${frame}Desc`] === 'string') {
       const description = body[`${frame}Desc`].trim();
@@ -1859,16 +3355,147 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
   const location = shotLocation(workingDir, root, slot);
   const target = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
   const current = JSON.parse(await readFile(target, 'utf8'));
+  const storyboard = Object.hasOwn(body, 'brief') ? await readJsonOptional(location.storyboardPath) : null;
+  if (Object.hasOwn(body, 'brief') && !Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
+  const storyboardIndex = Array.isArray(storyboard) ? storyboard.findIndex((entry) => String(entry?.idx) === location.local) : -1;
+  if (Object.hasOwn(body, 'brief') && storyboardIndex < 0) throw acceptanceError(`Shot ${slot} has no storyboard brief`);
+  const briefTarget = path.join(location.shotDir, 'brief.json');
+  const currentBrief = Object.hasOwn(body, 'brief') ? await readJsonOptional(briefTarget) : null;
+  if (Object.hasOwn(body, 'brief')) {
+    storyboard[storyboardIndex] = {...storyboard[storyboardIndex], visual_desc: body.brief.trim()};
+    if (isPlainObject(currentBrief)) currentBrief.visual_desc = body.brief.trim();
+  }
   const sourceEndingChanged = ['lf_desc', 'lf_vis_char_idxs'].some(
     (key) => Object.hasOwn(edits, key) && JSON.stringify(current[key]) !== JSON.stringify(edits[key]),
   );
+  const effectiveSetIdsChanged = Object.hasOwn(body, 'setIds')
+    && JSON.stringify(plan.setIds) !== JSON.stringify(body.setIds);
+  const reuseChoiceChanged = Object.hasOwn(body, 'reusePreviousLastFrame')
+    && current.reuse_previous_last_frame !== body.reusePreviousLastFrame;
+  const invalidateOutputs = Object.keys(edits).some((key) => !['set_ids', 'reuse_previous_last_frame'].includes(key))
+    || effectiveSetIdsChanged || reuseChoiceChanged;
   await withMutationTransaction(async (transaction) => {
-    await transaction.write(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
-    await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {
-      continuitySourceSlots: sourceEndingChanged ? [slot] : [],
-    });
+    if (Object.keys(edits).length) await transaction.write(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
+    if (Object.hasOwn(body, 'brief')) {
+      await transaction.write(location.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
+      if (isPlainObject(currentBrief)) await transaction.write(briefTarget, `${JSON.stringify(currentBrief, null, 4)}\n`);
+    }
+    if (invalidateOutputs) {
+      await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {
+        continuitySourceSlots: sourceEndingChanged || effectiveSetIdsChanged || reuseChoiceChanged ? [slot] : [],
+        forceContinuity: reuseChoiceChanged,
+        preserveMedia: reuseChoiceChanged,
+      });
+    }
   });
-  return shotPlanPayload(workingDir, root, slot);
+  const updatedInventory = await readSetReferences(repoRoot, sessionId, root);
+  const updatedContext = createFilmReadContext();
+  const updatedPlayback = await filmPlaybackContext(workingDir, root, updatedContext);
+  return shotPlanPayload(workingDir, root, slot, updatedContext, updatedInventory, {
+    playback: updatedPlayback,
+    continuityEnabled: await frameContinuityEnabled(workingDir),
+  });
+
+}
+/** Preview a shot reset against the exact outputs and dependency metadata on disk. */
+export async function getShotRestartPlan(repoRoot, input = {}) {
+  return withTimelineMutation(repoRoot, input, async () => {
+    const record = sessionRecord(await readSessionsPayload(repoRoot), input.sessionId);
+    const workingDir = sessionWorkingDir(repoRoot, input.sessionId, record);
+    return shotRestartPlanUnlocked(repoRoot, workingDir, input);
+  });
+}
+
+async function shotRestartPlanUnlocked(repoRoot, workingDir, input) {
+  const root = await resolveRenderRoot(repoRoot, workingDir, input.root);
+  const slot = String(input.slot ?? '');
+  const location = shotLocation(workingDir, root, slot);
+  await assertSafeRegularFile(workingDir, path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME));
+  if (!(await filmOrder(workingDir, root)).includes(slot)) {
+    throw acceptanceError(`Shot ${slot} is not in the active film`);
+  }
+  const paths = [];
+  async function collect(directory, preservePlan = false) {
+    let entries;
+    try { entries = await readdir(directory, {withFileTypes: true}); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for (const entry of entries) {
+      const file = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) throw acceptanceError('Shot restart refuses symbolic links');
+      if (entry.isDirectory()) await collect(file);
+      else if (entry.isFile()) {
+        await assertSafeRegularFile(workingDir, file);
+        if (preservePlan && [SHOT_DESCRIPTION_FILENAME, 'brief.json'].includes(entry.name)) continue;
+        paths.push(path.relative(workingDir, file).split(path.sep).join('/'));
+      } else throw acceptanceError('Shot restart refuses non-regular files');
+    }
+  }
+  await collect(location.shotDir, true);
+  const backupShot = path.join(workingDir, '.redo_backup', path.relative(workingDir, location.shotDir));
+  // A failed future redraw must not resurrect the outputs the user explicitly reset.
+  try {
+    const info = await lstat(backupShot);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw acceptanceError('Unsafe shot redraw backup');
+    await collect(backupShot);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const films = new Set([path.join(workingDir, root, 'final_video.mp4')]);
+  if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
+  for (const film of [...films]) films.add(path.join(workingDir, '.redo_backup', path.relative(workingDir, film)));
+  for (const film of films) {
+    try {
+      await assertSafeRegularFile(workingDir, film);
+      paths.push(path.relative(workingDir, film).split(path.sep).join('/'));
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  paths.sort();
+  const metadata = [
+    path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME),
+    path.join(location.shotDir, 'brief.json'),
+    location.treePath, location.storyboardPath,
+    path.join(workingDir, ACCEPTANCE_FILENAME),
+    path.join(workingDir, 'render_manifest.json'),
+    path.join(workingDir, 'frame_continuity.json'),
+  ];
+  const fingerprints = [];
+  for (const file of [...paths.map((relative) => path.join(workingDir, relative)), ...metadata]) {
+    try {
+      await assertSafeRegularFile(workingDir, file);
+      fingerprints.push([path.relative(workingDir, file), await sha256File(file)]);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      fingerprints.push([path.relative(workingDir, file), null]);
+    }
+  }
+  const continuityEnabled = await frameContinuityEnabled(workingDir);
+  const revision = createHash('sha256').update(JSON.stringify([
+    input.sessionId, root, slot, paths, fingerprints, await filmOrder(workingDir, root),
+  ])).digest('hex');
+  return {sessionId: input.sessionId, root, slot, revision, paths, continuityEnabled};
+}
+
+export async function restartShot(repoRoot, input = {}, isBusy = () => false) {
+  if (!isPlainObject(input) || typeof input.sessionId !== 'string'
+    || typeof input.root !== 'string' || !input.root || typeof input.slot !== 'string' || !input.slot
+    || typeof input.revision !== 'string' || !input.revision) {
+    throw acceptanceError('sessionId, root, slot, and revision are required');
+  }
+  return withTimelineMutation(repoRoot, input, async () => {
+    if (isBusy()) throw conflictError('Wait for active and queued requests to finish before restarting a shot');
+    const record = sessionRecord(await readSessionsPayload(repoRoot), input.sessionId);
+    const workingDir = sessionWorkingDir(repoRoot, input.sessionId, record);
+    const plan = await shotRestartPlanUnlocked(repoRoot, workingDir, input);
+    if (plan.revision !== input.revision) {
+      throw conflictError('Shot outputs or related metadata changed; reopen the restart confirmation');
+    }
+    if (isBusy()) throw conflictError('A request started or was queued; wait before restarting a shot');
+    await withMutationTransaction(async (transaction) => {
+      for (const relative of plan.paths) await transaction.remove(path.join(workingDir, relative));
+      await invalidateTimelineOutputs(transaction, workingDir, plan.root, [plan.slot], true, {
+        continuitySourceSlots: [plan.slot],
+      });
+    });
+    return {ok: true, restarted: plan.slot, root: plan.root};
+  });
 }
 
 /**
@@ -2129,7 +3756,8 @@ async function createShotUnlocked(repoRoot, input = {}) {
   if (!Array.isArray(cameras)) throw acceptanceError('This sequence has no camera tree to change');
   const camera = cameras.find((entry) => (entry.active_shot_idxs || []).map(String).includes(afterLocation.local));
   if (!camera) throw acceptanceError(`Shot ${after} is not part of a camera, so there is nothing to add a shot after`);
-  const reference = await shotPlanPayload(workingDir, root, after);
+  const setInventory = await readSetReferences(repoRoot, sessionId, root);
+  const reference = await shotPlanPayload(workingDir, root, after, createFilmReadContext(), setInventory);
   const sourcePath = path.join(afterLocation.shotDir, SHOT_DESCRIPTION_FILENAME);
   const source = JSON.parse(await readFile(sourcePath, 'utf8'));
 
@@ -2179,7 +3807,7 @@ async function createShotUnlocked(repoRoot, input = {}) {
   if (storyboard === undefined) storyboard = [];
   if (!Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
   storyboard = [...storyboard, {idx: localSlot, is_last: false, cam_idx: camera.idx, visual_desc: brief, audio_desc: audioDesc}];
-  const created = {...source, idx: localSlot, is_last: false, cam_idx: camera.idx, ...frames, audio_desc: audioDesc};
+  const created = {...source, idx: localSlot, is_last: false, cam_idx: camera.idx, set_ids: [...reference.setIds], ...frames, audio_desc: audioDesc};
   if (motionDesc) created.motion_desc = motionDesc;
 
   await withMutationTransaction(async (transaction) => {
@@ -2202,7 +3830,7 @@ async function invalidateTimelineOutputs(
   root,
   shots,
   clearShotAcceptance = true,
-  {orderBefore, continuitySourceSlots = []} = {},
+  {orderBefore, continuitySourceSlots = [], forceContinuity = false, preserveMedia = false} = {},
 ) {
   const continuityEnabled = await frameContinuityEnabled(workingDir);
   const store = await readAcceptanceFile(workingDir);
@@ -2210,10 +3838,19 @@ async function invalidateTimelineOutputs(
   const rootStore = isPlainObject(store[root]) ? store[root] : {};
   const shotStore = isPlainObject(rootStore.shots) ? rootStore.shots : {};
   const now = isoSeconds();
+  let playbackOrder = [];
+  let linkedInvalidatedSlots = [];
+  if (!continuityEnabled && (Array.isArray(orderBefore) || continuitySourceSlots.length)) {
+    playbackOrder = await filmOrder(workingDir, root);
+    const choices = await timelineReuseChoices(workingDir, root, [...new Set([...playbackOrder, ...(orderBefore || [])])]);
+    linkedInvalidatedSlots = Array.isArray(orderBefore)
+      ? changedLinkedContinuityTargets(orderBefore, playbackOrder, choices)
+      : linkedContinuitySuccessors(playbackOrder, continuitySourceSlots, choices);
+  }
 
+  const preserveApprovalContinuity = continuityEnabled || forceContinuity || linkedInvalidatedSlots.length > 0;
+  let invalidatedSlots = [];
   if (continuityEnabled) {
-    let invalidatedSlots = [];
-    let playbackOrder = [];
     if (Array.isArray(orderBefore)) {
       playbackOrder = await filmOrder(workingDir, root);
       const changedSuffix = timelineOrderChangedSuffix(orderBefore, playbackOrder);
@@ -2223,19 +3860,29 @@ async function invalidateTimelineOutputs(
       ];
     } else if (continuitySourceSlots.length) {
       playbackOrder = await filmOrder(workingDir, root);
-      invalidatedSlots = continuitySuccessors(
-        playbackOrder,
-        continuitySourceSlots,
-        new Set(shots.map(String)),
-      );
+      invalidatedSlots = [
+        ...(forceContinuity ? shots : []),
+        ...continuitySuccessors(
+          playbackOrder,
+          continuitySourceSlots,
+          new Set(shots.map(String)),
+        ),
+      ];
     }
+  } else if (forceContinuity) {
+    invalidatedSlots = [...shots, ...linkedInvalidatedSlots];
+  } else {
+    invalidatedSlots = linkedInvalidatedSlots;
+  }
+
+  if (preserveApprovalContinuity) {
     const uniqueSlots = [...new Set(invalidatedSlots.map(String))];
     for (const slot of uniqueSlots) {
       const record = shotStore[slot];
       if (!isPlainObject(record)) continue;
       const reason = Array.isArray(orderBefore)
         ? 'The shot or film playback order changed; re-review this shot’s keyframes and clip for the continuous handoff.'
-        : continuityInvalidationReason(playbackOrder, slot, continuitySourceSlots);
+        : continuityInvalidationReason(playbackOrder, slot, continuitySourceSlots.length ? continuitySourceSlots : shots);
       for (const stage of ['keyframes', 'clips']) {
         if (isPlainObject(record[stage])) {
           record[stage] = {...record[stage], invalidated_at: now, invalidation_reason: reason};
@@ -2258,7 +3905,7 @@ async function invalidateTimelineOutputs(
     removeAcceptance(store, root, null, 'final_video');
   }
 
-  if (clearShotAcceptance && !(continuityEnabled && Array.isArray(orderBefore))) {
+  if (clearShotAcceptance && !(continuityEnabled && Array.isArray(orderBefore)) && !forceContinuity) {
     for (const slot of shots) {
       removeAcceptance(store, root, slot, 'keyframes');
       removeAcceptance(store, root, slot, 'clips');
@@ -2268,13 +3915,15 @@ async function invalidateTimelineOutputs(
     await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
   }
 
-  const rootDir = path.join(workingDir, root);
-  const films = new Set([path.join(rootDir, 'final_video.mp4')]);
-  for (const slot of shots) {
-    const location = shotLocation(workingDir, root, slot);
-    if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
+  if (!preserveMedia) {
+    const rootDir = path.join(workingDir, root);
+    const films = new Set([path.join(rootDir, 'final_video.mp4')]);
+    for (const slot of shots) {
+      const location = shotLocation(workingDir, root, slot);
+      if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
+    }
+    for (const film of films) await transaction.remove(film);
   }
-  for (const film of films) await transaction.remove(film);
 }
 
 async function frameContinuityEnabled(workingDir) {
@@ -2301,6 +3950,51 @@ function continuitySuccessors(order, changedSlots, excluded = new Set()) {
     order.length,
   );
   return order.slice(firstChanged + 1).filter((slot) => !changed.has(slot) && !excluded.has(slot));
+}
+async function timelineReuseChoices(workingDir, root, slots) {
+  const choices = new Map();
+  for (const slot of new Set(slots.map(String))) {
+    const location = shotLocation(workingDir, root, slot);
+    const activePlanPath = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
+    let bytes = await readSafeMetadata(workingDir, activePlanPath);
+    if (bytes === null) {
+      bytes = await readSafeMetadata(
+        workingDir,
+        path.join(location.container, REMOVED_SHOTS_DIR, location.local, SHOT_DESCRIPTION_FILENAME),
+      );
+    }
+    const description = bytes === null ? null : JSON.parse(bytes.toString('utf8'));
+    if (typeof description?.reuse_previous_last_frame === 'boolean') {
+      choices.set(slot, description.reuse_previous_last_frame);
+    }
+  }
+  return choices;
+}
+
+function linkedContinuitySuccessors(order, changedSlots, reuseChoices) {
+  const changed = new Set(changedSlots.map(String));
+  const invalidated = [];
+  for (let index = 1; index < order.length; index += 1) {
+    const previous = order[index - 1];
+    const slot = order[index];
+    if (changed.has(previous) && reuseChoices.get(slot) === true) {
+      invalidated.push(slot);
+      changed.add(slot);
+    }
+  }
+  return invalidated;
+}
+
+function changedLinkedContinuityTargets(before, after, reuseChoices) {
+  const previousByShot = (order) => new Map(order.map((slot, index) => [slot, index ? order[index - 1] : null]));
+  const beforePrevious = previousByShot(before);
+  const afterPrevious = previousByShot(after);
+  const changedTargets = after.filter((slot) => reuseChoices.get(slot) === true
+    && beforePrevious.get(slot) !== afterPrevious.get(slot));
+  return [...new Set([
+    ...changedTargets,
+    ...linkedContinuitySuccessors(after, changedTargets, reuseChoices),
+  ])];
 }
 
 function continuityInvalidationReason(order, slot, changedSlots) {
@@ -2378,7 +4072,7 @@ async function pathExists(target) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-async function shotPlanPayload(workingDir, root, slot, context = createFilmReadContext()) {
+async function shotPlanPayload(workingDir, root, slot, context = createFilmReadContext(), setInventory, reuseContext) {
   const location = shotLocation(workingDir, root, slot);
   const shotDir = location.shotDir;
   let description;
@@ -2388,21 +4082,59 @@ async function shotPlanPayload(workingDir, root, slot, context = createFilmReadC
   } catch {
     throw acceptanceError(`Unknown shot: ${slot || '(missing)'}`);
   }
+  const playback = reuseContext?.playback ?? await filmPlaybackContext(workingDir, root, context);
+  const continuityEnabled = reuseContext?.continuityEnabled ?? await frameContinuityEnabled(workingDir);
+  const index = playback.order.indexOf(String(slot));
+  const previousSlot = index > 0 ? playback.order[index - 1] : null;
+  const storedChoice = typeof description.reuse_previous_last_frame === 'boolean'
+    ? description.reuse_previous_last_frame : null;
+  const reusePreviousLastFrame = previousSlot !== null && (storedChoice
+    ?? (continuityEnabled && playback.cameraBySlot.get(String(slot)) === playback.cameraBySlot.get(previousSlot)));
+  const previousLastFrameAvailable = previousSlot
+    ? await shotLastFrameAvailable(workingDir, root, previousSlot, context)
+    : false;
   const {characters, briefs} = await scenePlanMetadata(workingDir, location, context);
+  const shotBrief = await context.json(path.join(shotDir, 'brief.json')).catch(() => null);
+  const brief = typeof shotBrief?.visual_desc === 'string'
+    ? shotBrief.visual_desc
+    : briefs.get(String(location.local)) || '';
   const prompt = async (frame) => {
     try {
       const cached = await context.json(path.join(shotDir, `${frame}_selector_output.json`));
       return typeof cached?.sent_prompt === 'string' ? cached.sent_prompt : '';
     } catch { return ''; }
   };
+  const setShot = setInventory?.shots.find((shot) => shot.slot === String(slot));
   return {
     slot: String(slot), root,
-    brief: briefs.get(String(location.local)) || '',
+    brief,
     characters,
     firstFrame: {description: String(description.ff_desc || ''), visible: [...(description.ff_vis_char_idxs || [])], prompt: await prompt('first_frame')},
     lastFrame: {description: String(description.lf_desc || ''), visible: [...(description.lf_vis_char_idxs || [])], prompt: await prompt('last_frame')},
     motionDescription: String(description.motion_desc || ''),
+    reusePreviousLastFrame,
+    previousSlot,
+    previousLastFrameAvailable,
+    sets: (setInventory?.sets ?? []).map(({id, name, state}) => ({id, name, accepted: state === 'accepted'})),
+    setIds: setShot?.setIds ?? [],
+    setRevision: setInventory?.revision ?? '',
   };
+}
+
+async function shotLastFrameAvailable(workingDir, root, slot, context) {
+  const location = shotLocation(workingDir, root, slot);
+  if (!isPathInside(workingDir, location.shotDir)) return false;
+  let current = workingDir;
+  for (const part of path.relative(workingDir, location.shotDir).split(path.sep)) {
+    current = path.join(current, part);
+    let info;
+    try { info = await lstat(current); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    if (!info.isDirectory() || info.isSymbolicLink()) return false;
+  }
+  const artifacts = [];
+  await collectAcceptanceFiles(workingDir, location.shotDir, (name) => name === 'last_frame.png', artifacts, context);
+  return artifacts.length > 0;
 }
 
 function scenePlanMetadata(workingDir, location, context) {
@@ -2432,5 +4164,463 @@ async function readSessionCharacters(workingDir, root, context) {
       .sort((left, right) => left.idx - right.idx);
   } catch {
     return [];
+  }
+}
+const SET_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const SET_REFERENCE_LIMIT = 4000;
+
+/** Read the editable set plan and its approval state without creating files. */
+export async function readSetReferences(repoRoot, sessionId, requestedRoot = '') {
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  const context = createFilmReadContext();
+  const root = await resolveRenderRoot(repoRoot, workingDir, requestedRoot, context);
+  const discovery = await collectAcceptanceState(workingDir, root, context);
+  const manifest = await readRenderManifest(repoRoot, workingDir, context) ?? {};
+  const store = await readAcceptanceFile(workingDir, context);
+  const setStore = isPlainObject(store[root]?.sets) ? store[root].sets : {};
+  const directory = path.join(workingDir, root, 'set_references');
+  let entries = [];
+  try {
+    if (await realpath(directory) !== path.resolve(directory)) throw acceptanceError('Set reference directory is unsafe');
+    entries = await context.entries(directory);
+  } catch {}
+  const ids = entries.filter((entry) => entry.isDirectory() && SET_ID_PATTERN.test(entry.name))
+    .map((entry) => entry.name).sort();
+  const configured = manifest.image_model ? null : await readAgentConfig(repoRoot).catch(() => null);
+  const model = String(manifest.image_model || configured?.sections?.image?.model || '');
+  const modelSlug = model ? safePathComponent(model) : '';
+  const style = String(manifest.style ?? record.style ?? '');
+  const sets = [];
+  for (const id of ids) {
+    const setDir = path.join(directory, id);
+    if (!await safeSetDirectory(workingDir, setDir)) continue;
+    const descriptorPath = path.join(setDir, 'set.json');
+    if (!await safeSetFile(workingDir, descriptorPath)) continue;
+    const descriptor = await context.json(descriptorPath).catch(() => null);
+    const descriptorKeys = isPlainObject(descriptor) ? Object.keys(descriptor).sort().join(',') : '';
+    if (!isPlainObject(descriptor) || descriptorKeys !== 'description,id,name,shots'
+      || descriptor.id !== id || typeof descriptor.name !== 'string' || typeof descriptor.description !== 'string'
+      || !Array.isArray(descriptor.shots) || !descriptor.shots.every((slot) => typeof slot === 'string')
+      || new Set(descriptor.shots).size !== descriptor.shots.length) continue;
+    const specBytes = await readFile(descriptorPath).catch(() => Buffer.from(''));
+    const specSha256 = createHash('sha256').update(specBytes).digest('hex');
+    const imagePath = modelSlug ? `${root}/set_references/${id}/${modelSlug}/reference.png` : '';
+    const canonicalImage = imagePath ? path.join(workingDir, imagePath) : '';
+    const provenancePath = modelSlug ? path.join(setDir, modelSlug, 'provenance.json') : '';
+    const approval = setStore[id];
+    const provenanceExists = Boolean(provenancePath && await safeSetFile(workingDir, provenancePath));
+    const provenance = provenanceExists ? await context.json(provenancePath).catch(() => null) : null;
+    const currentProvenance = Boolean(modelSlug && provenanceExists
+      && isPlainObject(provenance) && provenance.image_model === model && provenance.style === style
+      && provenance.spec_sha256 === specSha256);
+    const imageExists = Boolean(canonicalImage && await safeSetFile(workingDir, canonicalImage));
+    let state = 'planned';
+    if (imageExists) {
+      state = isRejected(approval) ? 'rejected' : currentProvenance ? 'rendered' : 'stale';
+      if (isPlainObject(approval) && approval.accepted_at) {
+        const expectedPaths = [descriptorPath, canonicalImage, provenancePath].map((file) => path.relative(workingDir, file));
+        const approvedPaths = Array.isArray(approval.artifacts) ? approval.artifacts.map((artifact) => artifact?.path) : [];
+        const exactArtifacts = approvedPaths.length === 3 && new Set(approvedPaths).size === 3
+          && approvedPaths.every((file) => expectedPaths.includes(file));
+        state = !approval.invalidated_at && !isRejected(approval) && currentProvenance && exactArtifacts
+          && await acceptanceLockMatches(workingDir, approval, context) ? 'accepted' : 'stale';
+      }
+    } else if (isRejected(approval)) state = 'rejected';
+    else if (isPlainObject(approval) && approval.accepted_at) state = 'stale';
+    const candidateInventory = await readSetCandidates(workingDir, setDir, model, modelSlug, style, specSha256, context);
+    const revision = createHash('sha256').update(specBytes).update(JSON.stringify(approval ?? null))
+      .update(imageExists ? await context.hash(canonicalImage).catch(() => '') : '')
+      .update(provenanceExists ? await context.hash(provenancePath).catch(() => '') : '')
+      .update(JSON.stringify(candidateInventory.fingerprint))
+      .digest('hex');
+    sets.push({
+      id, name: descriptor.name, description: descriptor.description, shots: descriptor.shots,
+      state, ...(imageExists ? {imagePath} : {}), imageModel: model,
+      candidates: candidateInventory.candidates,
+      ...(typeof provenance?.candidate_id === 'string' && /^[a-f0-9]{32}$/.test(provenance.candidate_id)
+        ? {selectedCandidateId: provenance.candidate_id} : {}),
+      revision,
+    });
+  }
+  const rawShots = root === 'novel2video'
+    ? await novelSetShotSlots(path.join(workingDir, root))
+    : await setInventoryShotSlots(workingDir, root, discovery, context);
+  const defaults = new Map(sets.map((set) => [set.id, set.shots]));
+  const shots = rawShots.map(({slot, brief, setIdsOverride}) => ({
+    slot,
+    brief,
+    setIds: setIdsOverride ?? sets.filter((set) => defaults.get(set.id)?.includes(slot)).map((set) => set.id),
+  }));
+  const activeShots = shots.map(({slot}) => slot);
+  const knownSetIds = new Set(sets.map(({id}) => id));
+  const unassignedShots = shots
+    .filter(({setIds}) => !setIds.some((id) => knownSetIds.has(id)))
+    .map(({slot}) => slot);
+  const revision = createHash('sha256').update(JSON.stringify([
+    root, model, style, sets.map(({id, revision: rev}) => [id, rev]),
+    shots.map(({slot, setIds}, index) => [slot, setIds, rawShots[index].setIdsOverride]), activeShots, unassignedShots,
+  ])).digest('hex');
+  return {sessionId, root, revision, imageModel: model, style, sets, shots, unassignedShots};
+}
+
+function shotSetIdsOverride(description) {
+  if (!isPlainObject(description) || !Object.hasOwn(description, 'set_ids') || description.set_ids === null) return null;
+  return Array.isArray(description.set_ids) ? description.set_ids.filter((id) => typeof id === 'string') : [];
+}
+
+async function setInventoryShotSlots(workingDir, root, discovery, context) {
+  const rows = [];
+  for (const {shot: slot} of discovery.shots) {
+    const location = shotLocation(workingDir, root, slot);
+    const shotDir = location.shotDir;
+    const description = await context.json(path.join(shotDir, SHOT_DESCRIPTION_FILENAME)).catch(() => null);
+    const {briefs} = await scenePlanMetadata(workingDir, location, context);
+    const shotBrief = await context.json(path.join(shotDir, 'brief.json')).catch(() => null);
+    rows.push({
+      slot,
+      brief: typeof shotBrief?.visual_desc === 'string' ? shotBrief.visual_desc : briefs.get(location.local) || '',
+      setIdsOverride: shotSetIdsOverride(description),
+    });
+  }
+  return rows;
+}
+
+async function readSetCandidates(workingDir, setDir, model, modelSlug, style, specSha256, context) {
+  const modelEntries = await context.entries(setDir).catch(() => []);
+  const candidates = [];
+  const fingerprint = [];
+  for (const modelEntry of modelEntries) {
+    if (modelEntry.name.startsWith('.') || !modelEntry.isDirectory()) continue;
+    const modelDir = path.join(setDir, modelEntry.name);
+    if (!await safeSetDirectory(workingDir, modelDir)) continue;
+    const files = await context.entries(modelDir).catch(() => []);
+    for (const file of files) {
+      const match = /^candidate_([a-f0-9]{32})\.png$/.exec(file.name);
+      if (!match || !file.isFile()) continue;
+      const candidateId = match[1];
+      const absoluteImage = path.join(modelDir, file.name);
+      if (!await safeSetFile(workingDir, absoluteImage)) continue;
+      const imagePath = path.relative(workingDir, absoluteImage).split(path.sep).join('/');
+      const provenancePath = path.join(modelDir, `candidate_${candidateId}.json`);
+      const provenanceExists = await safeSetFile(workingDir, provenancePath);
+      const provenance = provenanceExists ? await context.json(provenancePath).catch(() => null) : null;
+      const imageBytes = await readFile(absoluteImage).catch(() => null);
+      let state = 'invalid';
+      if (imageBytes && isCompletePng(imageBytes) && provenanceExists && isPlainObject(provenance)
+        && provenance.candidate_id === candidateId
+        && typeof provenance.image_model === 'string' && typeof provenance.style === 'string'
+        && typeof provenance.spec_sha256 === 'string' && /^[a-f0-9]{64}$/.test(provenance.spec_sha256)
+        && (provenance.prompt === undefined || typeof provenance.prompt === 'string')) {
+        state = modelEntry.name === modelSlug && provenance.image_model === model && provenance.style === style
+          && provenance.spec_sha256 === specSha256 ? 'ready' : 'stale';
+      }
+      const imageHash = await context.hash(absoluteImage).catch(() => '');
+      const provenanceHash = provenanceExists ? await context.hash(provenancePath).catch(() => '') : '';
+      fingerprint.push([candidateId, imagePath, state, imageHash, provenanceHash]);
+      candidates.push({
+        id: candidateId,
+        imagePath,
+        state,
+        ...(typeof provenance?.prompt === 'string' ? {prompt: provenance.prompt} : {}),
+      });
+    }
+  }
+  candidates.sort((left, right) => left.imagePath.localeCompare(right.imagePath));
+  fingerprint.sort((left, right) => `${left[1]}`.localeCompare(`${right[1]}`));
+  return {candidates, fingerprint};
+}
+
+async function novelSetShotSlots(rootDir) {
+  const videosDir = path.join(rootDir, 'videos');
+  const found = [];
+  async function walk(directory, depth) {
+    if (depth > 12) return;
+    const entries = await readdir(directory, {withFileTypes: true}).catch(() => []);
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || !entry.isDirectory()) continue;
+      const child = path.join(directory, entry.name);
+      const descriptionPath = path.join(child, SHOT_DESCRIPTION_FILENAME);
+      if (await isRegularFile(descriptionPath)) {
+        let description = {};
+        try { description = JSON.parse(await readFile(descriptionPath, 'utf8')); } catch {}
+        let slot = path.relative(rootDir, child).split(path.sep).join('/');
+        slot = slot.replace(/\/shots\//g, '/');
+        found.push({slot, brief: isPlainObject(description) ? String(description.brief ?? '') : '', setIdsOverride: shotSetIdsOverride(description)});
+      }
+      await walk(child, depth + 1);
+    }
+  }
+  await walk(videosDir, 0);
+  return found.sort((left, right) => left.slot.localeCompare(right.slot, undefined, {numeric: true}));
+}
+
+async function safeSetDirectory(workingDir, directory) {
+  try {
+    const info = await lstat(directory);
+    const requested = path.resolve(directory);
+    const absolute = await realpath(directory);
+    return info.isDirectory() && absolute === requested && absolute.startsWith(`${workingDir}${path.sep}`);
+  } catch {
+    return false;
+  }
+}
+
+async function safeSetFile(workingDir, filePath) {
+  try {
+    const info = await lstat(filePath);
+    const requested = path.resolve(filePath);
+    const absolute = await realpath(filePath);
+    return info.isFile() && absolute === requested && absolute.startsWith(`${workingDir}${path.sep}`);
+  } catch {
+    return false;
+  }
+}
+async function prepareSetDirectory(workingDir, root, id) {
+  let current = workingDir;
+  for (const component of [root, 'set_references', id]) {
+    current = path.join(current, component);
+    const info = await lstat(current).catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (info && (!info.isDirectory() || await realpath(current) !== path.resolve(current))) {
+      throw acceptanceError('Set reference directory is unsafe');
+    }
+    if (!info) await mkdir(current);
+  }
+}
+
+async function prepareSetModelDirectory(workingDir, root, id, modelSlug) {
+  await prepareSetDirectory(workingDir, root, id);
+  const directory = path.join(workingDir, root, 'set_references', id, modelSlug);
+  const info = await lstat(directory).catch((error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (info && (!info.isDirectory() || await realpath(directory) !== path.resolve(directory))) {
+    throw acceptanceError('Set reference directory is unsafe');
+  }
+  if (!info) await mkdir(directory);
+}
+/** Create or edit a set descriptor, rejecting stale snapshots before any write. */
+export async function updateSetReference(repoRoot, input = {}) {
+  const body = isPlainObject(input) ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    const inventory = await readSetReferences(repoRoot, sessionId, body.root);
+    if (!inventory) return null;
+    if (body.revision !== inventory.revision) throw conflictError('Set references changed; refresh before saving');
+    const {id, name, description, shots} = body;
+    if (typeof id !== 'string' || !SET_ID_PATTERN.test(id)) throw acceptanceError('id must be a safe immutable set identifier');
+    if (typeof name !== 'string' || !name.trim() || name.length > 160) throw acceptanceError('name must be 1–160 characters');
+    if (typeof description !== 'string' || description.length > SET_REFERENCE_LIMIT) throw acceptanceError('description must be at most 4000 characters');
+    if (!Array.isArray(shots) || !shots.every((slot) => typeof slot === 'string') || new Set(shots).size !== shots.length) {
+      throw acceptanceError('shots must be a unique list of shot slots');
+    }
+    const active = new Set(inventory.shots.map(({slot}) => slot));
+    if (shots.some((slot) => !active.has(slot))) throw acceptanceError('shots must name active shot slots');
+    const descriptorPath = path.join(workingDir, inventory.root, 'set_references', id, 'set.json');
+    const bytes = Buffer.from(`${JSON.stringify({id, name: name.trim(), description, shots}, null, 2)}\n`);
+    await prepareSetDirectory(workingDir, inventory.root, id);
+    const store = await readAcceptanceFile(workingDir);
+    const rootStore = isPlainObject(store[inventory.root]) ? store[inventory.root] : {};
+    const setRecords = isPlainObject(rootStore.sets) ? rootStore.sets : {};
+    delete setRecords[id];
+    if (Object.keys(setRecords).length) rootStore.sets = setRecords;
+    else delete rootStore.sets;
+    store[inventory.root] = rootStore;
+    await withMutationTransaction(async (transaction) => {
+      await transaction.write(descriptorPath, bytes);
+      const updated = await readSetReferences(repoRoot, sessionId, inventory.root);
+      const before = inventory.shots.filter((shot) => shot.setIds.includes(id)).map(({slot}) => slot);
+      const after = (updated?.shots ?? []).filter((shot) => shot.setIds.includes(id)).map(({slot}) => slot);
+      await invalidateSetBoundShots(workingDir, inventory.root, [...new Set([...before, ...after])], store, transaction);
+      await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
+    });
+    return readSetReferences(repoRoot, sessionId, inventory.root);
+  });
+}
+
+/** Select a current candidate as canonical without deleting its immutable source. */
+export async function selectSetReference(repoRoot, input = {}, isBusy = () => false) {
+  const body = isPlainObject(input) ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    if (isBusy()) throw conflictError('Wait for active and queued requests to finish before selecting a set image');
+    const inventory = await readSetReferences(repoRoot, sessionId, body.root);
+    if (!inventory) return null;
+    if (body.revision !== inventory.revision) throw conflictError('Set references changed; refresh before selecting an image');
+    if (typeof body.id !== 'string' || !SET_ID_PATTERN.test(body.id)) throw acceptanceError('id must be a safe set identifier');
+    if (typeof body.candidateId !== 'string' || !/^[a-f0-9]{32}$/.test(body.candidateId)) {
+      throw acceptanceError('candidateId must be a lowercase 32-character candidate identifier');
+    }
+    const set = inventory.sets.find((item) => item.id === body.id);
+    if (!set) throw acceptanceError('Unknown set identifier');
+    const candidate = set.candidates.find((item) => item.id === body.candidateId);
+    if (!candidate || candidate.state !== 'ready') throw conflictError('Only a current valid candidate can be selected');
+    const manifest = await readRenderManifest(repoRoot, workingDir);
+    const model = String(manifest?.image_model ?? '');
+    const modelSlug = model ? safePathComponent(model) : '';
+    if (!modelSlug) throw conflictError('A current image model is required before selecting a candidate');
+    const base = path.join(workingDir, inventory.root, 'set_references', set.id);
+    const descriptorPath = path.join(base, 'set.json');
+    const modelDir = path.join(base, modelSlug);
+    const candidateImage = path.join(modelDir, `candidate_${body.candidateId}.png`);
+    const candidateProvenance = path.join(modelDir, `candidate_${body.candidateId}.json`);
+    if (candidate.imagePath !== path.relative(workingDir, candidateImage).split(path.sep).join('/')
+      || !await safeSetFile(workingDir, descriptorPath)
+      || !await safeSetDirectory(workingDir, modelDir)
+      || !await safeSetFile(workingDir, candidateImage)
+      || !await safeSetFile(workingDir, candidateProvenance)) {
+      throw conflictError('Set candidate files are missing or unsafe');
+    }
+    const [descriptorBytes, imageBytes, provenanceBytes] = await Promise.all([
+      readFile(descriptorPath), readFile(candidateImage), readFile(candidateProvenance),
+    ]);
+    let provenance;
+    try { provenance = JSON.parse(provenanceBytes.toString('utf8')); }
+    catch { throw conflictError('Set candidate provenance is malformed'); }
+    if (!isPlainObject(provenance) || provenance.candidate_id !== body.candidateId
+      || provenance.image_model !== model || provenance.style !== (manifest?.style ?? '')
+      || provenance.spec_sha256 !== createHash('sha256').update(descriptorBytes).digest('hex')
+      || (provenance.prompt !== undefined && typeof provenance.prompt !== 'string')
+      || !isCompletePng(imageBytes)) {
+      throw conflictError('Set candidate provenance or image is stale; generate a current candidate before selecting');
+    }
+
+    const canonicalImage = path.join(modelDir, 'reference.png');
+    const canonicalProvenance = path.join(modelDir, 'provenance.json');
+    const imageExists = await pathExists(canonicalImage);
+    const provenanceExists = await pathExists(canonicalProvenance);
+    if (imageExists && !await safeSetFile(workingDir, canonicalImage)
+      || provenanceExists && !await safeSetFile(workingDir, canonicalProvenance)) {
+      throw acceptanceError('Set reference files are unsafe');
+    }
+    const [previousImage, previousProvenance] = await Promise.all([
+      imageExists ? readFile(canonicalImage) : null,
+      provenanceExists ? readFile(canonicalProvenance) : null,
+    ]);
+    if (previousImage?.equals(imageBytes) && previousProvenance?.equals(provenanceBytes)) return inventory;
+
+    const store = await readAcceptanceFile(workingDir);
+    const rootStore = isPlainObject(store[inventory.root]) ? store[inventory.root] : {};
+    const setRecords = isPlainObject(rootStore.sets) ? rootStore.sets : {};
+    delete setRecords[set.id];
+    if (Object.keys(setRecords).length) rootStore.sets = setRecords;
+    else delete rootStore.sets;
+    store[inventory.root] = rootStore;
+    const boundShots = inventory.shots.filter((shot) => shot.setIds.includes(set.id)).map(({slot}) => slot);
+    await prepareSetModelDirectory(workingDir, inventory.root, set.id, modelSlug);
+    await withMutationTransaction(async (transaction) => {
+      await transaction.write(canonicalImage, imageBytes);
+      await transaction.write(canonicalProvenance, provenanceBytes);
+      await invalidateSetBoundShots(workingDir, inventory.root, boundShots, store, transaction);
+      await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
+    });
+    return readSetReferences(repoRoot, sessionId, inventory.root);
+  });
+}
+
+export async function updateSetReferenceAcceptance(repoRoot, input = {}) {
+  const body = isPlainObject(input) ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    const inventory = await readSetReferences(repoRoot, sessionId, body.root);
+    if (!inventory) return null;
+    if (body.revision !== inventory.revision) throw conflictError('Set references changed; refresh before reviewing');
+    const set = inventory.sets.find((item) => item.id === body.id);
+    if (!set) throw acceptanceError('Unknown set identifier');
+    if (typeof body.accepted !== 'boolean') throw acceptanceError('accepted must be a boolean');
+    const store = await readAcceptanceFile(workingDir);
+    const rootStore = isPlainObject(store[inventory.root]) ? store[inventory.root] : {};
+    const records = isPlainObject(rootStore.sets) ? rootStore.sets : {};
+    if (body.accepted) {
+      if (set.state !== 'rendered' && set.state !== 'accepted') throw conflictError('A current generated set image is required before acceptance');
+      const manifest = await readRenderManifest(repoRoot, workingDir);
+      const modelSlug = safePathComponent(manifest?.image_model ?? '');
+      const base = path.join(workingDir, inventory.root, 'set_references', set.id);
+      const descriptorPath = path.join(base, 'set.json');
+      const provenancePath = path.join(base, modelSlug, 'provenance.json');
+      const imagePath = path.join(base, modelSlug, 'reference.png');
+      if (!await safeSetFile(workingDir, descriptorPath) || !await safeSetFile(workingDir, provenancePath) || !await safeSetFile(workingDir, imagePath)) {
+        throw acceptanceError('Set reference files are missing or unsafe');
+      }
+      const descriptor = await readFile(descriptorPath);
+      let provenance;
+      try { provenance = JSON.parse(await readFile(provenancePath, 'utf8')); }
+      catch { throw acceptanceError('Set reference provenance is malformed'); }
+      if (!isPlainObject(provenance) || provenance.image_model !== manifest.image_model || provenance.style !== (manifest.style ?? '')
+        || provenance.spec_sha256 !== createHash('sha256').update(descriptor).digest('hex')) {
+        throw conflictError('Set image provenance is stale; regenerate this set before acceptance');
+      }
+      const png = await readFile(imagePath);
+      if (!isCompletePng(png)) {
+        throw acceptanceError('Set reference is not a valid PNG');
+      }
+      records[set.id] = {accepted_at: isoSeconds(), artifacts: await acceptanceArtifacts(workingDir,
+        [descriptorPath, imagePath, provenancePath].map((file) => path.relative(workingDir, file)))};
+    } else {
+      if (body.reason !== undefined && typeof body.reason !== 'string') throw acceptanceError('reason must be a string');
+      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      if (reason.length > REASON_MAX_LENGTH) throw acceptanceError(`reason must be at most ${REASON_MAX_LENGTH} characters`);
+      if (reason) records[set.id] = {rejected_at: isoSeconds(), reason};
+      else delete records[set.id];
+    }
+    const boundShots = inventory.shots.filter((shot) => shot.setIds.includes(set.id)).map(({slot}) => slot);
+    if (Object.keys(records).length) rootStore.sets = records;
+    else delete rootStore.sets;
+    store[inventory.root] = rootStore;
+    await invalidateSetBoundShots(workingDir, inventory.root, boundShots, store);
+    await writeAcceptanceFile(workingDir, store);
+    return readSetReferences(repoRoot, sessionId, inventory.root);
+  });
+}
+
+async function invalidateSetBoundShots(workingDir, root, shots, store, transaction) {
+  const affected = [...new Set(shots.map(String))];
+  if (!affected.length) return;
+  const playbackOrder = await filmOrder(workingDir, root);
+  const reuseChoices = await timelineReuseChoices(workingDir, root, playbackOrder);
+  const linkedSuccessors = linkedContinuitySuccessors(playbackOrder, affected, reuseChoices);
+  const rootStore = isPlainObject(store[root]) ? store[root] : {};
+  const shotStore = isPlainObject(rootStore.shots) ? rootStore.shots : {};
+  const now = isoSeconds();
+  for (const slot of [...new Set([...affected, ...linkedSuccessors])]) {
+    const record = isPlainObject(shotStore[slot]) ? shotStore[slot] : {};
+    for (const stage of ['keyframes', 'clips']) {
+      if (isPlainObject(record[stage])) record[stage] = {...record[stage], invalidated_at: now,
+        invalidation_reason: affected.includes(slot)
+          ? 'A bound set reference changed; re-review this shot.'
+          : 'An earlier linked keyframe changed; re-review this shot.'};
+    }
+    if (Object.keys(record).length) shotStore[slot] = record;
+  }
+  if (Object.keys(shotStore).length) rootStore.shots = shotStore;
+  if (Object.keys(rootStore).length) store[root] = rootStore;
+  if (isPlainObject(rootStore.final_video)) {
+    rootStore.final_video = {...rootStore.final_video, invalidated_at: now,
+      invalidation_reason: 'A bound set reference changed; review the updated film assembly.'};
+  }
+  const continuityPath = path.join(workingDir, CONTINUITY_FILENAME);
+  const review = await readJsonOptional(continuityPath);
+  if (isPlainObject(review) && (!review.root || review.root === root)) {
+    const bytes = `${JSON.stringify({
+      ...review,
+      set_references_invalidated_at: now,
+      set_references_invalidation_reason: 'A bound set reference changed; review continuity again.',
+    }, null, 2)}\n`;
+    if (transaction) await transaction.write(continuityPath, bytes);
+    else await writeAtomic(continuityPath, bytes);
   }
 }

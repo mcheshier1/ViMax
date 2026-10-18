@@ -102,11 +102,16 @@ export function toggleCharacter(visible: number[], idx: number, on: boolean): nu
  * Whether a saved plan differs from what the card is showing, so Save can stay quiet until
  * there is something to save.
  */
-export function planDirty(plan: {firstFrame: {description: string; visible: number[]}; lastFrame: {description: string; visible: number[]}}, draft: {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]}): boolean {
+export function planDirty(plan: {firstFrame: {description: string; visible: number[]}; lastFrame: {description: string; visible: number[]}; brief: string; motionDescription: string; setIds?: string[]; reusePreviousLastFrame?: boolean; previousSlot?: string | null}, draft: {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]; brief?: string; motionDesc?: string; setIds?: string[]; reusePreviousLastFrame?: boolean; previousSlot?: string | null}): boolean {
   return draft.ffDesc.trim() !== plan.firstFrame.description.trim()
     || draft.lfDesc.trim() !== plan.lastFrame.description.trim()
     || draft.ffVis.join(',') !== plan.firstFrame.visible.join(',')
-    || draft.lfVis.join(',') !== plan.lastFrame.visible.join(',');
+    || draft.lfVis.join(',') !== plan.lastFrame.visible.join(',')
+    || (draft.brief !== undefined && draft.brief.trim() !== plan.brief.trim())
+    || (draft.motionDesc !== undefined && draft.motionDesc.trim() !== plan.motionDescription.trim())
+    || (draft.reusePreviousLastFrame !== undefined && draft.reusePreviousLastFrame !== (plan.reusePreviousLastFrame ?? false))
+    || (draft.reusePreviousLastFrame === true && draft.previousSlot !== undefined && draft.previousSlot !== plan.previousSlot)
+    || (draft.setIds !== undefined && (draft.setIds.length !== (plan.setIds?.length || 0) || draft.setIds.some((id) => !plan.setIds?.includes(id))));
 }
 
 /** The name the Timeline gives a shot, from its slot key. */
@@ -320,7 +325,7 @@ export const RENDER_STALL_MINUTES = 10;
 
 /**
  * What a render is actually doing, from the status file plus the two things the file
- * cannot know: whether the agent it ran in still exists, and when it last made progress.
+ * cannot know: whether its agent is actively working, and when it last made progress.
  * A status file says "rendering" forever once a render dies, so neither reading is
  * trusted on its own.
  */
@@ -448,7 +453,7 @@ export function renderStatusLine(status: unknown, options: {now?: Date; agentRun
       return `Rendering ${phase || 'the next phase'} — started ${where}`;
     }
     case 'interrupted':
-      return `A render started ${where} and stopped without finishing — the agent is not running`;
+      return `A render started ${where} and stopped without finishing — no active render request`;
     case 'stalled': {
       const silent = minutesSince(isStatus(status) ? silenceSince(status, options.lastProgressAt) : undefined, now);
       return `A render started at ${clockTime(isStatus(status) ? status.timestamp : '')} has written nothing for ${silent} min — it may have stopped`;
