@@ -117,6 +117,30 @@ export async function readSessionHistory(repoRoot, sessionId) {
         messageCount += 1;
         if (messages.length > 120) messages.shift();
       };
+      const appendToolRound = (round, turnId, createdAt, roundNumber, stableIds) => {
+        const requestedTools = Array.isArray(round?.requested_tools) ? round.requested_tools : [];
+        for (const [resultIndex, result] of (Array.isArray(round?.tool_results) ? round.tool_results : []).entries()) {
+          const callId = typeof requestedTools[resultIndex]?.id === 'string' && requestedTools[resultIndex].id
+            ? requestedTools[resultIndex].id
+            : '';
+          appendMessage({
+            id: callId
+              ? `activity-${turnId}-${callId}`
+              : stableIds
+                ? `activity-${turnId}-tool-${roundNumber}-${resultIndex}`
+                : `${turnId}-tool-${messageCount}`,
+            role: 'activity',
+            text: historyToolResultText(result),
+            tool: String(result.name || requestedTools[resultIndex]?.name || 'tool'),
+            status: result.ok === false ? 'error' : 'done',
+            stage: result.ok === false ? 'failed' : 'completed',
+            createdAt,
+            turnId,
+            round: roundNumber - 1,
+            ...(callId ? {toolCallId: callId} : {}),
+          });
+        }
+      };
       const consumeLine = (line) => {
         if (!line) return;
         let record;
@@ -127,32 +151,73 @@ export async function readSessionHistory(repoRoot, sessionId) {
         }
         if (record.session_id !== sessionId || !record.raw_user_input) return;
         const turnId = String(record.turn_id || `turn-${messageCount}`);
+        const createdAt = String(record.created_at || record.timestamp || '');
         appendMessage({
           id: `${turnId}-user`,
           role: 'user',
           text: displayUserInput(record.raw_user_input),
-          createdAt: String(record.created_at || record.timestamp || ''),
+          createdAt,
+          turnId,
         });
-        for (const round of Array.isArray(record.tool_rounds) ? record.tool_rounds : []) {
-          for (const result of Array.isArray(round.tool_results) ? round.tool_results : []) {
+        const assistantTurns = Array.isArray(record.assistant_turns) ? record.assistant_turns : [];
+        const hasCanonicalSamples = assistantTurns.length > 0 && assistantTurns.every((sample) => (
+          sample && typeof sample === 'object'
+          && typeof sample.sample_id === 'string' && sample.sample_id.length > 0
+        ));
+        if (hasCanonicalSamples) {
+          const rounds = Array.isArray(record.tool_rounds) ? record.tool_rounds : [];
+          assistantTurns.forEach((sample, index) => {
+            const sampleMatch = sample.sample_id.match(/-sample-(\d+)$/);
+            const sampleRound = Number.isInteger(sample.round) ? sample.round : Number(sampleMatch?.[1] ?? index);
+            const text = typeof sample.text === 'string' ? sample.text : '';
+            if (text || sample.outcome) {
+              appendMessage({
+                id: `assistant-${sample.sample_id}`,
+                role: 'assistant',
+                text,
+                turnId,
+                sampleId: sample.sample_id,
+                round: sampleRound,
+                streamState: sample.outcome === 'tool_preamble' ? 'preamble'
+                  : sample.outcome === 'interrupted' ? 'interrupted'
+                    : sample.outcome === 'truncated' ? 'truncated' : 'complete',
+                createdAt,
+              });
+            }
+            const roundNumber = sampleRound + 1;
+            const round = rounds.find((item, roundIndex) => (
+              Number.isInteger(item?.tool_round) ? item.tool_round === roundNumber : roundIndex === sampleRound
+            ));
+            if (round) appendToolRound(round, turnId, createdAt, roundNumber, true);
+          });
+          const finalText = typeof record.final_assistant_text === 'string' ? record.final_assistant_text : '';
+          const matchingFinalSample = assistantTurns.some((sample) => (
+            sample.outcome === 'final' && sample.text === finalText
+          ));
+          if (finalText && !matchingFinalSample) {
             appendMessage({
-              id: `${turnId}-tool-${messageCount}`,
-              role: 'activity',
-              text: historyToolResultText(result),
-              tool: String(result.name || 'tool'),
-              status: result.ok === false ? 'error' : 'done',
-              stage: result.ok === false ? 'failed' : 'completed',
-              createdAt: String(record.created_at || record.timestamp || ''),
+              id: `assistant-${turnId}`,
+              role: record.status === 'failed' ? 'error' : 'assistant',
+              text: finalText,
+              turnId,
+              streamState: record.status === 'completed' ? 'complete' : 'interrupted',
+              createdAt,
             });
           }
-        }
-        if (record.final_assistant_text) {
-          appendMessage({
-            id: `${turnId}-assistant`,
-            role: record.status === 'failed' ? 'error' : 'assistant',
-            text: String(record.final_assistant_text),
-            createdAt: String(record.created_at || record.timestamp || ''),
-          });
+        } else {
+          for (const [roundIndex, round] of (Array.isArray(record.tool_rounds) ? record.tool_rounds : []).entries()) {
+            appendToolRound(round, turnId, createdAt, roundIndex + 1, false);
+          }
+          if (record.final_assistant_text) {
+            appendMessage({
+              id: `assistant-${turnId}`,
+              role: record.status === 'failed' ? 'error' : 'assistant',
+              text: String(record.final_assistant_text),
+              turnId,
+              streamState: record.status === 'failed' ? 'interrupted' : 'complete',
+              createdAt,
+            });
+          }
         }
       };
       const input = createReadStream(logPath, {encoding: 'utf8'});

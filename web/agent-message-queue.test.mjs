@@ -18,6 +18,7 @@ describe('agent message queue', () => {
 
     expect(queue.consumeEvent({type: 'turn', turn_id: 'turn-one'})).toMatchObject({messageId: 'one'});
     expect(queue.consumeEvent({type: 'error', turn_id: 'turn-one'})).toMatchObject({completed: false});
+    expect(queue.consumeEvent({type: 'assistant_end', turn_id: 'turn-one', sample_id: 'turn-one-sample-0', text: 'partial'})).toMatchObject({completed: false});
     expect(queue.snapshot().active).toEqual({id: 'one', text: 'one'});
     expect(queue.consumeEvent({type: 'done', turn_id: 'stale-turn'})).toMatchObject({completed: false});
     expect(queue.snapshot().pending).toHaveLength(2);

@@ -5,11 +5,13 @@ import {createServer} from 'node:http';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {performance} from 'node:perf_hooks';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
 import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
 import {createAgentMessageQueue} from './agent-message-queue.mjs';
 import {approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, selectPortraitCharacter, selectSetReference, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
 import {getShotRestartPlan, restartShot} from './server-lib.mjs';
+import {BoundedPerformanceLog, createBridgeStreamState, isSseBackpressureExceeded, safeRuntimePerformanceRecord, validateAgentMetricsPayload} from './bridge-streaming.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, '..');
@@ -24,8 +26,12 @@ const subscribers = new Set();
 let agentProcess = null;
 let activeSessionId = '';
 const agentQueue = createAgentMessageQueue();
-const turnMessageIds = new Map();
-
+const bridgeStreamState = createBridgeStreamState();
+const performanceLog = new BoundedPerformanceLog(repoRoot, () => console.warn('Unable to persist bounded bridge performance telemetry'));
+const turnContexts = new Map();
+const messageSessions = new Map();
+const messageTimings = new Map();
+const recordedMetricKeys = new Set();
 let vite = null;
 
 const server = createServer(async (request, response) => {
@@ -102,7 +108,12 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/api/history' && request.method === 'GET') {
       const sessionId = url.searchParams.get('session') || '';
       const messages = await readSessionHistory(repoRoot, sessionId);
-      return sendJson(response, 200, {messages: reconcileHistoryMessageIds(messages)});
+      return sendJson(response, 200, {
+        messages: reconcileHistoryMessageIds(messages, sessionId),
+        epoch: bridgeStreamState.epoch,
+        revision: bridgeStreamState.revision,
+        activeSessionId,
+      });
     }
     if (url.pathname === '/api/artifacts' && request.method === 'GET') {
       return sendJson(response, 200, {artifacts: await listSessionArtifacts(repoRoot, url.searchParams.get('session') || '')});
@@ -360,6 +371,37 @@ const server = createServer(async (request, response) => {
       await startAgent({newSession: body.newSession === true, sessionId, projectName, style, userRequirement});
       return sendJson(response, 200, {ok: true});
     }
+    if (url.pathname === '/api/agent-metrics' && request.method === 'POST') {
+      let body;
+      try {
+        body = await readSmallJsonBody(request, 8 * 1024);
+      } catch (error) {
+        return sendJson(response, error.statusCode || 400, {error: error.message || 'Invalid JSON body'});
+      }
+      const validated = validateAgentMetricsPayload(body);
+      if (!validated.ok) return sendJson(response, 400, {error: validated.error});
+      const metric = validated.value;
+      const knownSessionId = lookupMessageSession(metric.messageId);
+      const turnContext = metric.turnId ? lookupTurnContext(metric.turnId) : null;
+      if (knownSessionId !== metric.sessionId
+        || metric.turnId && (!turnContext || turnContext.sessionId !== metric.sessionId || turnContext.messageId !== metric.messageId)) {
+        return sendJson(response, 409, {error: 'Unknown message correlation'});
+      }
+      const metricKey = JSON.stringify([metric.sessionId, metric.messageId]);
+      if (recordedMetricKeys.has(metricKey)) return sendJson(response, 409, {error: 'Metrics already recorded for this turn'});
+      recordedMetricKeys.add(metricKey);
+      if (recordedMetricKeys.size > 1_000) recordedMetricKeys.delete(recordedMetricKeys.values().next().value);
+      void performanceLog.append({
+        type: 'browser_metrics',
+        epoch: bridgeStreamState.epoch,
+        sessionId: metric.sessionId,
+        messageId: metric.messageId,
+        ...(metric.turnId ? {turn_id: metric.turnId} : {}),
+        metrics: metric.metrics,
+      });
+      return sendJson(response, 202, {ok: true});
+    }
+
     if (url.pathname === '/api/messages' && request.method === 'POST') {
       const body = await readJsonBody(request);
       if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -373,10 +415,15 @@ const server = createServer(async (request, response) => {
       const child = agentProcess;
       if (!child?.stdin.writable) return sendJson(response, 409, {error: 'Agent is not running'});
       const messageId = typeof body.messageId === 'string' && body.messageId.trim() ? body.messageId : randomUUID();
+      if (messageId.length > 256 || !/^[A-Za-z0-9_.:-]+$/.test(messageId)) {
+        return sendJson(response, 400, {error: 'Message id must be a short text identifier'});
+      }
       const displayText = typeof body.displayText === 'string' ? body.displayText : text;
       const queuedMessage = {id: messageId, text: displayText, input: text};
       const enqueueResult = agentQueue.enqueue(sessionId, queuedMessage);
       if (!enqueueResult.accepted) return sendJson(response, 409, {error: 'The requested project is no longer active'});
+      rememberMessageSession(messageId, sessionId);
+      rememberMessageTiming(messageId, sessionId);
       if (enqueueResult.started && !dispatchAgentMessage(child)) {
         return sendJson(response, 503, {error: 'Unable to send message to agent'});
       }
@@ -467,6 +514,7 @@ async function startAgent({newSession, sessionId, projectName = '', style = '', 
   child.on('error', (error) => handleAgentFailure(child, error));
   child.on('exit', (code, signal) => {
     if (agentProcess !== child) return;
+    interruptSession(activeSessionId);
     agentProcess = null;
     broadcast(agentQueue.cancel());
     broadcast({
@@ -484,6 +532,8 @@ async function startAgent({newSession, sessionId, projectName = '', style = '', 
   if (newSession && userRequirement) {
     const requirement = {id: randomUUID(), text: userRequirement, input: userRequirement};
     agentQueue.enqueue(activeSessionId, requirement);
+    rememberMessageSession(requirement.id, activeSessionId);
+    rememberMessageTiming(requirement.id, activeSessionId);
     if (dispatchAgentMessage(child)) broadcastQueueSnapshot();
   } else {
     broadcastQueueSnapshot();
@@ -507,22 +557,65 @@ async function startAgent({newSession, sessionId, projectName = '', style = '', 
 function consumeAgentLine(child, line) {
   if (agentProcess !== child || !line.trim()) return;
   try {
-    const event = JSON.parse(line);
+    const parsed = JSON.parse(line);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid event');
+    const event = parsed;
     if (event.type === 'session') {
       const nextSessionId = event.session?.active_session_id || activeSessionId;
       changeAgentSession(nextSessionId);
     }
     const requestSessionId = agentQueue.activeMessage?.sessionId;
     const queueResult = agentQueue.consumeEvent(event);
-    if (queueResult.messageId) event.messageId = queueResult.messageId;
-    if (event.type === 'turn' && queueResult.messageId && event.turn_id) {
-      turnMessageIds.set(event.turn_id, queueResult.messageId);
-      if (turnMessageIds.size > 1_000) turnMessageIds.delete(turnMessageIds.keys().next().value);
+    if (event.type === 'turn' && !queueResult.messageId) return;
+    if (event.type === 'done' && !queueResult.completed) return;
+    let context = event.turn_id ? lookupTurnContext(event.turn_id) : null;
+    if (event.type === 'turn' && event.turn_id && queueResult.messageId && !context) {
+      const observedAt = performance.now();
+      const timing = lookupMessageTiming(queueResult.messageId);
+      if (timing?.dispatchedAt !== null && timing?.dispatchedAt !== undefined) {
+        timing.queueWaitMs = Math.max(0, timing.dispatchedAt - timing.acceptedAt);
+        timing.dispatchToTurnMs = Math.max(0, observedAt - timing.dispatchedAt);
+      }
+      context = {
+        messageId: queueResult.messageId,
+        sessionId: queueResult.sessionId || requestSessionId || activeSessionId,
+        queueWaitMs: timing?.queueWaitMs ?? null,
+        dispatchToTurnMs: timing?.dispatchToTurnMs ?? null,
+        seenAt: Date.now(),
+      };
+      rememberTurnContext(event.turn_id, context);
+      rememberMessageSession(context.messageId, context.sessionId);
+    } else if (event.turn_id && queueResult.messageId && !context) {
+      context = {
+        messageId: queueResult.messageId,
+        sessionId: queueResult.sessionId || requestSessionId || activeSessionId,
+        seenAt: Date.now(),
+      };
+      rememberTurnContext(event.turn_id, context);
+      rememberMessageSession(context.messageId, context.sessionId);
     }
-    event.activeSessionId = event.type === 'session'
+    const sessionId = event.type === 'session'
       ? activeSessionId
-      : queueResult.sessionId || requestSessionId || activeSessionId;
-    broadcast(event);
+      : queueResult.sessionId || context?.sessionId || requestSessionId || activeSessionId;
+    const messageId = queueResult.messageId || context?.messageId || null;
+    const eventFields = {...event};
+    delete eventFields.epoch;
+    delete eventFields.revision;
+    const correlatedEvent = {...eventFields, messageId, activeSessionId: sessionId};
+    const observed = bridgeStreamState.observe(correlatedEvent);
+    if (!observed.accepted) return;
+    broadcast(correlatedEvent);
+    if (event.type === 'performance') {
+      void performanceLog.append(safeRuntimePerformanceRecord({...correlatedEvent, epoch: bridgeStreamState.epoch}));
+    }
+    if (event.type === 'done') {
+      const summary = completionLogRecord(sessionId, event.turn_id);
+      if (summary) void performanceLog.append(summary);
+    }
+    if (observed.becameOverflow) {
+      broadcast(bridgeStreamState.snapshotEvent(sessionId));
+      disconnectSubscribers();
+    }
     if (event.type === 'session') {
       broadcastQueueSnapshot();
       readSessionState(repoRoot).then((state) => {
@@ -542,6 +635,7 @@ function consumeAgentLine(child, line) {
 
 function changeAgentSession(sessionId) {
   if (sessionId === activeSessionId) return;
+  interruptSession(activeSessionId);
   const cancelled = agentQueue.cancelPending();
   if (cancelled.cancelledIds?.length) broadcast(cancelled);
   activeSessionId = sessionId;
@@ -557,6 +651,7 @@ function dispatchAgentMessage(child) {
     return false;
   }
   try {
+    markMessageDispatched(message.id);
     child.stdin.write(`${message.input}\n`, (error) => {
       if (error) handleAgentFailure(child, error);
     });
@@ -569,6 +664,7 @@ function dispatchAgentMessage(child) {
 
 function handleAgentFailure(child, error) {
   if (agentProcess !== child) return;
+  interruptSession(activeSessionId);
   agentProcess = null;
   broadcast(agentQueue.cancel());
   try {
@@ -581,30 +677,49 @@ function handleAgentFailure(child, error) {
   broadcast({type: 'bridge_status', status: 'error', message, activeSessionId});
 }
 
-function reconcileHistoryMessageIds(messages) {
+function reconcileHistoryMessageIds(messages, sessionId) {
   return messages.map((message) => {
     if (message.role !== 'user' || !message.id.endsWith('-user')) return message;
     const turnId = message.id.slice(0, -5);
-    const messageId = turnMessageIds.get(turnId);
+    const context = lookupTurnContext(turnId);
+    const messageId = context?.sessionId === sessionId ? context.messageId : null;
     return {...message, id: messageId || message.id, turnId};
   });
 }
 
+const MAX_SSE_BUFFER_BYTES = 256 * 1024;
+
 function openEventStream(request, response) {
+  const openedAt = performance.now();
   response.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  const running = Boolean(agentProcess);
-  response.write(`data: ${JSON.stringify({type: 'bridge_status', status: running ? 'ready' : 'idle', message: running ? 'Agent connected' : 'Agent idle', activeSessionId})}\n\n`);
-  response.write(`data: ${JSON.stringify(agentQueue.snapshot())}\n\n`);
   subscribers.add(response);
-  const heartbeat = setInterval(() => response.write(': keepalive\n\n'), 15_000);
-  request.on('close', () => {
+  const running = Boolean(agentProcess);
+  writeSseEvent(response, {
+    type: 'bridge_status',
+    status: running ? 'ready' : 'idle',
+    message: running ? 'Agent connected' : 'Agent idle',
+    activeSessionId,
+  });
+  writeSseEvent(response, agentQueue.snapshot());
+  writeSseEvent(response, bridgeStreamState.snapshotEvent(activeSessionId));
+  const heartbeat = setInterval(() => {
+    if (isSseBackpressureExceeded(response.writableLength || 0, 14, MAX_SSE_BUFFER_BYTES)) {
+      closeSseSubscriber(response, false);
+      return;
+    }
+    if (!response.write(': keepalive\n\n') && response.writableLength > MAX_SSE_BUFFER_BYTES) {
+      closeSseSubscriber(response, false);
+    }
+  }, 15_000);
+  response.on('close', () => {
     clearInterval(heartbeat);
     subscribers.delete(response);
+    void performanceLog.append({type: 'sse_connection', epoch: bridgeStreamState.epoch, outcome: response.vimaxCloseReason || 'disconnected', duration_ms: performance.now() - openedAt});
   });
 }
 
@@ -613,12 +728,134 @@ function broadcastQueueSnapshot() {
 }
 
 function broadcast(event) {
-  const payload = `data: ${JSON.stringify(event)}\n\n`;
-  for (const subscriber of subscribers) subscriber.write(payload);
+  const enriched = event.type === 'stream_snapshot'
+    && event.epoch === bridgeStreamState.epoch && Number.isInteger(event.revision)
+    ? event
+    : bridgeStreamState.enrich(event, event.activeSessionId ?? activeSessionId, event.messageId ?? null);
+  for (const subscriber of [...subscribers]) writeSseEvent(subscriber, enriched);
+}
+
+function writeSseEvent(response, event) {
+  if (response.destroyed || response.writableEnded) {
+    subscribers.delete(response);
+    return false;
+  }
+  const enriched = event.epoch === bridgeStreamState.epoch && Number.isInteger(event.revision)
+    ? event
+    : bridgeStreamState.enrich(event, event.activeSessionId ?? activeSessionId, event.messageId ?? null);
+  const payload = `id: ${enriched.revision}\ndata: ${JSON.stringify(enriched)}\n\n`;
+  const payloadBytes = Buffer.byteLength(payload, 'utf8');
+  if (isSseBackpressureExceeded(response.writableLength || 0, payloadBytes, MAX_SSE_BUFFER_BYTES)) {
+    closeSseSubscriber(response, false, payloadBytes > MAX_SSE_BUFFER_BYTES ? 'event_too_large' : 'slow_subscriber');
+    return false;
+  }
+  const ready = response.write(payload);
+  if (!ready && response.writableLength > MAX_SSE_BUFFER_BYTES) {
+    closeSseSubscriber(response, false);
+    return false;
+  }
+  return true;
+}
+
+function closeSseSubscriber(response, graceful, reason = 'slow_subscriber') {
+  subscribers.delete(response);
+  if (response.destroyed || response.writableEnded) return;
+  response.vimaxCloseReason = reason;
+  if (graceful) response.end();
+  else response.destroy();
+}
+
+function disconnectSubscribers() {
+  for (const subscriber of [...subscribers]) closeSseSubscriber(subscriber, true, 'snapshot_overflow');
+}
+
+function interruptSession(sessionId) {
+  const historyRequiredBefore = bridgeStreamState.current(sessionId)?.historyRequired || false;
+  if (!bridgeStreamState.interrupt(sessionId)) return;
+  const current = bridgeStreamState.current(sessionId);
+  if (current?.turn_id) {
+    const summary = completionLogRecord(sessionId, current.turn_id);
+    if (summary) void performanceLog.append(summary);
+  }
+  const snapshot = bridgeStreamState.snapshotEvent(sessionId);
+  broadcast(snapshot);
+  if (!historyRequiredBefore && snapshot.historyRequired) disconnectSubscribers();
+}
+
+function rememberMessageSession(messageId, sessionId) {
+  if (!messageId || !sessionId) return;
+  messageSessions.delete(messageId);
+  messageSessions.set(messageId, {sessionId, seenAt: Date.now()});
+  pruneCorrelationMap(messageSessions);
+}
+
+function lookupMessageSession(messageId) {
+  pruneCorrelationMap(messageSessions);
+  return messageSessions.get(messageId)?.sessionId || null;
+}
+function rememberMessageTiming(messageId, sessionId) {
+  if (!messageId) return;
+  messageTimings.delete(messageId);
+  messageTimings.set(messageId, {
+    sessionId,
+    acceptedAt: performance.now(),
+    dispatchedAt: null,
+    seenAt: Date.now(),
+  });
+  pruneCorrelationMap(messageTimings);
+}
+
+function markMessageDispatched(messageId) {
+  const timing = lookupMessageTiming(messageId);
+  if (!timing || timing.dispatchedAt !== null) return;
+  timing.dispatchedAt = performance.now();
+  timing.seenAt = Date.now();
+  messageTimings.delete(messageId);
+  messageTimings.set(messageId, timing);
+  pruneCorrelationMap(messageTimings);
+}
+
+function lookupMessageTiming(messageId) {
+  pruneCorrelationMap(messageTimings);
+  return messageTimings.get(messageId) || null;
+}
+
+function completionLogRecord(sessionId, turnId) {
+  const summary = bridgeStreamState.completionSummary(sessionId, turnId);
+  if (!summary) return null;
+  const context = lookupTurnContext(turnId);
+  const timing = lookupMessageTiming(summary.messageId);
+  return {
+    ...summary,
+    queue_wait_ms: context?.queueWaitMs ?? timing?.queueWaitMs ?? null,
+    dispatch_to_turn_ms: context?.dispatchToTurnMs ?? timing?.dispatchToTurnMs ?? null,
+    accepted_to_terminal_ms: timing ? Math.max(0, performance.now() - timing.acceptedAt) : null,
+  };
+}
+
+function rememberTurnContext(turnId, context) {
+  turnContexts.delete(turnId);
+  turnContexts.set(turnId, {...context, seenAt: Date.now()});
+  pruneCorrelationMap(turnContexts);
+}
+
+function lookupTurnContext(turnId) {
+  pruneCorrelationMap(turnContexts);
+  return turnContexts.get(turnId) || null;
+}
+
+function pruneCorrelationMap(map) {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [key, value] of map) {
+    if (value.seenAt >= cutoff) break;
+    map.delete(key);
+  }
+  while (map.size > 1_000) map.delete(map.keys().next().value);
 }
 
 function stopAgent(reason) {
   const child = agentProcess;
+  interruptSession(activeSessionId);
   if (child) agentProcess = null;
   broadcast(agentQueue.cancel());
   if (!child) return;
@@ -660,6 +897,28 @@ async function readJsonBody(request) {
   const text = Buffer.concat(chunks).toString('utf8');
   if (text.length > 1_000_000) throw new Error('Request body is too large');
   return JSON.parse(text);
+}
+
+async function readSmallJsonBody(request, maxBytes) {
+  const declaredLength = Number(request.headers['content-length'] || 0);
+  if (declaredLength > maxBytes) {
+    const error = new Error('Request body is too large');
+    error.statusCode = 413;
+    throw error;
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      const error = new Error('Request body is too large');
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  if (!size) return {};
+  return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
 }
 
 async function readBinaryBody(request, maxBytes) {
@@ -707,6 +966,7 @@ function shutdown() {
   stopAgent('shutdown');
   void Promise.allSettled([
     closeMediaCache(),
+    performanceLog.pending,
     new Promise((resolve) => server.close(resolve)),
   ]).then(() => process.exit(0));
   setTimeout(() => process.exit(0), 1_000).unref();

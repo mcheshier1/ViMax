@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import {
   ArrowUp,
   Brain,
@@ -30,13 +30,15 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import {deleteSession, getAgentConfig, getHistory, getSessions, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
+import type {Components} from 'react-markdown';
+import {deleteSession, getAgentConfig, getHistory, getSessions, postAgentMetrics, readProject, saveAgentConfig, sendMessage, startAgent, stopAgent, subscribeToEvents, updateProject, uploadWorkspaceFile} from './api';
 import {ArtifactsView, ScriptView} from './ArtifactViews';
-import {applyAgentEvent, applyAgentQueueSnapshot, appendLocalUser, composeAgentPrompt, createChatState, humanize, setUserDelivery} from './events';
+import {applyAgentEvent, applyAgentQueueSnapshot, appendLocalUser, composeAgentPrompt, createChatState, humanize, mergeHistoryMessages, setUserDelivery} from './events';
 import {describeArtifacts, describeInvalidation, describeStyleMismatch, diffProjectFields, toProjectFields, type InvalidationConfirmation, type ProjectFields} from './projectMetadata';
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
-import type {AgentConfig, AgentEvent, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
+import type {AgentConfig, AgentEvent, BrowserAgentMetricsPayload, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
+import {createDeltaBatcher, type DeltaBatcher} from './streaming';
 import {IMAGE_PROVIDER_PRESETS, compatibleImageResolution, defaultImageResolution, imageProviderFromBaseUrl, imageProviderPreset, imageResolutionTiers} from './imagePresets';
 import {isHeygenVideoModel, validHeygenVideoSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
 import {credentialProvider} from '../provider-credentials.mjs';
@@ -51,6 +53,27 @@ type UtilityView = 'project' | 'settings' | null;
 type AssistantScope = 'film' | 'shot';
 const EMPTY_CHAT = createChatState();
 const EMPTY_UPLOADS: WorkspaceUpload[] = [];
+
+type TimedEvent = {sessionId: string; event: AgentEvent};
+type BrowserTurnTiming = {
+  sessionId: string;
+  messageId: string;
+  turnId?: string;
+  sentAt: number;
+  firstReceiptAt?: number;
+  firstVisibleAt?: number;
+  firstReceiptToCommitMs?: number;
+  deltaEvents: number;
+  snapshotRepairs: number;
+  lastSeqBySample: Map<string, number>;
+  lastSnapshotRevision?: number;
+  lastSnapshotEpoch?: string;
+};
+
+const MARKDOWN_PLUGINS = [remarkGfm];
+const MARKDOWN_COMPONENTS: Components = {
+  a: ({node: _node, ...props}) => <a {...props} target="_blank" rel="noreferrer" />,
+};
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -67,6 +90,7 @@ export default function App() {
   const [sendingSession, setSendingSession] = useState('');
   const [queueBridgeReady, setQueueBridgeReady] = useState(false);
   const [historyLoading, setHistoryLoading] = useState('');
+  const [documentVisible, setDocumentVisible] = useState(document.visibilityState === 'visible');
   const [theme, setTheme] = useState<Theme>(() => resolveTheme(document.documentElement.dataset.theme, false));
   const [loadError, setLoadError] = useState('');
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -88,10 +112,14 @@ export default function App() {
   const dirtyFilmSessions = useRef(new Set<string>());
   const loadedHistory = useRef(new Set<string>());
   const historyRequests = useRef(new Map<string, Promise<void>>());
-  const pendingHistoryEvents = useRef(new Map<string, AgentEvent[]>());
   const queueSnapshots = useRef(new Map<string, AgentEvent>());
+  const snapshotRecoveryRequests = useRef(new Map<string, string>());
   const busySessions = useRef(new Set<string>());
   const bridgeLifecycleObserved = useRef(false);
+  const scrollNearBottom = useRef(true);
+  const turnTimingById = useRef(new Map<string, BrowserTurnTiming>());
+  const turnTimingByMessage = useRef(new Map<string, BrowserTurnTiming>());
+  const reportedTurns = useRef(new Set<string>());
   const film = useFilmSession(selectedSessionId);
   const filmRef = useRef(film);
   filmRef.current = film;
@@ -111,6 +139,20 @@ export default function App() {
   const updateChat = useCallback((sessionId: string, update: (current: ChatState) => ChatState) => {
     setChats((current) => ({...current, [sessionId]: update(current[sessionId] || createChatState())}));
   }, []);
+
+  const commitDeltaBatch = useCallback((batch: TimedEvent[]) => {
+    const grouped = new Map<string, AgentEvent[]>();
+    for (const item of batch) {
+      const events = grouped.get(item.sessionId) || [];
+      events.push(item.event);
+      grouped.set(item.sessionId, events);
+    }
+    for (const [sessionId, events] of grouped) {
+      updateChat(sessionId, (current) => events.reduce((state, event) => applyAgentEvent(state, event), current));
+    }
+  }, [updateChat]);
+  const deltaBatcher = useRef<DeltaBatcher<TimedEvent> | null>(null);
+  if (!deltaBatcher.current) deltaBatcher.current = createDeltaBatcher(commitDeltaBatch);
 
   function setDraft(value: string) {
     setDrafts((current) => ({...current, [selectedSessionId]: value}));
@@ -134,6 +176,8 @@ export default function App() {
   }
 
   function selectSession(sessionId: string) {
+    deltaBatcher.current?.flush();
+    scrollNearBottom.current = true;
     selectedSessionIdRef.current = sessionId;
     setSelectedSessionId(sessionId);
     let destination: WorkspaceView = 'film';
@@ -157,31 +201,24 @@ export default function App() {
     return state;
   }, []);
 
-  const ensureHistory = useCallback((sessionId: string): Promise<void> => {
-    if (!sessionId || loadedHistory.current.has(sessionId)) return Promise.resolve();
+  const ensureHistory = useCallback(function ensureHistoryRequest(sessionId: string, force = false): Promise<void> {
+    if (!sessionId || !force && loadedHistory.current.has(sessionId)) return Promise.resolve();
     const pending = historyRequests.current.get(sessionId);
-    if (pending) return pending;
+    if (pending) return force ? pending.then(() => ensureHistoryRequest(sessionId, true)) : pending;
+    if (force) loadedHistory.current.delete(sessionId);
     setHistoryLoading(sessionId);
     const request = getHistory(sessionId).then((history) => {
-      const events = pendingHistoryEvents.current.get(sessionId) || [];
-      const recordedTurns = new Set(history.messages.filter((message) => message.role === 'user').flatMap((message) => [
-        ...(message.turnId ? [message.turnId] : []),
-        ...(message.id.endsWith('-user') ? [message.id.slice(0, -5)] : []),
-      ]));
-      const recordedMessageIds = new Set(history.messages.filter((message) => message.role === 'user').map((message) => message.id));
-      let bufferedTurn = '';
-      let restored = createChatState(history.messages);
-      for (const event of events) {
-        bufferedTurn = event.turn_id || bufferedTurn;
-        const recorded = (bufferedTurn && recordedTurns.has(bufferedTurn))
-          || (event.messageId && recordedMessageIds.has(event.messageId));
-        if (!recorded) restored = applyAgentEvent(restored, event);
-      }
-      const snapshot = queueSnapshots.current.get(sessionId);
-      if (snapshot) restored = applyAgentQueueSnapshot(restored, snapshot);
-      updateChat(sessionId, () => restored);
+      updateChat(sessionId, (current) => {
+        const sameEpoch = Boolean(history.epoch && current.epoch && history.epoch === current.epoch);
+        const restored = {
+          ...current,
+          messages: mergeHistoryMessages(current.messages, history.messages, history.revision, sameEpoch),
+          recoveringHistory: Boolean(current.recoveringHistory && current.busy),
+        };
+        const snapshot = queueSnapshots.current.get(sessionId);
+        return snapshot ? applyAgentQueueSnapshot(restored, snapshot) : restored;
+      });
       loadedHistory.current.add(sessionId);
-      pendingHistoryEvents.current.delete(sessionId);
     }).finally(() => {
       historyRequests.current.delete(sessionId);
       setHistoryLoading((current) => current === sessionId ? '' : current);
@@ -189,6 +226,82 @@ export default function App() {
     historyRequests.current.set(sessionId, request);
     return request;
   }, [updateChat]);
+
+  const displayVisible = documentVisible && drawer === 'assistant';
+  const displayVisibleRef = useRef(displayVisible);
+  displayVisibleRef.current = displayVisible;
+  const reportTurnTiming = useCallback((timing: BrowserTurnTiming, completedAt?: number) => {
+    if (!timing.turnId || reportedTurns.current.has(timing.turnId)) return;
+    const turnId = timing.turnId;
+    reportedTurns.current.add(turnId);
+    const visible = timing.firstVisibleAt !== undefined;
+    const metrics: BrowserAgentMetricsPayload['metrics'] = {
+      visible: visible ? 1 : 0,
+      deltaEvents: timing.deltaEvents,
+      snapshotRepairs: timing.snapshotRepairs,
+      ...(timing.firstVisibleAt !== undefined ? {
+        firstVisibleTextMs: timing.firstVisibleAt - timing.sentAt,
+        firstReceiptToCommitMs: timing.firstReceiptToCommitMs,
+      } : {}),
+      ...(completedAt !== undefined ? {completionMs: completedAt - timing.sentAt} : {}),
+    };
+    void postAgentMetrics({sessionId: timing.sessionId, messageId: timing.messageId, turnId: timing.turnId, metrics}).catch(() => {});
+    turnTimingById.current.delete(turnId);
+    turnTimingByMessage.current.delete(timing.messageId);
+    if (reportedTurns.current.size > 512) {
+      const oldest = reportedTurns.current.values().next().value;
+      if (oldest) reportedTurns.current.delete(oldest);
+    }
+  }, []);
+  const trackTurnEvent = useCallback((sessionId: string, event: AgentEvent) => {
+    let timing = event.messageId ? turnTimingByMessage.current.get(event.messageId) : undefined;
+    if (!timing && event.turn_id) timing = turnTimingById.current.get(event.turn_id);
+    if (timing && event.turn_id && timing.turnId !== event.turn_id) {
+      timing.turnId = event.turn_id;
+      turnTimingById.current.set(event.turn_id, timing);
+    }
+    if (timing && timing.sessionId === sessionId) {
+      if (event.type === 'token') {
+        const sampleId = event.sample_id || 'legacy';
+        const lastSeq = timing.lastSeqBySample.get(sampleId);
+        const duplicate = typeof event.seq === 'number' && lastSeq !== undefined && event.seq <= lastSeq;
+        if (!duplicate) {
+          if (typeof event.seq === 'number') timing.lastSeqBySample.set(sampleId, event.seq);
+          timing.deltaEvents += 1;
+          if (event.delta?.trim() && timing.firstReceiptAt === undefined) timing.firstReceiptAt = performance.now();
+        }
+      } else if (event.type === 'stream_snapshot' && ((event.samples?.length || 0) > 0 || event.historyRequired)) {
+        if (timing.lastSnapshotEpoch !== event.epoch || timing.lastSnapshotRevision !== event.revision) {
+          timing.snapshotRepairs += 1;
+          timing.lastSnapshotEpoch = event.epoch;
+          timing.lastSnapshotRevision = event.revision;
+        }
+      }
+      if (event.type === 'done') {
+        const finishedTiming = timing;
+        const completedAt = performance.now();
+        window.setTimeout(() => reportTurnTiming(finishedTiming, completedAt), 100);
+      }
+    }
+    if (timing && timing.sessionId === sessionId && event.type === 'stream_snapshot' && ['completed', 'failed', 'interrupted'].includes(event.status || '')) {
+        const completedTiming = timing;
+        const completedAt = event.status === 'completed' ? performance.now() : undefined;
+        window.setTimeout(() => reportTurnTiming(completedTiming, completedAt), 100);
+      }
+    if (event.type === 'bridge_status' && (event.status === 'stopped' || event.status === 'error')) {
+      for (const active of turnTimingById.current.values()) {
+        if (active.sessionId === sessionId) window.setTimeout(() => reportTurnTiming(active), 250);
+      }
+    }
+  }, [reportTurnTiming]);
+  const onAssistantCommit = useCallback((message: Message, sessionId: string) => {
+    if (message.role !== 'assistant' || !message.liveOutput || !message.text.trim() || sessionId !== selectedSessionIdRef.current || !displayVisibleRef.current) return;
+    const timing = message.turnId ? turnTimingById.current.get(message.turnId) : undefined;
+    if (!timing || timing.sessionId !== sessionId || timing.firstReceiptAt === undefined || timing.firstVisibleAt !== undefined) return;
+    const committedAt = performance.now();
+    timing.firstVisibleAt = committedAt;
+    timing.firstReceiptToCommitMs = committedAt - timing.firstReceiptAt;
+  }, []);
 
   useEffect(() => {
     applyTheme(theme);
@@ -201,10 +314,12 @@ export default function App() {
 
   useEffect(() => subscribeToEvents((event) => {
     if (event.type === 'sessions_changed') {
+      deltaBatcher.current?.flush();
       setSessions(event.sessions || []);
       return;
     }
     if (event.type === 'agent_queue') {
+      deltaBatcher.current?.flush();
       setQueueBridgeReady(true);
       const sessionId = event.activeSessionId || '';
       if (!sessionId) return;
@@ -232,6 +347,7 @@ export default function App() {
     }
     const sessionId = explicitSessionId || agentSessionRef.current;
     if (!sessionId) return;
+    trackTurnEvent(sessionId, event);
     if (event.type === 'turn') busySessions.current.add(sessionId);
     if (event.type === 'done') {
       const snapshot = queueSnapshots.current.get(sessionId);
@@ -239,15 +355,35 @@ export default function App() {
       else busySessions.current.delete(sessionId);
     }
     if (event.type === 'bridge_status' && (event.status === 'stopped' || event.status === 'error')) busySessions.current.delete(sessionId);
-    if (!loadedHistory.current.has(sessionId)) {
-      const events = pendingHistoryEvents.current.get(sessionId) || [];
-      events.push(event);
-      pendingHistoryEvents.current.set(sessionId, events);
+    if (event.type === 'token') {
+      const key = `${sessionId}:${event.sample_id || event.turn_id || 'legacy'}`;
+      deltaBatcher.current?.push({sessionId, event}, key);
+      return;
     }
+    deltaBatcher.current?.flush();
     updateChat(sessionId, (current) => applyAgentEvent(current, event));
+    const terminalSnapshot = event.type === 'stream_snapshot' && ['completed', 'failed', 'interrupted'].includes(event.status || '');
+    if (event.type === 'done' || event.type === 'stream_snapshot' && (event.historyRequired || terminalSnapshot)) {
+      const recoveryVersion = `${event.epoch || ''}:${event.turn_id || event.messageId || ''}:${event.status || 'history-required'}`;
+      if (snapshotRecoveryRequests.current.get(sessionId) !== recoveryVersion) {
+        snapshotRecoveryRequests.current.set(sessionId, recoveryVersion);
+        void ensureHistory(sessionId, true).catch((error) => {
+          if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
+        });
+      }
+    }
     if (selectedSessionIdRef.current === sessionId && ['tool_start', 'tool_progress', 'tool_result', 'done', 'session'].includes(event.type || '')) filmRef.current.wake();
   }, (connected) => {
-    if (connected) return;
+    if (connected) {
+      const sessionsToReload = new Set([...loadedHistory.current, selectedSessionIdRef.current].filter(Boolean));
+      for (const sessionId of sessionsToReload) {
+        void ensureHistory(sessionId, true).catch((error) => {
+          if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
+        });
+      }
+      return;
+    }
+    deltaBatcher.current?.flush();
     setQueueBridgeReady(false);
     queueSnapshots.current.clear();
     setChats((current) => {
@@ -259,7 +395,7 @@ export default function App() {
       }
       return next || current;
     });
-  }), [refreshSessions, updateChat]);
+  }), [ensureHistory, refreshSessions, trackTurnEvent, updateChat]);
 
   useEffect(() => {
     let cancelled = false;
@@ -292,10 +428,25 @@ export default function App() {
     });
   }, [drawer, selectedSessionId, ensureHistory]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = scrollRef.current;
-    if (element) element.scrollTo({top: element.scrollHeight, behavior: chat.busy ? 'smooth' : 'auto'});
+    if (element && scrollNearBottom.current) element.scrollTo({top: element.scrollHeight, behavior: 'auto'});
   }, [chat.messages, chat.busy, drawer]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      deltaBatcher.current?.flush();
+      setDocumentVisible(document.visibilityState === 'visible');
+    };
+    const flushPending = () => deltaBatcher.current?.flush();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', flushPending);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', flushPending);
+      flushPending();
+    };
+  }, []);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -420,6 +571,15 @@ export default function App() {
         ? ` Film context: ${JSON.stringify({session: sessionId, root, scope: scope === 'shot' ? 'selected-shot' : 'whole-film', ...(chosenShot ? {slot: chosenShot.slot, label: chosenShot.label} : {})})}. ${chosenShot ? 'Limit changes to this selected shot unless I explicitly request broader changes.' : 'This request concerns the whole film.'}`
         : '';
       updateChat(sessionId, (current) => appendLocalUser(current, text, messageId));
+      const timing: BrowserTurnTiming = {
+        sessionId,
+        messageId,
+        sentAt: performance.now(),
+        deltaEvents: 0,
+        snapshotRepairs: 0,
+        lastSeqBySample: new Map(),
+      };
+      turnTimingByMessage.current.set(messageId, timing);
       const response = await sendMessage({
         text: composeAgentPrompt(text + context, attachments),
         sessionId,
@@ -433,6 +593,8 @@ export default function App() {
       });
       filmRef.current.wake();
     } catch (error) {
+      const failedTiming = turnTimingByMessage.current.get(messageId);
+      if (failedTiming && !failedTiming.turnId) turnTimingByMessage.current.delete(messageId);
       updateChat(sessionId, (current) => {
         const message = current.messages.find((item) => item.id === messageId);
         if (message?.delivery !== 'sending') return current;
@@ -517,7 +679,9 @@ export default function App() {
       setSessions(state.sessions);
       setPendingDelete(undefined);
       loadedHistory.current.delete(sessionId);
-      pendingHistoryEvents.current.delete(sessionId);
+      queueSnapshots.current.delete(sessionId);
+      snapshotRecoveryRequests.current.delete(sessionId);
+      busySessions.current.delete(sessionId);
       if (selectedSessionIdRef.current === sessionId) {
         selectSession(state.activeSessionId || state.sessions[0]?.sessionId || '');
         setUtility(null);
@@ -600,10 +764,14 @@ export default function App() {
               </div>
               <small>{assistantScope === 'shot' ? selection?.label || 'No shot selected — choose a shot or Whole film' : 'Story, structure, and film-wide changes'}</small>
             </div>
-            <div className="conversation" ref={scrollRef}>
+            <div className="conversation" ref={scrollRef} onScroll={(event) => {
+              const element = event.currentTarget;
+              scrollNearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 120;
+            }}>
               {historyLoading === selectedSessionId && selectedSessionId && <p className="assistant-loading" role="status">Loading conversation…</p>}
+              {chat.recoveringHistory && <p className="assistant-loading" role="status">Live recovery buffer exceeded. Your partial response is preserved; the full response will load from history when this turn finishes.</p>}
               {!assistantMessages.length && <div className="assistant-intro"><MessageSquare size={23} /><h2>{selectedSessionId ? 'A creative partner, on request' : 'Create a project to begin'}</h2><p>{selectedSessionId ? 'Describe an idea, ask for a revision, or select a shot to keep the request focused. Nothing runs until you send.' : 'Keep your script, shots, and conversation together in a project.'}</p>{selectedSessionId ? <button onClick={openPlanningAssistant}>Draft a planning request</button> : <button onClick={openNewProjectDialog}>Create project</button>}</div>}
-              <div className="message-stream">{assistantMessages.map((message) => <MessageRow key={message.id} message={message} />)}{busy && <ThinkingRow messages={chat.messages} />}</div>
+              <div className="message-stream">{assistantMessages.map((message) => <MessageRow key={message.id} message={message} sessionId={selectedSessionId} canMeasure={displayVisible} onAssistantCommit={onAssistantCommit} />)}{busy && <ThinkingRow messages={chat.messages} phase={chat.phase} />}</div>
             </div>
             <div className="composer-zone">
               {showSlashCommands && <SlashCommandMenu matches={slashMatches} contextPercent={contextPercent} onSelect={(command) => {setDraft(command); textareaRef.current?.focus();}} />}
@@ -681,7 +849,27 @@ function ThemeToggle({theme, onToggle}: {theme: Theme; onToggle: () => void}) {
   );
 }
 
-function MessageRow({message}: {message: Message}) {
+const MessageRow = memo(function MessageRow({message, sessionId = '', canMeasure = false, onAssistantCommit}: {
+  message: Message;
+  sessionId?: string;
+  canMeasure?: boolean;
+  onAssistantCommit?: (message: Message, sessionId: string) => void;
+}) {
+  const rowRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (!canMeasure || !onAssistantCommit || message.role !== 'assistant' || !message.liveOutput || !message.text.trim()) return;
+    const frame = requestAnimationFrame(() => {
+      const row = rowRef.current;
+      const conversation = row?.closest('.conversation');
+      if (!row || !conversation) return;
+      const bounds = row.getBoundingClientRect();
+      const viewport = conversation.getBoundingClientRect();
+      if (bounds.bottom > viewport.top && bounds.top < viewport.bottom && bounds.right > viewport.left && bounds.left < viewport.right) {
+        onAssistantCommit(message, sessionId);
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [canMeasure, message, onAssistantCommit, sessionId]);
   if (message.role === 'activity') return <ActivityRow message={message} />;
   const deliveryLabel = message.delivery === 'sending' ? 'Sending…'
     : message.delivery === 'queued' ? 'Queued'
@@ -690,18 +878,24 @@ function MessageRow({message}: {message: Message}) {
           : message.delivery === 'cancelled' ? 'Cancelled'
             : message.delivery === 'error' ? 'Failed to send'
               : '';
+  const streamLabel = message.streamState === 'preamble' ? 'Tool preamble'
+    : message.streamState === 'streaming' ? 'Responding'
+      : message.streamState === 'interrupted' ? 'Interrupted · partial response'
+        : message.streamState === 'truncated' ? 'Response cut short'
+          : '';
   return (
-    <article className={`message-row role-${message.role}`}>
+    <article ref={rowRef} className={`message-row role-${message.role}${message.streamState ? ` stream-${message.streamState}` : ''}`}>
       <div className="message-body">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{a: (props) => <a {...props} target="_blank" rel="noreferrer" />}}>
+        <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS} components={MARKDOWN_COMPONENTS}>
           {message.text}
         </ReactMarkdown>
+        {message.role === 'assistant' && streamLabel && <small className={`message-stream-state stream-state-${message.streamState}`}>{streamLabel}</small>}
         {message.role === 'user' && deliveryLabel && <small className={`message-delivery delivery-${message.delivery}`}>{deliveryLabel}</small>}
         {message.role === 'user' && message.deliveryError && <small className="message-delivery-error">{message.deliveryError}</small>}
       </div>
     </article>
   );
-}
+});
 
 function ActivityRow({message}: {message: Message}) {
   const stage = message.stage ? humanize(message.stage) : '';
@@ -747,12 +941,21 @@ function activityToolKind(tool?: string) {
   return 'file';
 }
 
-function ThinkingRow({messages}: {messages: Message[]}) {
+function ThinkingRow({messages, phase}: {messages: Message[]; phase: string}) {
   const running = [...messages].reverse().find((message) => message.role === 'activity' && message.status === 'running');
+  const responding = messages.some((message) => message.role === 'assistant' && message.streamState === 'streaming' && message.text);
+  const phaseLabel = running ? `${humanize(running.tool || 'ViMax')} · ${running.text}`
+    : responding ? 'Responding'
+      : phase === 'compact' ? 'Compacting context'
+        : phase === 'preparing_context' ? 'Preparing context'
+          : phase === 'sampling_assistant' ? 'Waiting for model'
+            : phase === 'executing_tools' ? 'Running tool'
+              : phase === 'responding' ? 'Responding'
+                : 'Preparing context';
   return (
     <div className="thinking-row">
       <span className="thinking-mark"><i /><i /><i /></span>
-      <span>{running ? `${humanize(running.tool || 'ViMax')} · ${running.text}` : 'ViMax is thinking'}</span>
+      <span>{phaseLabel}</span>
     </div>
   );
 }

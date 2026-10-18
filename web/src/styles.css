@@ -507,6 +507,24 @@ a:focus-visible {
   border-radius: 0;
 }
 
+.message-stream-state {
+  display: block;
+  margin-top: 7px;
+  color: #737d89;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.stream-state-interrupted,
+.stream-state-truncated {
+  color: #a04b37;
+}
+
+.stream-interrupted .message-body,
+.stream-truncated .message-body {
+  opacity: 0.82;
+}
+
 .role-user {
   justify-content: flex-end;
 }

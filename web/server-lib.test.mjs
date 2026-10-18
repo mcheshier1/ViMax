@@ -46,7 +46,57 @@ describe('web bridge state', () => {
     expect(history.map((message) => message.role)).toEqual(['user', 'assistant']);
   });
 
-  it('retains the last 120 matching messages with original ordering and generated IDs', async () => {
+  it('projects persisted assistant samples and tool results in chronological canonical order', async () => {
+    const root = await fixture();
+    await writeFile(path.join(root, '.vimax', 'logs', 'loop_history.jsonl'), `${JSON.stringify({
+      session_id: 'session-1',
+      turn_id: 'turn-streamed',
+      raw_user_input: 'Make a film',
+      status: 'completed',
+      assistant_turns: [
+        {sample_id: 'turn-streamed-sample-0', text: 'Preparing', outcome: 'tool_preamble', phase: 'initial', tool_calls: [{id: 'render-call'}]},
+        {sample_id: 'turn-streamed-sample-1', text: 'Finished', outcome: 'final', phase: 'followup_1'},
+      ],
+      tool_rounds: [{tool_round: 1, requested_tools: [{id: 'render-call', name: 'render'}], tool_results: [{name: 'render', ok: true}]}],
+      final_assistant_text: 'Finished',
+    })}\n`);
+    const history = await readSessionHistory(root, 'session-1');
+    expect(history.map(({id, role}) => [id, role])).toEqual([
+      ['turn-streamed-user', 'user'],
+      ['assistant-turn-streamed-sample-0', 'assistant'],
+      ['activity-turn-streamed-render-call', 'activity'],
+      ['assistant-turn-streamed-sample-1', 'assistant'],
+    ]);
+    expect(history[1]).toMatchObject({turnId: 'turn-streamed', sampleId: 'turn-streamed-sample-0', streamState: 'preamble', text: 'Preparing'});
+    expect(history[2]).toMatchObject({turnId: 'turn-streamed', toolCallId: 'render-call', tool: 'render', status: 'done'});
+    expect(history[3].text).toBe('Finished');
+  });
+
+  it('retains a distinct turn-level final message when a halted turn has no final sample', async () => {
+    const root = await fixture();
+    await writeFile(path.join(root, '.vimax', 'logs', 'loop_history.jsonl'), `${JSON.stringify({
+      session_id: 'session-1',
+      turn_id: 'turn-limit',
+      raw_user_input: 'Render a film',
+      status: 'halted',
+      assistant_turns: [
+        {sample_id: 'turn-limit-sample-0', text: 'Preparing render', outcome: 'tool_preamble', phase: 'initial'},
+      ],
+      tool_rounds: [{tool_round: 1, tool_results: [{name: 'render', ok: true}]}],
+      final_sample_id: null,
+      final_assistant_text: 'Stopped after the maximum tool passes.',
+    })}\n`);
+    const history = await readSessionHistory(root, 'session-1');
+    expect(history.map(({id, role}) => [id, role])).toEqual([
+      ['turn-limit-user', 'user'],
+      ['assistant-turn-limit-sample-0', 'assistant'],
+      ['activity-turn-limit-tool-1-0', 'activity'],
+      ['assistant-turn-limit', 'assistant'],
+    ]);
+    expect(history[3].text).toBe('Stopped after the maximum tool passes.');
+  });
+
+  it('retains bounded matching history in chronological order with distinct identities', async () => {
     const root = await fixture();
     const logPath = path.join(root, '.vimax', 'logs', 'loop_history.jsonl');
     const rows = [];
@@ -71,10 +121,11 @@ describe('web bridge state', () => {
 
     const history = await readSessionHistory(root, 'session-1');
     expect(history).toHaveLength(120);
-    expect(history[0]).toMatchObject({id: 'turn-2-assistant', role: 'assistant', text: 'answer 2'});
-    expect(history.slice(-3).map((message) => message.id)).toEqual([
-      'turn-122-user', 'turn-122-tool-123', 'turn-122-assistant',
-    ]);
+    expect(history[0]).toMatchObject({role: 'assistant', text: 'answer 2'});
+    expect(history.slice(-3).map((message) => message.role)).toEqual(['user', 'activity', 'assistant']);
+    expect(history.at(-3).text).toBe('prompt 61');
+    expect(history.at(-1).text).toBe('answer 61');
+    expect(new Set(history.map((message) => message.id)).size).toBe(history.length);
     expect(history.map((message) => message.text)).not.toContain('ignore me');
   });
 

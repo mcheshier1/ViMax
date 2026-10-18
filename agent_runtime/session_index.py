@@ -227,6 +227,16 @@ class SessionIndex:
                 "status": record.get("status", ""),
                 "tool_round_count": len(record.get("tool_rounds", [])),
                 "final_preview": str(record.get("final_assistant_text", ""))[:240],
+                "final_sample_id": record.get("final_sample_id"),
+                "samples": [
+                    {
+                        "sample_id": sample.get("sample_id"),
+                        "outcome": sample.get("outcome"),
+                        "finish_reason": sample.get("finish_reason"),
+                        "phase": sample.get("phase"),
+                    }
+                    for sample in record.get("assistant_turns", [])
+                ],
                 "created_at": record.get("created_at", ""),
             })
             session["recent_turn_records"] = recent[-6:]

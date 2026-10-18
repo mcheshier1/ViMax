@@ -1,6 +1,6 @@
 export type WorkspaceLine =
   | {kind: 'user'; text: string}
-  | {kind: 'assistant'; text: string}
+  | {kind: 'assistant'; text: string; sampleId?: string; seq?: number; outcome?: 'final' | 'tool_preamble' | 'interrupted' | 'truncated'}
   | {kind: 'thinking'; text: string}
   | {kind: 'status'; text: string}
   | {kind: 'workflow'; text: string}
@@ -19,6 +19,12 @@ export type ToolResult = {
 export type StreamEvent = {
   type?: string;
   turn_id?: string;
+  sample_id?: string;
+  final_sample_id?: string;
+  seq?: number;
+  text?: string;
+  outcome?: 'final' | 'tool_preamble' | 'interrupted' | 'truncated';
+  status?: string;
   delta?: string;
   phase?: string;
   message?: string;
@@ -47,4 +53,5 @@ export type StreamEvent = {
 
 export type MappingState = {
   assistantStreaming: boolean;
+  sampleId?: string;
 };
