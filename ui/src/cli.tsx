@@ -153,7 +153,6 @@ function App() {
   const stateRef = useRef<MappingState>(createMappingState());
   const childRef = useRef<ChildProcessWithoutNullStreams | null>(null);
   const bufferRef = useRef('');
-  const responseIdleTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const width = useMemo(() => Math.max(20, terminalWidth - 6), [terminalWidth]);
   const thinkingFrame = useThinkingFrame(busy);
@@ -275,6 +274,10 @@ function App() {
     child.on('exit', (code, signal) => {
       childRef.current = null;
       setBusy(false);
+      const sampleId = stateRef.current.sampleId;
+      if (sampleId) setLines((current) => current.map((line) => line.kind === 'assistant' && line.sampleId === sampleId
+        ? {...line, outcome: 'interrupted'} : line));
+      stateRef.current = createMappingState();
       if (code && code !== 0) {
         appendLine({kind: 'error', text: `agent process exited with code ${code}`});
       } else if (signal) {
@@ -283,7 +286,6 @@ function App() {
     });
 
     return () => {
-      if (responseIdleTimerRef.current) clearTimeout(responseIdleTimerRef.current);
       child.kill();
     };
   }, []);
@@ -309,10 +311,10 @@ function App() {
     }
     updateWorkspaceMeta(event);
     updateActivity(event);
-    if (event.type === 'done' || event.type === 'error' || event.type === 'session') {
-      clearResponseIdleTimer();
+    if (event.type === 'done') {
       setBusy(false);
     }
+    if (event.type === 'turn') setBusy(true);
     setLines((current) => {
       const mapped = applyStreamEvent(stripThinking(current), stateRef.current, event);
       stateRef.current = mapped.state;
@@ -320,54 +322,34 @@ function App() {
     });
   }
 
-  function clearResponseIdleTimer() {
-    if (!responseIdleTimerRef.current) return;
-    clearTimeout(responseIdleTimerRef.current);
-    responseIdleTimerRef.current = null;
-  }
-
-  function scheduleResponseIdleClear() {
-    clearResponseIdleTimer();
-    responseIdleTimerRef.current = setTimeout(() => {
-      responseIdleTimerRef.current = null;
-      setBusy(false);
-    }, 1500);
-  }
 
   function updateActivity(event: StreamEvent) {
     if (event.type === 'tool_start') {
-      clearResponseIdleTimer();
       setActivityText(`tool ${event.tool?.name ?? 'unknown'} running`);
       return;
     }
     if (event.type === 'tool_progress') {
-      clearResponseIdleTimer();
       const stage = event.progress?.stage;
       setActivityText(stage ? `tool ${event.tool?.name ?? 'unknown'}: ${stage}` : `tool ${event.tool?.name ?? 'unknown'} running`);
       return;
     }
     if (event.type === 'tool_result') {
-      clearResponseIdleTimer();
       setActivityText('ViMax thinking');
       return;
     }
     if (event.type === 'token') {
       setActivityText('ViMax responding');
-      scheduleResponseIdleClear();
       return;
     }
     if (event.type === 'status') {
-      clearResponseIdleTimer();
       setActivityText(statusActivityLabel(event.phase, event.message));
       return;
     }
-    if (event.type === 'done' || event.type === 'error' || event.type === 'session') {
-      clearResponseIdleTimer();
+    if (event.type === 'done') {
       setActivityText('ViMax thinking');
       return;
     }
     if (event.type === 'turn') {
-      clearResponseIdleTimer();
       setActivityText('ViMax thinking');
     }
   }
@@ -407,7 +389,6 @@ function App() {
       return;
     }
     setLines((current) => [...stripThinking(current), {kind: 'user', text: prompt}]);
-    clearResponseIdleTimer();
     setActivityText('ViMax thinking');
     stateRef.current = createMappingState();
     updateInput('', 0);
@@ -477,7 +458,8 @@ function WorkspacePanel({lines, width, thinkingFrame, meta, busy, activityText}:
         <WorkspaceContentLine key={`header-${index}`} text={line.text} color={line.color} width={panelWidth} />
       ))}
       {lines.flatMap((line, index) => {
-        const rawText = `› ${line.text}`;
+        const incomplete = line.kind === 'assistant' && (line.outcome === 'interrupted' || line.outcome === 'truncated');
+        const rawText = `› ${line.text}${incomplete ? ` [${line.outcome}]` : ''}`;
         return wrapText(rawText, contentWidth).map((part, partIndex) => (
           <WorkspaceContentLine key={`${line.kind}-${index}-${partIndex}`} text={part} color={lineColor(line)} width={panelWidth} />
         ));
@@ -511,6 +493,8 @@ function statusActivityLabel(phase: string | undefined, message: string | undefi
   if (phase === 'compact') return 'compacting context';
   if (phase === 'sampling_assistant') return 'ViMax thinking';
   if (phase === 'executing_tools') return 'running tools';
+  if (phase === 'preparing_context') return 'preparing context';
+  if (phase === 'responding') return 'ViMax responding';
   const normalized = String(message ?? '').trim();
   return normalized || 'ViMax thinking';
 }

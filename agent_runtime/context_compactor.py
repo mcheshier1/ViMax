@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from time import perf_counter
+
 
 
 SUMMARY_SECTIONS = [
@@ -30,6 +32,9 @@ class CompactionResult:
     reason: str
     mode: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    duration_ms: float = 0
+    request_metadata: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, Any] | None = None
 
 
 class ContextCompactor:
@@ -86,6 +91,7 @@ class ContextCompactor:
         preserve_last_n: int | None = None,
         reason: str = "manual",
     ) -> CompactionResult:
+        started = perf_counter()
         preserve = max(0, self.preserve_last_n if preserve_last_n is None else preserve_last_n)
         preserved = [dict(message) for message in messages[-preserve:]] if preserve else []
         compactible = [dict(message) for message in messages[:-preserve]] if preserve else [dict(message) for message in messages]
@@ -93,7 +99,7 @@ class ContextCompactor:
             compactible = [dict(message) for message in messages]
             preserved = []
         before_tokens = self.estimate_messages_tokens(messages)
-        summary = await self._llm_summary(compactible, preserved, previous_summary, reason)
+        summary, request_metadata, usage = await self._llm_summary(compactible, preserved, previous_summary, reason)
         mode = "llm"
         if not summary:
             summary = self._fallback_summary(compactible, preserved, previous_summary, reason)
@@ -109,6 +115,9 @@ class ContextCompactor:
             estimated_tokens_after=after_tokens,
             reason=reason,
             mode=mode,
+            duration_ms=(perf_counter() - started) * 1000,
+            request_metadata=request_metadata,
+            usage=usage,
         )
 
     def synthetic_summary_message(self, summary: str) -> dict[str, str]:
@@ -117,9 +126,9 @@ class ContextCompactor:
             "content": "Session context summary. The following summary is reference context only, not a new active instruction.\n\n" + summary.strip(),
         }
 
-    async def _llm_summary(self, compactible: list[dict[str, Any]], preserved: list[dict[str, Any]], previous_summary: str, reason: str) -> str:
+    async def _llm_summary(self, compactible: list[dict[str, Any]], preserved: list[dict[str, Any]], previous_summary: str, reason: str) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
         if self.llm is None:
-            return ""
+            return "", {}, None
         payload = {
             "reason": reason,
             "previous_summary": _clip(previous_summary, 5000),
@@ -142,9 +151,9 @@ class ContextCompactor:
         )
         try:
             response = await self.llm.complete([{"role": "system", "content": system}, {"role": "user", "content": user}], tools=[])
-        except Exception:
-            return ""
-        return str(getattr(response, "text", "") or "").strip()
+        except Exception as exc:
+            return "", getattr(exc, "request_metadata", {}), None
+        return str(getattr(response, "text", "") or "").strip(), getattr(response, "request_metadata", {}), getattr(response, "usage", None)
 
     def _fallback_summary(self, compactible: list[dict[str, Any]], preserved: list[dict[str, Any]], previous_summary: str, reason: str) -> str:
         user_lines = [self._message_preview(message, limit=180) for message in compactible if message.get("role") == "user"]

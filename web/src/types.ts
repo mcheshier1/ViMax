@@ -438,13 +438,23 @@ export type JsonPrimitive = string | number | boolean | null;
 
 export type JsonValue = JsonPrimitive | JsonValue[] | {[key: string]: JsonValue};
 
+export type AssistantStreamState = 'streaming' | 'complete' | 'preamble' | 'interrupted' | 'truncated';
+
 export type Message = {
   id: string;
   role: 'user' | 'assistant' | 'activity' | 'error';
   text: string;
   createdAt?: string;
   turnId?: string;
+  sampleId?: string;
+  round?: number;
+  streamState?: AssistantStreamState;
+  seq?: number;
+  epoch?: string;
+  revision?: number;
+  liveOutput?: boolean;
   tool?: string;
+  toolCallId?: string;
   status?: 'running' | 'done' | 'error';
   stage?: string;
   delivery?: 'sending' | 'queued' | 'running' | 'done' | 'cancelled' | 'error';
@@ -453,9 +463,37 @@ export type Message = {
 
 export type AgentQueueMessage = {id: string; text: string};
 
+export type StreamSnapshotSample = {
+  sample_id: string;
+  round?: number;
+  seq: number;
+  text: string;
+  outcome?: 'final' | 'tool_preamble' | 'interrupted' | 'truncated';
+  finish_reason?: string;
+};
+
+export type StreamToolSnapshot = {
+  id?: string;
+  round?: number;
+  name?: string;
+  requested_name?: string;
+  status?: 'running' | 'completed' | 'failed';
+  stage?: string;
+  text?: string;
+};
+
 export type AgentEvent = {
   type?: string;
   turn_id?: string;
+  sample_id?: string;
+  round?: number;
+  seq?: number;
+  outcome?: StreamSnapshotSample['outcome'];
+  finish_reason?: string;
+  text?: string;
+  final_sample_id?: string;
+  epoch?: string;
+  revision?: number;
   messageId?: string;
   delta?: string;
   message?: string;
@@ -470,9 +508,13 @@ export type AgentEvent = {
   pending?: AgentQueueMessage[];
   cancelledIds?: string[];
   sessions?: SessionSummary[];
+  historyRequired?: boolean;
+  samples?: StreamSnapshotSample[];
+  tools?: Array<AgentEvent | StreamToolSnapshot>;
+  metrics?: Record<string, unknown>;
   tool?: {id?: string; name?: string; requested_name?: string};
   progress?: {stage?: string; message?: string; metadata?: Record<string, unknown>};
-  tool_result?: {name?: string; ok?: boolean; content?: string; metadata?: Record<string, unknown>};
+  tool_result?: {id?: string; name?: string; ok?: boolean; content?: string; metadata?: Record<string, unknown>};
   session?: {
     active_session_id?: string;
     session?: {
@@ -495,4 +537,25 @@ export type ChatState = {
   promptTokens: number;
   queueSupported: boolean;
   activeMessageId: string;
+  epoch: string;
+  revision: number;
+  phase: string;
+  retiredEpochs: string[];
+  recoveringHistory?: boolean;
+};
+
+export type BrowserAgentMetrics = {
+  firstVisibleTextMs?: number;
+  firstReceiptToCommitMs?: number;
+  completionMs?: number;
+  deltaEvents?: number;
+  snapshotRepairs?: number;
+  visible: 0 | 1;
+};
+
+export type BrowserAgentMetricsPayload = {
+  sessionId: string;
+  messageId: string;
+  turnId?: string;
+  metrics: BrowserAgentMetrics;
 };

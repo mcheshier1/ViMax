@@ -1,4 +1,4 @@
-import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, AssetDeletionPlan, AssetDeletionRequest, AssetDeletionResponse, AssetsDeletionPlan, AssetsDeletionRequest, AssetsDeletionResponse, ContinuityPayload, JsonValue, Message, PortraitMutationRequest, PortraitMutationResponse, PortraitOptions, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, SetReferenceAcceptanceRequest, SetReferenceInventory, SetReferenceSelectionRequest, SetReferenceUpdateRequest, ShotPlan, ShotPlanUpdateRequest, ShotRestartPlan, WorkspaceUpload} from './types';
+import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, AssetDeletionPlan, AssetDeletionRequest, AssetDeletionResponse, AssetsDeletionPlan, AssetsDeletionRequest, AssetsDeletionResponse, BrowserAgentMetricsPayload, ContinuityPayload, JsonValue, Message, PortraitMutationRequest, PortraitMutationResponse, PortraitOptions, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, SetReferenceAcceptanceRequest, SetReferenceInventory, SetReferenceSelectionRequest, SetReferenceUpdateRequest, ShotPlan, ShotPlanUpdateRequest, ShotRestartPlan, WorkspaceUpload} from './types';
 import type {FilmProgress, FilmSnapshot} from './filmSession';
 
 export async function getSessions() {
@@ -25,9 +25,33 @@ export async function saveAgentConfig(config: AgentConfig) {
   return request<AgentConfig>('/api/config', {method: 'PUT', body: JSON.stringify(config)});
 }
 
+export type HistoryResponse = {messages: Message[]; epoch?: string; revision?: number};
+
 export async function getHistory(sessionId: string) {
-  return request<{messages: Message[]}>(`/api/history?session=${encodeURIComponent(sessionId)}`);
+  return request<HistoryResponse>(`/api/history?session=${encodeURIComponent(sessionId)}`, {cache: 'no-store'});
 }
+
+export async function postAgentMetrics(payload: BrowserAgentMetricsPayload) {
+  const metrics: BrowserAgentMetricsPayload['metrics'] = {visible: payload.metrics.visible === 1 ? 1 : 0};
+  for (const field of ['firstVisibleTextMs', 'firstReceiptToCommitMs', 'completionMs'] as const) {
+    const value = payload.metrics[field];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 86_400_000) metrics[field] = value;
+  }
+  for (const field of ['deltaEvents', 'snapshotRepairs'] as const) {
+    const value = payload.metrics[field];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 10_000_000) metrics[field] = Math.floor(value);
+  }
+  return request<{ok: boolean}>('/api/agent-metrics', {
+    method: 'POST',
+    body: JSON.stringify({
+      sessionId: payload.sessionId,
+      messageId: payload.messageId,
+      ...(payload.turnId ? {turnId: payload.turnId} : {}),
+      metrics,
+    }),
+  });
+}
+
 
 export async function getArtifacts(sessionId: string) {
   return request<{artifacts: Artifact[]}>(`/api/artifacts?session=${encodeURIComponent(sessionId)}`);

@@ -38,4 +38,28 @@ assert.deepEqual(lines.at(-1), {kind: 'error', text: 'bad'});
 ({lines, state} = applyStreamEvent(lines, state, {type: 'done', assistant: 'hello world'}));
 assert.equal(state.assistantStreaming, false);
 
+// Samples stay separate across a tool round; authoritative ends repair missed deltas.
+lines = [];
+state = createMappingState();
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_start', sample_id: 'turn-a-sample-0'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'token', sample_id: 'turn-a-sample-0', seq: 1, delta: 'Checking'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'token', sample_id: 'turn-a-sample-0', seq: 1, delta: 'Checking'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_end', sample_id: 'turn-a-sample-0', seq: 2, text: 'Checking local state.', outcome: 'tool_preamble'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'tool_result', tool_result: {name: 'read_file', ok: true}}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_start', sample_id: 'turn-a-sample-1'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'token', sample_id: 'turn-a-sample-1', seq: 1, delta: 'The result'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_end', sample_id: 'turn-a-sample-1', seq: 2, text: 'The result is ready.', outcome: 'final'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'done', final_sample_id: 'turn-a-sample-1', assistant: 'The result is ready.'}));
+assert.deepEqual(lines.filter((line) => line.kind === 'assistant').map((line) => [line.text, line.outcome]), [
+  ['Checking local state.', 'tool_preamble'], ['The result is ready.', 'final'],
+]);
+assert.equal(state.assistantStreaming, false);
+
+// A failed stream retains its incomplete evidence without becoming a final answer.
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_start', sample_id: 'turn-b-sample-0'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'token', sample_id: 'turn-b-sample-0', seq: 1, delta: 'Partial ☃'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'assistant_end', sample_id: 'turn-b-sample-0', seq: 1, text: 'Partial ☃', outcome: 'interrupted'}));
+({lines, state} = applyStreamEvent(lines, state, {type: 'done', status: 'failed', assistant: ''}));
+assert.deepEqual(lines.at(-1), {kind: 'assistant', sampleId: 'turn-b-sample-0', seq: 1, text: 'Partial ☃', outcome: 'interrupted'});
+
 console.log('lineMapping tests passed');

@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import json
 import asyncio
+from contextlib import aclosing
 import os
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, AsyncIterator
 
 from .context_compactor import ContextCompactor, CompactionResult
-from .llm import OpenAICompatibleLLM
+from .llm import OpenAICompatibleLLM, StreamComplete, StreamTextDelta
 from .models import ToolCall, ToolResult, TurnControl
 from .prompts import PromptBuilder
 from .session_index import SessionIndex
 from .tool_executor import ToolExecutor
 from .tools import ToolRegistry, build_builtin_registry
+
+from .metrics import append_runtime_metric
+
 
 MAX_TOOL_PASSES = 50
 
@@ -69,7 +74,20 @@ class AgentLoop:
         self.context_compactor = context_compactor or ContextCompactor(llm)
         self.history: list[dict[str, Any]] = []
 
-    async def compact_history(self, *, reason: str = "manual") -> str:
+    def _metric(self, record: dict[str, Any]) -> None:
+        append_runtime_metric(record, self.session_index.workspace_root)
+
+    def _record_requests(self, turn_id: str | None, sample_id: str, metadata: dict[str, Any], usage: dict[str, Any] | None = None) -> None:
+        for attempt in metadata.get("attempts", []):
+            self._metric({"kind": "provider_attempt", "turn_id": turn_id, "sample_id": sample_id, **attempt})
+        if usage is not None:
+            self._metric({
+                "kind": "usage", "turn_id": turn_id, "sample_id": sample_id,
+                "actual_prompt_tokens": usage.get("prompt_tokens"), "actual_completion_tokens": usage.get("completion_tokens"),
+                "actual_cached_tokens": usage.get("cached_tokens"), "actual_reasoning_tokens": usage.get("reasoning_tokens"),
+            })
+
+    async def compact_history(self, *, reason: str = "manual", turn_id: str | None = None) -> str:
         if not self.history:
             return "No conversation history to compact."
         session = self.session_index.active() or self.session_index.create()
@@ -80,14 +98,93 @@ class AgentLoop:
         )
         self.history = [self.context_compactor.synthetic_summary_message(result.summary), *result.preserved_messages]
         self.session_index.update_compaction(session["session_id"], _compaction_record(result))
+        self._metric({"kind": "compaction", "turn_id": turn_id, "duration_ms": result.duration_ms, "reason": reason, "mode": result.mode, "estimated_tokens_before": result.estimated_tokens_before, "estimated_tokens_after": result.estimated_tokens_after})
+        self._record_requests(turn_id, f"{turn_id or 'manual'}-compaction", result.request_metadata, result.usage)
         return f"Compacted context {result.estimated_tokens_before} -> {result.estimated_tokens_after} ({result.mode})."
 
     async def stream_events(self, user_input: str) -> AsyncIterator[dict[str, Any]]:
+        """Keep exceptional preparation/tool failures terminal and recoverable."""
+        turn_id = ""
+        terminal = False
+        samples: dict[str, dict[str, Any]] = {}
+        active_sample = ""
+        started = perf_counter()
+        try:
+            async with aclosing(self._stream_turn(user_input)) as events:
+                async for event in events:
+                    turn_id = event.get("turn_id", turn_id)
+                    sample_id = event.get("sample_id", "")
+                    if event["type"] == "assistant_start":
+                        active_sample = sample_id
+                        samples[sample_id] = {"sample_id": sample_id, "parts": [], "seq": 0}
+                    elif event["type"] == "token" and sample_id in samples:
+                        samples[sample_id]["parts"].append(event["delta"])
+                        samples[sample_id]["seq"] = event["seq"]
+                    elif event["type"] == "assistant_end" and sample_id in samples:
+                        samples[sample_id].update(text=event["text"], outcome=event["outcome"], finish_reason=event.get("finish_reason"))
+                        samples[sample_id]["parts"].clear()
+                        active_sample = ""
+                    elif event["type"] == "done":
+                        terminal = True
+                    yield event
+        except Exception as exc:
+            if terminal:
+                self._metric({"kind": "post_terminal_failure", "turn_id": turn_id, "error_class": type(exc).__name__})
+                return
+            records = []
+            for sample in samples.values():
+                text = sample["text"] if "text" in sample else "".join(sample["parts"])
+                record = {"sample_id": sample["sample_id"], "text": text, "outcome": sample.get("outcome", "interrupted"), "finish_reason": sample.get("finish_reason", "error"), "tool_calls": []}
+                records.append(record)
+                if sample["sample_id"] == active_sample:
+                    yield {"type": "assistant_end", "turn_id": turn_id, "sample_id": active_sample, "seq": sample["seq"], "text": text, "outcome": "interrupted", "finish_reason": "error"}
+            try:
+                session = self.session_index.active() or self.session_index.create()
+                self.session_index.append_turn_record(session["session_id"], {"turn_id": turn_id, "status": "failed", "raw_user_input": user_input, "assistant_turns": records, "tool_rounds": [], "final_assistant_text": "", "created_at": datetime.now().isoformat(timespec="seconds")})
+            except Exception:
+                pass  # Terminal delivery must survive a persistence failure.
+            metrics = {"duration_ms": (perf_counter() - started) * 1000, "sample_count": len(records), "status": "failed", "error_class": type(exc).__name__}
+            self._metric({"kind": "turn", "turn_id": turn_id, **metrics})
+            yield {"type": "error", "turn_id": turn_id, "message": f"Agent turn failed ({type(exc).__name__})"}
+            yield {"type": "turn_metrics", "turn_id": turn_id, "metrics": metrics}
+            yield {"type": "done", "turn_id": turn_id, "status": "failed", "assistant": "", "tool_results": []}
+
+    async def _stream_turn(self, user_input: str) -> AsyncIterator[dict[str, Any]]:
         control = TurnControl()
+        turn_started = perf_counter()
         yield {"type": "turn", "turn_id": control.turn_id, "turn": {"id": control.turn_id}}
+        if user_input.strip() == "/compact":
+            sample_id = f"{control.turn_id}-sample-0"
+            yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context"}
+            yield {"type": "assistant_start", "turn_id": control.turn_id, "sample_id": sample_id, "round": 0}
+            message = await self.compact_history(reason="manual", turn_id=control.turn_id)
+            yield {"type": "token", "turn_id": control.turn_id, "sample_id": sample_id, "seq": 1, "delta": message}
+            yield {"type": "assistant_end", "turn_id": control.turn_id, "sample_id": sample_id, "seq": 1, "text": message, "outcome": "final", "finish_reason": "stop"}
+            session = self.session_index.active() or self.session_index.create()
+            persist_started = perf_counter()
+            self.session_index.append_turn_record(session["session_id"], {"turn_id": control.turn_id, "status": "completed", "raw_user_input": "/compact", "assistant_turns": [{"sample_id": sample_id, "phase": "manual_compaction", "text": message, "outcome": "final", "finish_reason": "stop", "tool_calls": []}], "tool_rounds": [], "final_assistant_text": message, "final_sample_id": sample_id})
+            persistence_ms = (perf_counter() - persist_started) * 1000
+            snapshot_started = perf_counter()
+            try:
+                snapshot = self.session_index.snapshot()
+            except Exception as exc:
+                snapshot = None
+                yield {"type": "error", "turn_id": control.turn_id, "message": "Could not refresh session state.", "metadata": {"error_type": type(exc).__name__}}
+            metrics = {"duration_ms": (perf_counter() - turn_started) * 1000, "sample_count": 1, "tool_count": 0, "persistence_ms": persistence_ms, "snapshot_ms": (perf_counter() - snapshot_started) * 1000, "status": "completed"}
+            self._metric({"kind": "turn", "turn_id": control.turn_id, **metrics})
+            yield {"type": "turn_metrics", "turn_id": control.turn_id, "metrics": metrics}
+            yield {"type": "done", "turn_id": control.turn_id, "status": "completed", "assistant": message, "final_sample_id": sample_id, "tool_results": []}
+            if snapshot is not None:
+                yield {"type": "session", "turn_id": control.turn_id, "session": snapshot}
+            return
+        yield {"type": "status", "turn_id": control.turn_id, "phase": "preparing_context", "message": "Preparing context"}
+        catalog_started = perf_counter()
         tool_schemas = self.tool_registry.list_function_tools()
+        catalog_ms = (perf_counter() - catalog_started) * 1000
+        prompt_started = perf_counter()
         parts = self.prompt_builder.build_parts(user_input)
         system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+        prompt_ms = (perf_counter() - prompt_started) * 1000
         # Messages accumulated *inside this turn* (assistant tool-calls + tool
         # results + any tool-provided image blocks). Kept separate from
         # self.history so history can be compacted mid-turn without losing the
@@ -98,24 +195,29 @@ class AgentLoop:
         # History and appended messages are unchanged between samples. Count them
         # once per turn rather than repeatedly scanning retained image Data URIs.
         budget_enabled = self.context_compactor.compact_target_tokens() > 0
-        schema_tokens = _tool_schema_tokens(tool_schemas) if budget_enabled else 0
+        estimate_started = perf_counter()
+        schema_tokens = _tool_schema_tokens(tool_schemas)
+        history_estimate = user_estimate = system_estimate = 0
+        estimate_ms = (perf_counter() - estimate_started) * 1000
         in_turn_token_counts: list[int] = []
         in_turn_tokens = 0
 
         def base_token_count() -> int:
-            if not budget_enabled:
-                return 0
-            return (
-                self.context_compactor.estimate_messages_tokens([*self.history, {"role": "user", "content": user_input}])
-                + _prompt_tokens(parts)
-                + schema_tokens
-            )
+            nonlocal history_estimate, user_estimate, system_estimate, estimate_ms
+            started = perf_counter()
+            history_estimate = self.context_compactor.estimate_messages_tokens(self.history)
+            user_estimate = self.context_compactor.estimate_message_tokens({"role": "user", "content": user_input})
+            system_estimate = self.context_compactor.estimate_message_tokens({"role": "system", "content": system})
+            estimate_ms += (perf_counter() - started) * 1000
+            return history_estimate + user_estimate + _prompt_tokens(parts) + schema_tokens if budget_enabled else 0
 
         base_tokens = base_token_count()
 
         def append_in_turn(message: dict[str, Any]) -> None:
-            nonlocal in_turn_tokens
-            tokens = self.context_compactor.estimate_message_tokens(message) if budget_enabled else 0
+            nonlocal in_turn_tokens, estimate_ms
+            started = perf_counter()
+            tokens = self.context_compactor.estimate_message_tokens(message)
+            estimate_ms += (perf_counter() - started) * 1000
             in_turn.append(message)
             in_turn_token_counts.append(tokens)
             in_turn_tokens += tokens
@@ -126,19 +228,22 @@ class AgentLoop:
 
         if over_budget():
             yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
-            await self.compact_history(reason="token-pressure")
+            await self.compact_history(reason="token-pressure", turn_id=control.turn_id)
             history_compacted = True
+            prompt_started = perf_counter()
             parts = self.prompt_builder.build_parts(user_input)
             system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+            prompt_ms += (perf_counter() - prompt_started) * 1000
             base_tokens = base_token_count()
-        yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": self.prompt_builder.trace(parts)}
         assistant_turns: list[dict[str, Any]] = []
         tool_rounds: list[dict[str, Any]] = []
         transitions: list[dict[str, str]] = []
         all_tool_results: list[ToolResult] = []
         final_text = ""
+        final_sample_id: str | None = None
         status = "completed"
         tool_round = 0
+        sample_round = 0
         _max_result_chars = _max_tool_result_chars()
 
         while True:
@@ -150,10 +255,12 @@ class AgentLoop:
             if over_budget(in_turn):
                 if not history_compacted and over_budget():
                     yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
-                    await self.compact_history(reason="token-pressure")
+                    await self.compact_history(reason="token-pressure", turn_id=control.turn_id)
                     history_compacted = True
+                    prompt_started = perf_counter()
                     parts = self.prompt_builder.build_parts(user_input)
                     system = "\n\n".join(f"## {part.title}\n{part.body}" for part in parts if part.id != "request.user")
+                    prompt_ms += (perf_counter() - prompt_started) * 1000
                     base_tokens = base_token_count()
                 while over_budget(in_turn):
                     previous_count = len(in_turn)
@@ -164,20 +271,57 @@ class AgentLoop:
                     yield {"type": "status", "turn_id": control.turn_id, "phase": "trim", "message": "Dropped the oldest in-turn tool round to stay inside the model context window"}
             runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}, *in_turn]
             yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
+            sample_id = f"{control.turn_id}-sample-{sample_round}"
+            sample_round += 1
+            sample_text: list[str] = []
+            sample_seq = 0
+            sample_started = perf_counter()
+            request_tokens_estimate = system_estimate + history_estimate + user_estimate + in_turn_tokens + schema_tokens
+            estimates = {"system_tokens_estimate": system_estimate, "history_tokens_estimate": history_estimate, "current_tokens_estimate": user_estimate + in_turn_tokens, "tool_tokens_estimate": schema_tokens}
+            trace = self.prompt_builder.trace(parts)
+            trace["total_estimated_tokens"] = request_tokens_estimate
+            trace["totals"]["total_tokens"] = request_tokens_estimate
+            trace["request_estimates"] = estimates
+            yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": trace}
+            self._metric({"kind": "request", "turn_id": control.turn_id, "sample_id": sample_id, "input_tokens_estimate": request_tokens_estimate, **estimates})
+            sample_record: StreamComplete | None = None
+            yield {"type": "assistant_start", "turn_id": control.turn_id, "sample_id": sample_id, "round": sample_round - 1}
             try:
-                assistant = await self.llm.complete(runtime_messages, tools=tool_schemas)
+                async with aclosing(self.llm.stream(runtime_messages, tools=tool_schemas)) as stream:
+                    async for item in stream:
+                        if isinstance(item, StreamTextDelta):
+                            sample_seq += 1
+                            sample_text.append(item.delta)
+                            if sample_seq == 1:
+                                yield {"type": "status", "turn_id": control.turn_id, "phase": "responding", "message": "Responding"}
+                            yield {"type": "token", "turn_id": control.turn_id, "sample_id": sample_id, "seq": sample_seq, "delta": item.delta}
+                        elif isinstance(item, StreamComplete):
+                            sample_record = item
+                if sample_record is None:
+                    raise RuntimeError("LLM stream completed without terminal assistant message")
+                assistant = sample_record.message
+                # The terminal assembled text is authoritative; emitted deltas are not replayed.
+                text = assistant.text
+                outcome = "tool_preamble" if assistant.tool_calls else "final"
+                yield {"type": "assistant_end", "turn_id": control.turn_id, "sample_id": sample_id, "seq": sample_seq, "text": text, "outcome": outcome, "finish_reason": assistant.finish_reason or "stop"}
             except Exception as exc:
+                text = "".join(sample_text)
                 status = "failed"
-                final_text = f"Agent LLM request failed: {exc}"
+                finish_reason = getattr(exc, "finish_reason", "error")
+                outcome = "truncated" if finish_reason in {"length", "content_filter", "refusal", "truncated"} else ("interrupted" if text else "truncated")
+                assistant_turns.append({"sample_id": sample_id, "phase": "initial" if tool_round == 0 else f"followup_{tool_round}", "text": text, "outcome": outcome, "finish_reason": finish_reason, "tool_calls": [], "incomplete": True, "input_tokens_estimate": request_tokens_estimate, "duration_ms": (perf_counter() - sample_started) * 1000})
+                self._record_requests(control.turn_id, sample_id, getattr(exc, "request_metadata", {}))
+                yield {"type": "assistant_end", "turn_id": control.turn_id, "sample_id": sample_id, "seq": sample_seq, "text": text, "outcome": outcome, "finish_reason": finish_reason}
+                final_text = ""
                 transitions.append(_transition("sampling_assistant", "finalizing_answer", "llm_sampling_failed"))
-                yield {"type": "error", "turn_id": control.turn_id, "message": final_text, "metadata": {"error_type": "llm_sampling_failed"}}
+                yield {"type": "error", "turn_id": control.turn_id, "message": f"Agent LLM request failed ({type(exc).__name__})", "metadata": {"error_type": "llm_sampling_failed"}}
                 break
-            assistant_turns.append({"phase": "initial" if tool_round == 0 else f"followup_{tool_round}", "text": assistant.text, "tool_calls": [call.as_dict() for call in assistant.tool_calls]})
+            assistant_turns.append({"sample_id": sample_id, "phase": "initial" if tool_round == 0 else f"followup_{tool_round}", "text": text, "outcome": outcome, "finish_reason": assistant.finish_reason or "stop", "tool_calls": [call.as_dict() for call in assistant.tool_calls], "usage": assistant.usage, "request_metadata": assistant.request_metadata, "input_tokens_estimate": request_tokens_estimate, "duration_ms": (perf_counter() - sample_started) * 1000})
+            self._record_requests(control.turn_id, sample_id, assistant.request_metadata, assistant.usage)
             if not assistant.tool_calls:
                 transitions.append(_transition("sampling_assistant", "finalizing_answer", "assistant_finished_without_tools"))
-                final_text = assistant.text
-                if final_text:
-                    yield {"type": "token", "turn_id": control.turn_id, "delta": final_text}
+                final_text = text
+                final_sample_id = sample_id
                 break
             transitions.append(_transition("sampling_assistant", "executing_tools", "assistant_requested_tools"))
             if tool_round >= MAX_TOOL_PASSES:
@@ -193,6 +337,7 @@ class AgentLoop:
             round_model_content: list[dict[str, Any]] = []
 
             for call in assistant.tool_calls:
+                tool_started = perf_counter()
                 yield {"type": "tool_start", "turn_id": control.turn_id, "tool": call.as_dict()}
                 progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -200,22 +345,31 @@ class AgentLoop:
                     progress_queue.put_nowait(event)
 
                 task = asyncio.create_task(self.tool_executor.execute(call, control, progress_callback=on_progress))
-                while not task.done():
-                    progress_task = asyncio.create_task(progress_queue.get())
-                    try:
-                        ready, _ = await asyncio.wait(
-                            (task, progress_task), return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if progress_task in ready:
-                            yield progress_task.result()
-                    finally:
-                        if not progress_task.done():
-                            progress_task.cancel()
-                        await asyncio.gather(progress_task, return_exceptions=True)
-                while not progress_queue.empty():
-                    yield progress_queue.get_nowait()
-                record = await task
+                try:
+                    while not task.done():
+                        progress_task = asyncio.create_task(progress_queue.get())
+                        try:
+                            ready, _ = await asyncio.wait(
+                                (task, progress_task), return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if progress_task in ready:
+                                yield progress_task.result()
+                        finally:
+                            if not progress_task.done():
+                                progress_task.cancel()
+                            await asyncio.gather(progress_task, return_exceptions=True)
+                    while not progress_queue.empty():
+                        yield progress_queue.get_nowait()
+                    record = await task
+                except BaseException as exc:
+                    self._metric({"kind": "tool", "turn_id": control.turn_id, "tool_id": call.id, "tool_name": call.name, "duration_ms": (perf_counter() - tool_started) * 1000, "outcome": "interrupted", "error_class": type(exc).__name__})
+                    raise
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
                 result = record.result
+                self._metric({"kind": "tool", "turn_id": control.turn_id, "tool_id": call.id, "tool_name": call.name, "duration_ms": (perf_counter() - tool_started) * 1000, "outcome": "success" if result.ok else "failure"})
                 round_results.append(result)
                 all_tool_results.append(result)
                 yield {"type": "tool_result", "turn_id": control.turn_id, "tool_result": result.as_dict()}
@@ -244,12 +398,36 @@ class AgentLoop:
             transitions.append(_transition("executing_tools", "post_tool_decision", "tool_round_completed"))
             transitions.append(_transition("post_tool_decision", "sampling_assistant", "runtime_continuation_after_tools"))
 
-        self.history.extend([{"role": "user", "content": user_input}, {"role": "assistant", "content": final_text}])
-        turn_record = {"turn_id": control.turn_id, "status": status, "raw_user_input": user_input, "assistant_turns": assistant_turns, "tool_rounds": tool_rounds, "transitions": transitions, "final_assistant_text": final_text, "created_at": datetime.now().isoformat(timespec="seconds")}
-        final_session = self.session_index.active() or self.session_index.create()
-        self.session_index.append_turn_record(final_session["session_id"], turn_record)
-        yield {"type": "done", "turn_id": control.turn_id, "assistant": final_text, "tool_results": [result.as_dict() for result in all_tool_results]}
-        yield {"type": "session", "turn_id": control.turn_id, "session": self.session_index.snapshot()}
+        turn_record = {"turn_id": control.turn_id, "status": status, "raw_user_input": user_input, "assistant_turns": assistant_turns, "tool_rounds": tool_rounds, "transitions": transitions, "final_assistant_text": final_text, "final_sample_id": final_sample_id, "created_at": datetime.now().isoformat(timespec="seconds")}
+        persistence_started = perf_counter()
+        try:
+            final_session = self.session_index.active() or self.session_index.create()
+            self.session_index.append_turn_record(final_session["session_id"], turn_record)
+        except Exception as exc:
+            status = "failed"
+            final_text = ""
+            yield {"type": "error", "turn_id": control.turn_id, "message": "Could not persist the completed turn.", "metadata": {"error_type": type(exc).__name__}}
+        if status == "completed":
+            self.history.extend([{"role": "user", "content": user_input}, {"role": "assistant", "content": final_text}])
+        persistence_ms = (perf_counter() - persistence_started) * 1000
+        snapshot_started = perf_counter()
+        try:
+            snapshot = self.session_index.snapshot()
+        except Exception as exc:
+            snapshot = None
+            yield {"type": "error", "turn_id": control.turn_id, "message": "Could not refresh session state.", "metadata": {"error_type": type(exc).__name__}}
+        snapshot_ms = (perf_counter() - snapshot_started) * 1000
+        def actual_total(key: str) -> int | None:
+            values = [(sample.get("usage") or {}).get(key) for sample in assistant_turns]
+            return sum(values) if values and all(isinstance(value, int) and not isinstance(value, bool) for value in values) else None
+        metrics = {"duration_ms": (perf_counter() - turn_started) * 1000, "sample_count": len(assistant_turns), "tool_round_count": len(tool_rounds), "tool_count": len(all_tool_results), "input_tokens_estimate": sum(int(sample.get("input_tokens_estimate", 0)) for sample in assistant_turns), "actual_prompt_tokens": actual_total("prompt_tokens"), "actual_completion_tokens": actual_total("completion_tokens"), "actual_cached_tokens": actual_total("cached_tokens"), "actual_reasoning_tokens": actual_total("reasoning_tokens"), "catalog_ms": catalog_ms, "prompt_ms": prompt_ms, "estimate_ms": estimate_ms, "persistence_ms": persistence_ms, "snapshot_ms": snapshot_ms, "status": status}
+        self._metric({"kind": "turn", "turn_id": control.turn_id, **metrics})
+        for sample in assistant_turns:
+            self._metric({"kind": "sample", "turn_id": control.turn_id, "sample_id": sample.get("sample_id"), "duration_ms": sample.get("duration_ms", 0), "input_tokens_estimate": sample.get("input_tokens_estimate", 0), "outcome": sample.get("outcome"), "finish_reason": sample.get("finish_reason")})
+        yield {"type": "turn_metrics", "turn_id": control.turn_id, "metrics": metrics}
+        yield {"type": "done", "turn_id": control.turn_id, "status": status, "assistant": final_text, "final_sample_id": final_sample_id, "tool_results": [result.as_dict() for result in all_tool_results]}
+        if snapshot is not None:
+            yield {"type": "session", "turn_id": control.turn_id, "session": snapshot}
 
 
 def _compaction_record(result: CompactionResult) -> dict[str, Any]:

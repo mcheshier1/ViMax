@@ -31,14 +31,17 @@ class FakeSessionIndex:
     def snapshot(self):
         return {"active_session_id": self.activated, "session": {"session_id": self.activated, "stage": "created"}}
 
+    def append_turn_record(self, session_id, record):
+        self.turn_record = record
+
+    def active(self):
+        return None
+
 
 class FakeRuntime:
     def __init__(self, fail_session=False):
         self.session_index = FakeSessionIndex(fail_session=fail_session)
         self.inputs = []
-
-    async def compact_history(self, reason="manual"):
-        return "Compacted context 100 -> 50 (fallback-local)."
 
     async def stream_events(self, user_input):
         self.inputs.append(user_input)
@@ -180,19 +183,6 @@ class MainAgentCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stdout, "")
         self.assertIn("cannot be used together", stderr)
         self.assertEqual(runtime.inputs, [])
-
-
-    async def test_compact_command_outputs_jsonl_without_llm_turn(self):
-        code, stdout, stderr, runtime = await self.run_cli(["--jsonl", "--once", "/compact"])
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-        self.assertEqual(runtime.inputs, [])
-        events = [json.loads(line) for line in stdout.splitlines()]
-        self.assertEqual([event["type"] for event in events], ["turn", "status", "token", "done", "session"])
-        turn_ids = {event["turn_id"] for event in events}
-        self.assertEqual(len(turn_ids), 1)
-        self.assertTrue(next(iter(turn_ids)).startswith("turn-"))
-        self.assertIn("Compacted context", events[2]["delta"])
 
     async def test_failed_repl_request_completes_its_own_turn_before_next_request(self):
         for fail_before_turn in (False, True):

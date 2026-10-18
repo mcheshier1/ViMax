@@ -48,6 +48,15 @@ def print_event(event: dict[str, Any], *, jsonl: bool) -> None:
     event_type = event.get("type")
     if event_type == "turn":
         print(f"· turn: {event.get('turn_id', '')}", file=out, flush=True)
+    elif event_type == "assistant_start":
+        if event.get("round", 0):
+            print("", file=out, flush=True)
+    elif event_type == "assistant_end":
+        outcome = event.get("outcome")
+        if outcome in {"interrupted", "truncated"}:
+            print(f"\n· assistant {outcome}: {event.get('finish_reason', 'unknown')}", file=out, flush=True)
+        elif outcome == "tool_preamble":
+            print("", file=out, flush=True)
     elif event_type == "token":
         print(event.get("delta", ""), end="", file=out, flush=True)
     elif event_type == "tool_start":
@@ -131,29 +140,22 @@ async def amain(argv: list[str] | None = None) -> int:
     if interactive and not args.jsonl:
         print("ViMax agent ready. Ctrl+C to exit.")
     for user_input in prompt_inputs(args):
-        if user_input.strip() == "/compact":
-            turn_id = f"turn-{uuid4().hex[:12]}"
-            print_event({"type": "turn", "turn_id": turn_id, "turn": {"id": turn_id}}, jsonl=args.jsonl)
-            print_event({"type": "status", "turn_id": turn_id, "phase": "compact", "message": "Compacting context"}, jsonl=args.jsonl)
-            message = await runtime.compact_history(reason="manual")
-            print_event({"type": "token", "turn_id": turn_id, "delta": message}, jsonl=args.jsonl)
-            print_event({"type": "done", "turn_id": turn_id, "assistant": message, "tool_results": []}, jsonl=args.jsonl)
-            print_event({"type": "session", "turn_id": turn_id, "session": runtime.session_index.snapshot()}, jsonl=args.jsonl)
-            continue
         turn_id = ""
+        terminal_seen = False
         try:
             async for event in runtime.stream_events(user_input):
                 if event.get("type") == "turn":
                     turn_id = str(event.get("turn_id") or event.get("turn", {}).get("id") or "")
+                if event.get("type") == "done":
+                    terminal_seen = True
                 print_event(event, jsonl=args.jsonl)
         except Exception as exc:
-            # Keep the REPL alive: one failed turn must not kill the process
-            # (and with it the TUI driving us over stdio).
             if not turn_id:
                 turn_id = f"turn-{uuid4().hex[:12]}"
                 print_event({"type": "turn", "turn_id": turn_id, "turn": {"id": turn_id}}, jsonl=args.jsonl)
-            print_event({"type": "error", "turn_id": turn_id, "message": f"turn failed: {exc}"}, jsonl=args.jsonl)
-            print_event({"type": "done", "turn_id": turn_id, "assistant": "", "tool_results": []}, jsonl=args.jsonl)
+            if not terminal_seen:
+                print_event({"type": "error", "turn_id": turn_id, "message": f"turn failed ({type(exc).__name__})"}, jsonl=args.jsonl)
+                print_event({"type": "done", "turn_id": turn_id, "status": "failed", "assistant": "", "tool_results": []}, jsonl=args.jsonl)
     return 0
 
 
