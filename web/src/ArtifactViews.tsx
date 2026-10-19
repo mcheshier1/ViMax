@@ -1,5 +1,5 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
-import {FileJson, Film, Files, Image as ImageIcon, Video, X} from 'lucide-react';
+import {ArrowUpRight, FileJson, Film, Files, Image as ImageIcon, Video, X} from 'lucide-react';
 import {approvePortraitSet, deleteAsset, deleteAssets, getAgentConfig, getAssetDeletionPlan, getAssetsDeletionPlan, getJsonArtifact, getPortraitOptions, selectPortraitSet} from './api';
 import {
   extractStoryboardPreviews,
@@ -26,8 +26,9 @@ import type {Artifact, AssetDeletionPlan, AssetsDeletionPlan, FilmCharacter, Jso
 import type {FilmProgress} from './filmSession';
 import {CharacterPortraitDecision} from './CharacterPortraitDecision';
 import {SetReferencesPanel} from './SetReferencesPanel';
+import type {AssetCreationRequest} from './AssetCreationDialog';
 
-export function ArtifactsView({session, artifacts, onRefresh, characters = [], root = '', revision = '', portraitImageModel = '', imageModel = '', progress, disabled = false, onAskAgent}: {
+export function ArtifactsView({session, artifacts, onRefresh, characters = [], root = '', revision = '', portraitImageModel = '', imageModel = '', progress, disabled = false, onAskAgent, onCreateAsset}: {
   session?: SessionSummary;
   artifacts: Artifact[];
   onRefresh?: (sessionId: string) => void | Promise<void>;
@@ -39,6 +40,7 @@ export function ArtifactsView({session, artifacts, onRefresh, characters = [], r
   progress?: FilmProgress;
   disabled?: boolean;
   onAskAgent: (text: string) => Promise<void>;
+  onCreateAsset?: (request: AssetCreationRequest) => void;
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [previewArtifact, setPreviewArtifact] = useState<Artifact>();
@@ -46,22 +48,22 @@ export function ArtifactsView({session, artifacts, onRefresh, characters = [], r
   const jsonArtifacts = useMemo(() => artifacts.filter(isJsonArtifact).sort((left, right) => left.path.localeCompare(right.path, undefined, {numeric: true})), [artifacts]);
   return (
     <section className="artifacts-view workbench-assets">
-      <header className="workbench-page-heading"><div><span>Media library</span><h1>Assets</h1></div><span className="artifact-file-count">{mediaArtifacts.length} visuals · {jsonArtifacts.length} documents</span></header>
+      <header className="workbench-page-heading"><div><span>Media library</span><h1>Assets</h1></div><span className="artifact-file-count">{mediaArtifacts.length} visuals · {jsonArtifacts.length} documents</span>{session && onCreateAsset && <button className="workbench-primary" type="button" onClick={() => onCreateAsset({})}><ArrowUpRight size={15}/>Generate asset…</button>}</header>
       {!session ? <ArtifactsEmpty title="Select a project" detail="Your images, clips, and source files will appear here." /> : <>
-        <SetReferencesPanel sessionId={session.sessionId} root={root} revision={revision} disabled={disabled} onGenerate={onAskAgent} onPrepare={onAskAgent} onRefresh={onRefresh} />
-        <CharacterInventory characters={characters} artifacts={mediaArtifacts} sessionId={session.sessionId} root={root} revision={revision} portraitImageModel={portraitImageModel} imageModel={imageModel} progress={progress} disabled={disabled} onAskAgent={onAskAgent} onRefresh={() => onRefresh?.(session.sessionId)} onPreview={setPreviewArtifact} />
+        <SetReferencesPanel sessionId={session.sessionId} root={root} revision={revision} disabled={disabled} onGenerate={onAskAgent} onPrepare={onAskAgent} onCreateAsset={onCreateAsset} onRefresh={onRefresh} />
+        <CharacterInventory characters={characters} artifacts={mediaArtifacts} sessionId={session.sessionId} root={root} revision={revision} portraitImageModel={portraitImageModel} imageModel={imageModel} progress={progress} disabled={disabled} onAskAgent={onAskAgent} onCreateAsset={onCreateAsset} onRefresh={() => onRefresh?.(session.sessionId)} onPreview={setPreviewArtifact} />
         <VisualArtifacts key={session.sessionId} session={session} artifacts={mediaArtifacts} onPreview={setPreviewArtifact} onRefresh={() => onRefresh?.(session.sessionId)} />
         <details className="assets-advanced" open={advancedOpen} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}>
           <summary><FileJson size={16} /><span>Advanced · raw documents</span><small>{jsonArtifacts.length} files</small></summary>
           {advancedOpen && <DocumentBrowser artifacts={jsonArtifacts} raw />}
         </details>
       </>}
-      {previewArtifact && <MediaPreviewDialog key={`${session?.sessionId || ''}:${previewArtifact.path}`} session={session} artifact={previewArtifact} artifacts={mediaArtifacts} promptDocument={artifacts.find((candidate) => candidate.path === (previewArtifact.promptPath || visualPromptSource(previewArtifact.path)?.documentPath))} onRefresh={() => onRefresh?.(session?.sessionId || '')} onClose={() => setPreviewArtifact(undefined)} />}
+      {previewArtifact && <MediaPreviewDialog key={`${session?.sessionId || ''}:${previewArtifact.path}`} session={session} artifact={previewArtifact} artifacts={mediaArtifacts} promptDocument={artifacts.find((candidate) => candidate.path === (previewArtifact.promptPath || visualPromptSource(previewArtifact.path)?.documentPath))} onRefresh={() => onRefresh?.(session?.sessionId || '')} onClose={() => setPreviewArtifact(undefined)} onCreateAsset={(request) => { setPreviewArtifact(undefined); onCreateAsset?.(request); }} />}
     </section>
   );
 }
 
-function CharacterInventory({characters, artifacts, sessionId, root, revision, portraitImageModel, imageModel, progress, disabled, onAskAgent, onRefresh, onPreview}: {
+function CharacterInventory({characters, artifacts, sessionId, root, revision, portraitImageModel, imageModel, progress, disabled, onAskAgent, onCreateAsset, onRefresh, onPreview}: {
   characters: FilmCharacter[];
   artifacts: Artifact[];
   sessionId: string;
@@ -72,6 +74,7 @@ function CharacterInventory({characters, artifacts, sessionId, root, revision, p
   progress?: FilmProgress;
   disabled: boolean;
   onAskAgent: (text: string) => Promise<void>;
+  onCreateAsset?: (request: AssetCreationRequest) => void;
   onRefresh: () => void | Promise<void>;
   onPreview: (artifact: Artifact) => void;
 }) {
@@ -91,6 +94,7 @@ function CharacterInventory({characters, artifacts, sessionId, root, revision, p
     {!characters.length ? <p className="artifact-document-state">No character inventory is available yet.</p> : <div className="character-inventory-list">
       {characters.map((character) => <article className="character-inventory-card" key={`${character.scope}:${character.identifier}`}>
         <header><div><h3>{character.identifier}</h3><span>{character.scope}</span></div><span className={`timeline-state is-${character.state}`}>{character.visible ? character.state : 'No portrait required'}</span></header>
+        {onCreateAsset && <button type="button" className="workbench-secondary" onClick={() => onCreateAsset({type: 'character', destination: {id: `${character.scope}::${character.identifier}`, name: character.identifier}})}>Generate alternative…</button>}
         <details className="character-description"><summary>Character description</summary><p>{character.description || 'No description provided.'}</p></details>
         {!character.visible ? <p className="plan-hint">Planned but not visible in the film; portraits are not required.</p> : <>
           <div className="character-portrait-views">{(['front', 'side', 'back'] as const).map((view) => {
@@ -315,7 +319,7 @@ function VisualModel({path}: {path: string}) {
   return <em className="visual-model" title={`Produced by ${model}`}>{model}</em>;
 }
 
-export function MediaPreviewDialog({session, artifact, artifacts, promptDocument, onRefresh, onClose}: {session?: SessionSummary; artifact: Artifact; artifacts: Artifact[]; promptDocument?: Artifact; onRefresh: () => void; onClose: () => void}) {
+export function MediaPreviewDialog({session, artifact, artifacts, promptDocument, onRefresh, onClose, onCreateAsset}: {session?: SessionSummary; artifact: Artifact; artifacts: Artifact[]; promptDocument?: Artifact; onRefresh: () => void; onClose: () => void; onCreateAsset?: (request: AssetCreationRequest) => void}) {
   const [prompt, setPrompt] = useState('');
   const [promptError, setPromptError] = useState('');
   const [promptLoaded, setPromptLoaded] = useState(false);
@@ -480,6 +484,7 @@ export function MediaPreviewDialog({session, artifact, artifacts, promptDocument
             </div>
           </div>}
         </section>
+        {artifact.kind === 'image' && session && onCreateAsset && <button type="button" className="workbench-secondary" onClick={() => { onClose(); onCreateAsset({source: artifact}); }}>Generate asset from this image…</button>}
         <div className="media-preview-stage">
           {artifact.kind === 'image'
             ? <img src={artifactUrl(artifact)} alt={visualArtifactTitle(artifact.path)} />

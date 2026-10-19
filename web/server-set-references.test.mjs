@@ -3,7 +3,7 @@ import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {readSetReferences, selectSetReference, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
+import {applySetReferenceImage, readSetReferences, selectSetReference, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
 
 const storageTestControl = vi.hoisted(() => ({failAcceptanceWrite: false}));
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -107,6 +107,47 @@ describe('set reference inventory and approval', () => {
     expect(updated.sets.map(({id, shots, state}) => ({id, shots, state}))).toEqual([{id: 'saloon', shots: ['0'], state: 'planned'}]);
     expect(updated.unassignedShots).toEqual(['1']);
     await expect(saveSet(repo, initial)).rejects.toMatchObject({statusCode: 409});
+  });
+
+  it('distinguishes explicit empty bindings from missing and null bindings', async () => {
+    const {repo, working} = await fixture();
+    const initial = await readSetReferences(repo, SESSION_ID, ROOT);
+    expect(initial.shots.map(({slot, setBindingExplicit}) => [slot, setBindingExplicit])).toEqual([
+      ['0', false], ['1', false],
+    ]);
+
+    await writeFile(path.join(working, ROOT, 'shots', '0', 'shot_description.json'), JSON.stringify({brief: 'Shot 0', set_ids: null}));
+    await writeFile(path.join(working, ROOT, 'shots', '1', 'shot_description.json'), JSON.stringify({brief: 'Shot 1', set_ids: []}));
+    const explicitEmpty = await readSetReferences(repo, SESSION_ID, ROOT);
+    expect(explicitEmpty.revision).not.toBe(initial.revision);
+    expect(explicitEmpty.shots.map(({slot, setIds, setBindingExplicit}) => [slot, setIds, setBindingExplicit])).toEqual([
+      ['0', [], false], ['1', [], true],
+    ]);
+    expect(explicitEmpty.unassignedShots).toEqual(['0']);
+
+    const withDefaults = await saveSet(repo, explicitEmpty);
+    expect(withDefaults.shots.map(({slot, setIds, setBindingExplicit}) => [slot, setIds, setBindingExplicit])).toEqual([
+      ['0', ['saloon'], false], ['1', [], true],
+    ]);
+    expect(withDefaults.unassignedShots).toEqual([]);
+
+    await writeFile(path.join(working, ROOT, 'shots', '1', 'shot_description.json'), JSON.stringify({brief: 'Shot 1'}));
+    const missingOverride = await readSetReferences(repo, SESSION_ID, ROOT);
+    expect(missingOverride.revision).not.toBe(withDefaults.revision);
+    expect(missingOverride.shots[1]).toMatchObject({setIds: [], setBindingExplicit: false});
+    expect(missingOverride.unassignedShots).toEqual(['1']);
+  });
+
+  it('keeps unknown and malformed overrides from becoming valid empty bindings', async () => {
+    const {repo, working} = await fixture();
+    const shotPath = path.join(working, ROOT, 'shots', '1', 'shot_description.json');
+    await writeFile(shotPath, JSON.stringify({brief: 'Shot 1', set_ids: ['missing-set']}));
+    const unknown = await readSetReferences(repo, SESSION_ID, ROOT);
+    expect(unknown.shots[1]).toMatchObject({setIds: ['missing-set'], setBindingExplicit: true});
+    expect(unknown.unassignedShots).toEqual(['0', '1']);
+
+    await writeFile(shotPath, JSON.stringify({brief: 'Shot 1', set_ids: ['bad id']}));
+    await expect(readSetReferences(repo, SESSION_ID, ROOT)).rejects.toMatchObject({statusCode: 400});
   });
 
   it('accepts only the current descriptor/image/provenance and invalidates approval after an edit', async () => {
@@ -213,7 +254,7 @@ describe('set reference inventory and approval', () => {
     }, () => true)).rejects.toMatchObject({statusCode: 409});
   });
 
-  it('copies a candidate transactionally and invalidates bound shots plus linked successors', async () => {
+  it('copies a candidate transactionally and invalidates bound shots only', async () => {
     const {repo, working} = await fixture();
     let inventory = await saveSet(repo, await readSetReferences(repo, SESSION_ID, ROOT), {shots: ['0', '1']});
     await writeFile(path.join(working, ROOT, 'shots', '1', 'shot_description.json'), JSON.stringify({
@@ -251,8 +292,8 @@ describe('set reference inventory and approval', () => {
     const acceptance = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
     expect(acceptance.shots['0'].keyframes.invalidated_at).toBeTruthy();
     expect(acceptance.shots['0'].clips.invalidated_at).toBeTruthy();
-    expect(acceptance.shots['1'].keyframes).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
-    expect(acceptance.shots['1'].clips).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+    expect(acceptance.shots['1'].keyframes).toEqual(untouched);
+    expect(acceptance.shots['1'].clips).toEqual(untouched);
     expect(acceptance.final_video.invalidated_at).toBeTruthy();
     expect(JSON.parse(await readFile(path.join(working, 'continuity_review.json'), 'utf8')).set_references_invalidated_at).toBeTruthy();
     const approved = await updateSetReferenceAcceptance(repo, {
@@ -309,5 +350,148 @@ describe('set reference inventory and approval', () => {
     await expect(readFile(path.join(canonicalDir, 'provenance.json'))).rejects.toMatchObject({code: 'ENOENT'});
     expect(await readFile(candidate.imagePath)).toEqual(candidate.image);
     expect(await readFile(candidate.provenancePath)).toEqual(candidate.provenance);
+  });
+
+  it('applies reviewed pixels as an accepted source import and invalidates bound reviews', async () => {
+    const {repo, working} = await fixture();
+    let inventory = await saveSet(repo, await readSetReferences(repo, SESSION_ID, ROOT), {shots: ['0', '1']});
+    const oldCanonical = path.join(working, ROOT, 'set_references', 'saloon', MODEL_DIR);
+    await mkdir(oldCanonical, {recursive: true});
+    const descriptor = await readFile(path.join(working, ROOT, 'set_references', 'saloon', 'set.json'));
+    await writeFile(path.join(oldCanonical, 'reference.png'), png);
+    await writeFile(path.join(oldCanonical, 'provenance.json'), JSON.stringify({
+      image_model: MODEL, style: 'cinematic', spec_sha256: createHash('sha256').update(descriptor).digest('hex'),
+    }));
+    const source = path.join(working, 'uploads', 'western-room.png');
+    await mkdir(path.dirname(source), {recursive: true});
+    await writeFile(source, png);
+    const untouched = {accepted_at: 'reviewed', artifacts: []};
+    await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({
+      [ROOT]: {sets: {saloon: {rejected_at: 'rejected'}}, shots: {
+        '0': {keyframes: {...untouched}, clips: {...untouched}},
+      }, final_video: {...untouched}},
+    }));
+    inventory = await readSetReferences(repo, SESSION_ID, ROOT);
+    const applied = await applySetReferenceImage(repo, {
+      sessionId: SESSION_ID, root: ROOT, revision: inventory.revision, id: 'saloon',
+      sourcePath: 'uploads/western-room.png', pngBase64: png.toString('base64'), crop: {x: 1, y: 2, width: 12, height: 9},
+    });
+    const imagePath = path.join(working, ROOT, 'set_references', 'saloon', MODEL_DIR, 'reference.png');
+    const provenance = JSON.parse(await readFile(path.join(path.dirname(imagePath), 'provenance.json'), 'utf8'));
+    const acceptance = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(await readFile(imagePath)).toEqual(png);
+    expect(provenance.source_import).toMatchObject({
+      source_path: 'uploads/western-room.png', source_sha256: createHash('sha256').update(png).digest('hex'),
+      crop: {x: 1, y: 2, width: 12, height: 9},
+    });
+    expect(applied.sets[0].state).toBe('accepted');
+    expect(applied.sets[0].candidates).toHaveLength(1);
+    expect(applied.sets[0].candidates[0]).toMatchObject({state: 'ready', prompt: 'Not generated; preserved previous canonical reference.'});
+    expect(acceptance.sets.saloon).toMatchObject({accepted_at: expect.any(String), artifacts: expect.arrayContaining([
+      expect.objectContaining({path: `${ROOT}/set_references/saloon/${MODEL_DIR}/reference.png`}),
+    ])});
+    expect(acceptance.sets.saloon.rejected_at).toBeUndefined();
+    expect(acceptance.shots['0'].keyframes.invalidated_at).toBeTruthy();
+    expect(acceptance.shots['0'].clips.invalidated_at).toBeTruthy();
+    expect(acceptance.final_video.invalidated_at).toBeTruthy();
+  });
+
+  it('invalidates only bound reviews in global chained mode and retains media', async () => {
+    const {repo, working} = await fixture();
+    const slots = ['0', '1', '2', '3', '4', '5'];
+    for (const slot of slots.slice(2)) {
+      const shot = path.join(working, ROOT, 'shots', slot);
+      await mkdir(shot, {recursive: true});
+      await writeFile(path.join(shot, 'shot_description.json'), JSON.stringify({brief: `Shot ${slot}`}));
+    }
+    await writeFile(path.join(working, ROOT, 'shots', '3', 'shot_description.json'), JSON.stringify({
+      brief: 'Shot 3', reuse_previous_last_frame: false,
+    }));
+    await writeFile(path.join(working, ROOT, 'shots', '5', 'shot_description.json'), JSON.stringify({
+      brief: 'Shot 5', set_ids: [],
+    }));
+    await writeFile(path.join(working, ROOT, 'camera_tree.json'), JSON.stringify([
+      {idx: 0, active_shot_idxs: [4, 1, 0, 3, 2, 5]},
+    ]));
+    await writeFile(path.join(working, 'frame_continuity.json'), JSON.stringify({mode: 'chained_keyframes'}));
+    const retainedMedia = path.join(working, ROOT, 'shots', '3', 'first_frame.png');
+    await writeFile(retainedMedia, png);
+    let inventory = await saveSet(repo, await readSetReferences(repo, SESSION_ID, ROOT));
+    const acceptance = {accepted_at: 'reviewed', artifacts: [{path: 'media.png'}]};
+    const shots = Object.fromEntries(slots.map((slot) => [slot, {
+      keyframes: {...acceptance}, clips: {...acceptance},
+    }]));
+    await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({
+      [ROOT]: {sets: {saloon: {accepted_at: 'reviewed'}}, shots, final_video: {...acceptance}},
+    }));
+    const candidateId = 'e'.repeat(32);
+    await writeCandidate(working, candidateId);
+    inventory = await readSetReferences(repo, SESSION_ID, ROOT);
+    await selectSetReference(repo, {sessionId: SESSION_ID, root: ROOT, id: 'saloon', candidateId, revision: inventory.revision});
+    const updated = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(updated.shots['0'].keyframes.invalidated_at).toBeTruthy();
+    expect(updated.shots['0'].clips.invalidated_at).toBeTruthy();
+    for (const slot of ['1', '2', '3', '4', '5']) expect(updated.shots[slot]).toEqual(shots[slot]);
+    expect(await readFile(retainedMedia)).toEqual(png);
+    expect(updated.final_video.invalidated_at).toBeTruthy();
+  });
+
+  it('keeps non-chained set invalidation limited to bound shots', async () => {
+    const {repo, working} = await fixture();
+    const slots = ['0', '1', '2', '3'];
+    for (const slot of slots.slice(2)) {
+      const shot = path.join(working, ROOT, 'shots', slot);
+      await mkdir(shot, {recursive: true});
+      await writeFile(path.join(shot, 'shot_description.json'), JSON.stringify({brief: `Shot ${slot}`}));
+    }
+    await writeFile(path.join(working, ROOT, 'camera_tree.json'), JSON.stringify([
+      {idx: 0, active_shot_idxs: [0, 1, 2, 3]},
+    ]));
+    let inventory = await saveSet(repo, await readSetReferences(repo, SESSION_ID, ROOT));
+    const approval = {accepted_at: 'reviewed', artifacts: []};
+    const shots = Object.fromEntries(slots.map((slot) => [slot, {keyframes: {...approval}, clips: {...approval}}]));
+    await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({[ROOT]: {shots, final_video: {...approval}}}));
+    await writeCandidate(working, 'a'.repeat(32));
+    inventory = await readSetReferences(repo, SESSION_ID, ROOT);
+    await selectSetReference(repo, {sessionId: SESSION_ID, root: ROOT, id: 'saloon', candidateId: 'a'.repeat(32), revision: inventory.revision});
+    const updated = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(updated.shots['0'].keyframes.invalidated_at).toBeTruthy();
+    for (const slot of ['1', '2', '3']) expect(updated.shots[slot]).toEqual(shots[slot]);
+  });
+
+  it('creates a safely identified unbound set and rejects stale or busy applies', async () => {
+    const {repo, working} = await fixture();
+    const source = path.join(working, 'source.jpg');
+    await writeFile(source, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    const initial = await readSetReferences(repo, SESSION_ID, ROOT);
+    const apply = (revision, busy) => applySetReferenceImage(repo, {
+      sessionId: SESSION_ID, root: ROOT, revision, name: 'New location',
+      sourcePath: 'source.jpg', pngBase64: png.toString('base64'),
+    }, busy);
+    await expect(apply(initial.revision, () => true)).rejects.toMatchObject({statusCode: 409});
+    await expect(apply('stale', () => false)).rejects.toMatchObject({statusCode: 409});
+    expect((await readSetReferences(repo, SESSION_ID, ROOT)).sets).toHaveLength(0);
+    const created = await apply(initial.revision, () => false);
+    expect(created.sets).toHaveLength(1);
+    expect(created.sets[0]).toMatchObject({name: 'New location', shots: [], state: 'accepted'});
+    expect(created.sets[0].id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(created.shots.map(({setIds}) => setIds)).toEqual([[], []]);
+  });
+
+  it('rolls back imported pixels and a new descriptor if acceptance persistence fails', async () => {
+    const {repo, working} = await fixture();
+    const source = path.join(working, 'source.png');
+    await writeFile(source, png);
+    await writeFile(path.join(working, 'render_acceptance.json'), '{}\n');
+    const inventory = await readSetReferences(repo, SESSION_ID, ROOT);
+    const acceptanceBefore = await readFile(path.join(working, 'render_acceptance.json'));
+    storageTestControl.failAcceptanceWrite = true;
+    await expect(applySetReferenceImage(repo, {
+      sessionId: SESSION_ID, root: ROOT, revision: inventory.revision, name: 'Temporary',
+      sourcePath: 'source.png', pngBase64: png.toString('base64'),
+    })).rejects.toMatchObject({code: 'EIO'});
+    expect(await readFile(path.join(working, 'render_acceptance.json'))).toEqual(acceptanceBefore);
+    expect((await readSetReferences(repo, SESSION_ID, ROOT)).sets).toEqual([]);
+    await expect(readFile(path.join(working, ROOT, 'set_references'))).rejects.toMatchObject({code: 'ENOENT'});
   });
 });

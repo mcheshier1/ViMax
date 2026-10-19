@@ -42,6 +42,7 @@ import {createDeltaBatcher, type DeltaBatcher} from './streaming';
 import {IMAGE_PROVIDER_PRESETS, compatibleImageResolution, defaultImageResolution, imageProviderFromBaseUrl, imageProviderPreset, imageResolutionTiers} from './imagePresets';
 import {isHeygenVideoModel, validHeygenVideoSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
 import {credentialProvider} from '../provider-credentials.mjs';
+import {AssetCreationDialog, type AssetCreationRequest} from './AssetCreationDialog';
 import {TimelineView} from './TimelineView';
 import {useFilmSession, type FilmSelection} from './filmSession';
 import './workbench-shell.css';
@@ -101,6 +102,7 @@ export default function App() {
   const [creatingProject, setCreatingProject] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<SessionSummary>();
   const [deleting, setDeleting] = useState(false);
+  const [assetCreationRequest, setAssetCreationRequest] = useState<{sessionId: string; request: AssetCreationRequest}>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -189,6 +191,7 @@ export default function App() {
       // A new or storage-restricted project opens directly in Film.
     }
     setWorkspaceView(destination);
+    setAssetCreationRequest(undefined);
     setSelection(null);
     setAssistantScope('film');
     setLoadError('');
@@ -741,12 +744,12 @@ export default function App() {
               <>
                 {!film.loading && film.data && film.data.plans.length === 0 && <div className="workbench-planning-prompt"><div><strong>Give your film a starting point</strong><span>Use the Assistant to develop a script and shot plan before generating media.</span></div><button onClick={openPlanningAssistant}><MessageSquare size={15} />Plan with Assistant</button></div>}
 
-                <TimelineView key={selectedSessionId} session={selectedSession} artifacts={artifacts} film={film} active={workspaceView === 'film' && !utility} requestBusy={chat.busy || sending || !queueBridgeReady} onAskAgent={(text, restartAgent) => askAgent(text, [], restartAgent)} onSelectionChange={setSelection} />
+                <TimelineView key={selectedSessionId} session={selectedSession} artifacts={artifacts} film={film} active={workspaceView === 'film' && !utility} requestBusy={chat.busy || sending || !queueBridgeReady} onAskAgent={(text, restartAgent) => askAgent(text, [], restartAgent)} onSelectionChange={setSelection} onCreateAsset={(request) => setAssetCreationRequest({sessionId: selectedSessionId, request})} />
               </>
             )}
           </div>
           {workspaceView === 'script' && <ScriptView key={selectedSessionId} session={selectedSession} artifacts={artifacts} onPlan={openPlanningAssistant} />}
-          {workspaceView === 'assets' && <ArtifactsView key={selectedSessionId} session={selectedSession} artifacts={artifacts} characters={film.data?.acceptance.characters || []} root={film.data?.acceptance.root || ''} revision={film.progress?.revision || ''} portraitImageModel={film.data?.acceptance.portraitImageModel || ''} progress={film.progress} disabled={chat.busy || sending || !queueBridgeReady} onAskAgent={(text) => {setDrawer('activity'); return askAgent(text, [], false, 'film', {sessionId: selectedSessionId});}} onRefresh={async (sessionId) => {
+          {workspaceView === 'assets' && <ArtifactsView key={selectedSessionId} session={selectedSession} artifacts={artifacts} characters={film.data?.acceptance.characters || []} root={film.data?.acceptance.root || ''} revision={film.progress?.revision || ''} portraitImageModel={film.data?.acceptance.portraitImageModel || ''} progress={film.progress} disabled={chat.busy || sending || !queueBridgeReady} onAskAgent={(text) => {setDrawer('activity'); return askAgent(text, [], false, 'film', {sessionId: selectedSessionId});}} onCreateAsset={(request) => setAssetCreationRequest({sessionId: selectedSessionId, request})} onRefresh={async (sessionId) => {
             if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before refreshing assets.');
             try { await filmRef.current.refresh(); } catch (error) {
               if (selectedSessionIdRef.current === sessionId) setLoadError(error instanceof Error ? error.message : String(error));
@@ -826,6 +829,10 @@ export default function App() {
         </section>
       </div>}
       <DeleteProjectDialog session={pendingDelete} deleting={deleting} onCancel={() => !deleting && setPendingDelete(undefined)} onConfirm={() => void confirmDelete()} />
+      {assetCreationRequest && assetCreationRequest.sessionId === selectedSessionId && selectedSession && <AssetCreationDialog key={assetCreationRequest.sessionId} sessionId={selectedSessionId} projectName={sessionTitle(selectedSession)} root={film.data?.acceptance.root || ''} artifacts={artifacts} characters={film.data?.acceptance.characters || []} request={assetCreationRequest.request} onClose={() => setAssetCreationRequest(undefined)} onRefresh={async (sessionId) => {
+        if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before refreshing assets.');
+        await filmRef.current.refresh();
+      }} />}
       <NewProjectDialog open={newProjectOpen} name={newProjectName} style={newProjectStyle} requirement={newProjectRequirement} error={newProjectError} creating={creatingProject}
         onNameChange={(value) => {setNewProjectName(value); setNewProjectError('');}} onStyleChange={setNewProjectStyle} onRequirementChange={setNewProjectRequirement}
         onCancel={() => {if (!creatingProject) {setNewProjectOpen(false); setNewProjectError('');}}} onConfirm={() => void newProject()} />
@@ -1143,6 +1150,11 @@ function SettingsView() {
 }
 
 const OPENROUTER_IMAGE_MODELS = IMAGE_PROVIDER_PRESETS.openrouter.models;
+const IMAGE_EDITING_MODELS = [
+  {id: 'black-forest-labs/flux-3-image-klein', label: 'Black Forest Labs: FLUX 3 Image Klein'},
+  {id: 'krea/k3-edit', label: 'Krea K3 Edit'},
+  {id: 'qwen/qwen-image-2.1-turbo', label: 'Qwen Image 2.1 Turbo'},
+];
 
 function ConfigSectionEditor({definition, value, onChange, validVideoSettings, disabled, imageResolutionSupported}: {
   definition: {key: keyof AgentConfig['sections']; title: string; description: string};
@@ -1162,6 +1174,8 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
   const customOpenRouterImage = openrouterImage && imageTiers.length === 0;
   const imageResolution = value.resolution || value.effective_resolution || defaultImageResolution(imageProvider || '', value.model);
   const [customImageModel, setCustomImageModel] = useState('');
+  const [customEditingModel, setCustomEditingModel] = useState(false);
+  const editingModelIsCustom = customEditingModel || !IMAGE_EDITING_MODELS.some((model) => model.id === value.editing_model);
   const imageModels = imageProvider === 'agnes' ? IMAGE_PROVIDER_PRESETS.agnes.models : OPENROUTER_IMAGE_MODELS;
   const imageModelIsCustom = customImageModel === value.model || !imageModels.some((model) => model.id === value.model);
   return (
@@ -1193,6 +1207,20 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
         </> : <label><span>Model</span><input value={value.model} list={definition.key === 'video' && value.provider === 'openrouter' ? 'openrouter-video-models' : undefined} onChange={(event) => onChange('model', event.target.value)} />
           {definition.key === 'video' && value.provider === 'openrouter' && <datalist id="openrouter-video-models">{VIDEO_PROVIDER_PRESETS.openrouter.models.map((model) => <option key={model} value={model} />)}</datalist>}
         </label>}
+        {definition.key === 'image' && <>
+          <label><span>Image editing model</span>
+            <select value={editingModelIsCustom ? '@custom' : value.editing_model} onChange={(event) => {
+              const custom = event.target.value === '@custom';
+              setCustomEditingModel(custom);
+              if (!custom) onChange('editing_model', event.target.value);
+            }}>
+              {IMAGE_EDITING_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+              <option value="@custom">Custom model…</option>
+            </select>
+          </label>
+          {editingModelIsCustom && <label><span>Custom editing model ID</span><input value={value.editing_model || ''} onChange={(event) => onChange('editing_model', event.target.value)} /></label>}
+          <p className="config-field-wide">Separate OpenRouter model choice for image editing. Does not change the model used to generate portraits or keyframes.</p>
+        </>}
         {definition.key === 'video' && (
           <label><span>Provider</span>
             <select value={value.provider || 'openrouter'} onChange={(event) => onChange('provider', event.target.value)}>

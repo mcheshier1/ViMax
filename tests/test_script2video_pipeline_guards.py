@@ -428,7 +428,7 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(images.calls, [])
 
 
-    def test_invalid_or_empty_shot_set_overrides_block_frame_preflight_before_image_requests(self):
+    def test_invalid_shot_set_overrides_block_frame_preflight_before_image_requests(self):
         class Images:
             model = "test-image-model"
             reference_limit = 4
@@ -436,7 +436,6 @@ class Script2VideoPipelineGuardTests(unittest.IsolatedAsyncioTestCase):
         for set_ids, error in (
             (["missing"], "unknown set references"),
             (["saloon", "saloon"], "duplicates"),
-            ([], "Assign a set reference"),
         ):
             with self.subTest(set_ids=set_ids), tempfile.TemporaryDirectory() as tmp:
                 working_dir = Path(tmp) / "project" / "script2video"
@@ -1160,7 +1159,7 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
                     only_shots=[2],
                 )
 
-    async def test_scoped_redraw_preserves_future_media_and_rejects_invalidated_predecessor(self):
+    async def test_scoped_redraw_preserves_other_media_and_uses_invalidated_saved_anchor(self):
         class Images:
             reference_limit = 3
 
@@ -1206,14 +1205,99 @@ class ChainedKeyframeTests(unittest.IsolatedAsyncioTestCase):
             )
             for path, original in preserved.items():
                 self.assertEqual(path.read_bytes(), original)
-            (project / "render_acceptance.json").write_text(json.dumps({
-                "script2video": {"shots": {"15": {"keyframes": {"invalidated_at": "changed"}}}},
-            }))
-            with self.assertRaisesRegex(RuntimeError, "invalidated keyframes"):
+            approvals_path = project / "render_acceptance.json"
+            approvals = json.loads(approvals_path.read_text())
+            approvals["script2video"]["shots"] = {"15": {"keyframes": {"invalidated_at": "changed"}}}
+            approvals_path.write_text(json.dumps(approvals))
+            anchor = Path(pipeline.frame_path(15, "last_frame")).read_bytes()
+            pipeline.revision_notes = {"2": "Redraw only this shot."}
+            await pipeline.generate_chained_frames(
+                camera_tree=cameras, shot_descriptions=shots, characters=[],
+                character_portraits_registry={}, only_shots=[2],
+            )
+            source = json.loads(Path(pipeline.selector_output_path(2, "first_frame")).read_text())["continuity_source"]
+            self.assertEqual(source["shot_idx"], 15)
+            self.assertEqual(source["sha256"], hashlib.sha256(anchor).hexdigest())
+            self.assertEqual(Path(pipeline.frame_path(15, "last_frame")).read_bytes(), anchor)
+
+    async def test_saved_endings_anchor_sparse_scope_without_ancestor_validation(self):
+        class Images:
+            reference_limit = 3
+
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_image(self, **kwargs):
+                self.calls.append(kwargs)
+                return Image.new("RGB", (2, 2), (len(self.calls), 0, 0))
+
+        class Video:
+            async def supports_last_frame(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            root = project / "script2video"
+            root.mkdir()
+            order = [0, 15, 2, 8, 7]
+            approve_sets(root, {"saloon": {
+                "name": "Saloon", "description": "Empty timber saloon.",
+                "shots": [str(idx) for idx in order],
+            }})
+            approvals_path = project / "render_acceptance.json"
+            approvals = json.loads(approvals_path.read_text())
+            approvals["script2video"]["shots"] = {
+                "15": {"keyframes": {"invalidated_at": "set changed"}},
+                "2": {"keyframes": {"invalidated_at": "earlier chain changed"}},
+            }
+            approvals_path.write_text(json.dumps(approvals))
+            images = Images()
+            pipeline = Script2VideoPipeline(object(), images, Video(), str(root))
+            pipeline._active_style = "western"
+            pipeline.revision_notes = {}
+            shots = [self._shot(idx, 0) for idx in reversed(order)]
+            cameras = [Camera(idx=0, active_shot_idxs=order)]
+            preserved = {}
+            for idx in (2, 7):
+                for kind in ("first_frame", "last_frame"):
+                    if idx == 2 and kind == "first_frame":
+                        continue
+                    path = Path(pipeline.frame_path(idx, kind))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("RGB", (2, 2), "red").save(path)
+                    preserved[path] = path.read_bytes()
+
+            async def render(scope):
                 await pipeline.generate_chained_frames(
                     camera_tree=cameras, shot_descriptions=shots, characters=[],
-                    character_portraits_registry={}, only_shots=[2],
+                    character_portraits_registry={}, only_shots=scope,
                 )
+
+            await render([8])
+            source_path = Path(pipeline.frame_path(2, "last_frame"))
+            self.assertEqual(Path(pipeline.frame_path(8, "first_frame")).read_bytes(), source_path.read_bytes())
+            self.assertEqual(len(images.calls), 1)
+            for idx in (0, 15):
+                self.assertFalse(Path(pipeline.frame_path(idx, "last_frame")).exists())
+            with self.assertRaisesRegex(RuntimeError, "predecessor shot 0.*missing"):
+                await render([15, 8])
+            self.assertEqual(len(images.calls), 1)
+
+            # A sparse request uses the saved intervening ending, not the last
+            # selected shot's newly generated ending.
+            root_ending = Path(pipeline.frame_path(0, "last_frame"))
+            root_ending.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (2, 2), "green").save(root_ending)
+            pipeline.revision_notes = {"15": "Redraw selected shot.", "8": "Redraw selected shot."}
+            await render([15, 8])
+            for source_idx, target_idx in ((0, 15), (2, 8)):
+                source_path = Path(pipeline.frame_path(source_idx, "last_frame"))
+                self.assertEqual(Path(pipeline.frame_path(target_idx, "first_frame")).read_bytes(), source_path.read_bytes())
+                provenance = json.loads(Path(pipeline.selector_output_path(target_idx, "first_frame")).read_text())["continuity_source"]
+                self.assertEqual(provenance["shot_idx"], source_idx)
+                self.assertEqual(provenance["sha256"], pipeline._sha256_file(str(source_path)))
+            for path, content in preserved.items():
+                self.assertEqual(path.read_bytes(), content)
 
     async def test_explicit_false_overrides_same_camera_automatic_reuse(self):
         class Images:

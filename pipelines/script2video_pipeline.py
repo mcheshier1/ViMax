@@ -832,7 +832,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             and source_slot == self._source_slot(source_idx)
             and self._is_redrawn(source_idx)
         )
-        if source_invalidated and (
+        if source_invalidated and not self._global_chained_keyframes and (
             not source_selected
             or (
                 source_slot == self._source_slot(source_idx)
@@ -944,47 +944,22 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             if shot_idx in by_idx
         }
         wanted = {int(idx) for idx in only_shots} if only_shots is not None else None
-        stop_position = len(ordered) - 1
         if wanted is not None:
             if not wanted:
                 return
             unknown = wanted - by_idx.keys()
             if unknown:
                 raise RuntimeError(f"Unknown chained shot(s): {sorted(unknown)}")
-            positions = [position for position, shot in enumerate(ordered) if shot.idx in wanted]
-            stop_position = positions[-1]
-            excluded_between = [
-                ordered[position].idx for position in range(positions[0], stop_position + 1)
-                if ordered[position].idx not in wanted
-            ]
-            if excluded_between:
-                raise RuntimeError(
-                    f"Chained scope crosses excluded dependent shots {excluded_between}; "
-                    "include those predecessors explicitly in only_shots before rendering."
-                )
-            project_dir = self._continuity_project_dir()
-            acceptance_path = os.path.join(project_dir, "render_acceptance.json")
-            try:
-                with open(acceptance_path, "r", encoding="utf-8") as handle:
-                    acceptance = json.load(handle)
-            except FileNotFoundError:
-                acceptance = {}
-            except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Cannot read chained frame approvals: {exc}") from exc
-            relative = os.path.relpath(self.working_dir, project_dir).split(os.sep)
-            root_store = acceptance.get(relative[0], {})
-            shot_store = root_store.get("shots", {})
-            prefix = "/".join(relative[1:])
-            for position in range(stop_position + 1):
-                shot = ordered[position]
-                if shot.idx in wanted:
+            # Saved endings are independent anchors. Only requested shots and their
+            # immediate input frames matter; no ancestor chain is replayed.
+            for position, shot in enumerate(ordered):
+                if shot.idx not in wanted or position == 0:
                     continue
-                slot = f"{prefix}/{shot.idx}" if prefix else str(shot.idx)
-                record = shot_store.get(slot, {}).get("keyframes", {})
-                if record.get("invalidated_at"):
+                predecessor = ordered[position - 1]
+                if predecessor.idx not in wanted and not os.path.isfile(self.frame_path(predecessor.idx, "last_frame")):
                     raise RuntimeError(
-                        f"Cannot render scoped shot(s) {sorted(wanted)}: excluded predecessor shot {slot} "
-                        "has invalidated keyframes; include it explicitly in only_shots."
+                        f"Cannot render scoped shot {shot.idx}: required predecessor shot {predecessor.idx} "
+                        "last frame is missing; include that predecessor in only_shots."
                     )
         for shot in ordered:
             for kind in ("first_frame", "last_frame"):
@@ -996,21 +971,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             await prepare()
 
         first_shot = ordered[0]
-        first_external = self._playback_predecessors.get(first_shot.idx)
-        if (
-            wanted is not None
-            and first_shot.idx not in wanted
-            and first_external is not None
-            and first_shot.reuse_previous_last_frame is not None
-        ):
-            mode = "reuse" if first_shot.reuse_previous_last_frame else "reframe"
-            self._require_cached_continuity(first_shot.idx, first_external, mode, wanted)
-        if wanted is not None and first_shot.idx not in wanted:
-            if not all(os.path.isfile(self.frame_path(first_shot.idx, kind)) for kind in ("first_frame", "last_frame")):
-                raise RuntimeError(
-                    f"Cannot render scoped shot(s) {sorted(wanted)}: required predecessor shot "
-                    f"{first_shot.idx} keyframes are missing; include that predecessor in only_shots."
-                )
         self._preflight_pending_frame_sets(camera_tree, shot_descriptions, only_shots, chained=True)
         if wanted is None or first_shot.idx in wanted:
             camera = camera_by_shot[first_shot.idx]
@@ -1025,9 +985,10 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 only_shots=[first_shot.idx],
             )
 
-        previous = first_shot
-        for position in range(1, stop_position + 1):
-            shot = ordered[position]
+        for position, shot in enumerate(ordered[1:], start=1):
+            if wanted is not None and shot.idx not in wanted:
+                continue
+            previous = ordered[position - 1]
             previous_last = self.frame_path(previous.idx, "last_frame")
             if not os.path.isfile(previous_last):
                 if wanted is not None and previous.idx not in wanted:
@@ -1046,34 +1007,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             expected_slot = self._source_slot(previous.idx)
             expected_hash = self._sha256_file(previous_last)
             expected_path = Path(os.path.relpath(previous_last, self._continuity_project_dir())).as_posix()
-            if wanted is not None and shot.idx not in wanted:
-                skipped_first = self.frame_path(shot.idx, "first_frame")
-                try:
-                    with open(self.selector_output_path(shot.idx, "first_frame"), "r", encoding="utf-8") as handle:
-                        skipped_source = json.load(handle).get("continuity_source")
-                except (OSError, ValueError, AttributeError):
-                    skipped_source = None
-                if (
-                    not os.path.isfile(skipped_first)
-                    or not isinstance(skipped_source, dict)
-                    or skipped_source.get("shot_idx") != previous.idx
-                    or skipped_source.get("slot") != expected_slot and (
-                        skipped_source.get("slot") is not None or expected_slot.startswith("scene_")
-                    )
-                    or skipped_source.get("path") != expected_path and (
-                        skipped_source.get("path") is not None or expected_slot.startswith("scene_")
-                    )
-                    or skipped_source.get("frame_type") != "last_frame"
-                    or skipped_source.get("sha256") != expected_hash
-                    or skipped_source.get("mode") != expected_mode
-                    or (expected_mode == "reuse" and self._sha256_file(skipped_first) != expected_hash)
-                ):
-                    raise RuntimeError(
-                        f"Cannot render scoped shot(s) {sorted(wanted)}: excluded predecessor shot {shot.idx} "
-                        f"has missing or stale chained keyframes; include it in only_shots."
-                    )
-                previous = shot
-                continue
             first_path = self.frame_path(shot.idx, "first_frame")
             redrawn = self._is_redrawn(shot.idx)
             try:
@@ -1129,7 +1062,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 shot, shot, first_path, characters, character_portraits_registry,
                 progress, frame_type="last_frame",
             )
-            previous = shot
 
     async def _generate_chained_image(
         self,
@@ -1314,8 +1246,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                         f"Cannot render shot {first_shot_idx}: predecessor shot {source_slot} "
                         "last frame is missing; include that predecessor explicitly in the render scope."
                     )
-                if source_slot not in self._continuity_scope and self._continuity_slot_invalidated(source_slot):
-                    raise RuntimeError(f"Cannot render shot {first_shot_idx}: predecessor shot {source_slot} has invalidated keyframes.")
                 source_description = first_predecessor.get("description")
                 if source_description is None:
                     raise RuntimeError(f"Cannot reframe shot {first_shot_idx}: predecessor shot {source_slot} description is missing.")

@@ -97,6 +97,32 @@ describe('agent config store', () => {
 
     expect((await readClipSettings(root)).seconds).toBe(8);
   });
+  it('keeps editing and generation model choices independent across partial and full saves', async () => {
+    const root = await fixture();
+    await writeConfig(root, {
+      image: {
+        model: 'bytedance-seed/seedream-5-0-flash',
+        base_url: 'https://openrouter.ai/api/v1',
+        api_keys: {openrouter: 'image-secret'},
+      },
+    });
+    const initial = await readAgentConfig(root);
+    expect(initial.sections.image.editing_model).toBe('black-forest-labs/flux-3-image-klein');
+    await saveAgentConfig(root, initial);
+    await saveAgentConfig(root, {sections: {image: {editing_model: 'custom/editor'}}});
+    expect((await readStoredConfig(root)).image).toMatchObject({
+      model: 'bytedance-seed/seedream-5-0-flash',
+      editing_model: 'custom/editor',
+      api_keys: {openrouter: 'image-secret'},
+    });
+    await saveAgentConfig(root, {sections: {image: {model: 'qwen/qwen-image-3'}}});
+    expect((await readAgentConfig(root)).sections.image).toMatchObject({
+      model: 'qwen/qwen-image-3',
+      editing_model: 'custom/editor',
+      has_api_key: true,
+    });
+  });
+
 
   it('round-trips image resolution choices without changing video resolution', async () => {
     const root = await fixture();

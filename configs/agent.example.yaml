@@ -9,6 +9,7 @@ llm:
 
 image:
   model: <YOUR_IMAGE_MODEL>
+  editing_model: black-forest-labs/flux-3-image-klein
   base_url: <YOUR_IMAGE_BASE_URL>
   api_key: ''
 

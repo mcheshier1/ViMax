@@ -97,7 +97,7 @@ def build_vimax_adapter_specs(workspace_root: str | Path, session_index: Any) ->
                 "\"sets\" generates only the explicitly selected, character-free set references and stops so they can be reviewed and accepted before stills. It can run independently of portrait approval. "
                 "\"stills\" renders the keyframes video generation will consume and stops for explicit approval before video clips. "
                 "\"video\" renders clips and the final concatenated video. "
-                "Portrait approval gates stills; accepted set references are always required before any missing or redrawn shot image, even with allow_unlocked=true; accepted keyframes gate video. allow_unlocked applies only to existing portrait/keyframe gates, never set references. "
+                "Portrait approval gates stills; every assigned set reference must be accepted before any missing or redrawn shot image, even with allow_unlocked=true; an explicitly empty set_ids binding requires no set reference. Accepted keyframes gate video. allow_unlocked applies only to existing portrait/keyframe gates, never set references. "
                 "Default is \"portraits\". Each phase reuses artifacts that already exist. "
                 "Changing the image model mid-sequence is refused unless allow_model_change=true is passed with explicit user approval. "
                 "render_mode picks which root renders: \"script2video\", \"idea2video\" or \"novel2video\". The chosen root is pinned in render_manifest.json. "
@@ -2110,7 +2110,7 @@ def _invalidate_continuity_dependents(
     root: str,
     changed_slots: list[str] | tuple[str, ...] | set[str] | dict[str, Any] | str | int,
 ) -> list[str]:
-    """Invalidate accepted downstream chain records without moving their media.
+    """Invalidate accepted review records for direct playback successors.
 
     ``changed_slots`` names keyframe-bearing slots whose ending has changed. Playback
     order comes exclusively from the active camera trees, never from shot numbers.
@@ -2124,12 +2124,11 @@ def _invalidate_continuity_dependents(
     else:
         changed = {str(slot) for slot in changed_slots}
     order = _continuity_playback_order(working_dir / root)
-    sources = {slot: index for index, slot in enumerate(order) if slot in changed}
-    first_source = min(sources.values(), default=len(order))
-    dependents = [
-        slot for index, slot in enumerate(order)
-        if index > first_source and slot not in changed
-    ]
+    dependents = []
+    for index, slot in enumerate(order):
+        if slot in changed:
+            if index + 1 < len(order) and order[index + 1] not in changed:
+                dependents.append(order[index + 1])
 
     path = _acceptance_path(working_dir)
     store = _read_acceptance(working_dir)
@@ -2137,11 +2136,10 @@ def _invalidate_continuity_dependents(
     shots_store = root_store.get("shots") if isinstance(root_store.get("shots"), dict) else {}
     now = datetime.now().isoformat(timespec="seconds")
     changed_any = False
-    for index, slot in enumerate(order):
-        if slot not in dependents:
-            continue
+    for slot in dependents:
         shot_store = shots_store.get(slot) if isinstance(shots_store.get(slot), dict) else {}
-        source = next((candidate for candidate in reversed(order[:index]) if candidate in changed), "")
+        position = order.index(slot)
+        source = order[position - 1] if position else ""
         reason = (
             f"Shot {source} has a changed ending; re-review this shot's keyframes and clip "
             "to confirm the continuous handoff."

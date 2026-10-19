@@ -2,12 +2,13 @@ import {useEffect, useMemo, useState} from 'react';
 import {Check, ExternalLink, ImagePlus, Plus, RefreshCw, Save, X} from 'lucide-react';
 import {getAgentConfig, readSetReferences, selectSetReference, updateSetReference, updateSetReferenceAcceptance} from './api';
 import type {SetReference, SetReferenceInventory} from './types';
+import type {AssetCreationRequest} from './AssetCreationDialog';
 import {hasFilmDrafts} from './ShotPlanPanel';
 
 type Draft = {id: string; name: string; description: string; shots: string[]};
 
-export function SetReferencesPanel({sessionId, root, revision, disabled, onGenerate, onPrepare, onRefresh}: {
-  sessionId: string; root: string; revision: string; disabled: boolean; onGenerate: (instruction: string) => Promise<void>; onPrepare: (instruction: string) => Promise<void>; onRefresh?: (sessionId: string) => void | Promise<void>;
+export function SetReferencesPanel({sessionId, root, revision, disabled, onGenerate, onPrepare, onCreateAsset, onRefresh}: {
+  sessionId: string; root: string; revision: string; disabled: boolean; onGenerate: (instruction: string) => Promise<void>; onPrepare: (instruction: string) => Promise<void>; onCreateAsset?: (request: AssetCreationRequest) => void; onRefresh?: (sessionId: string) => void | Promise<void>;
 }) {
   const [inventory, setInventory] = useState<SetReferenceInventory | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
@@ -132,7 +133,7 @@ export function SetReferencesPanel({sessionId, root, revision, disabled, onGener
       <div className="set-reference-list">{[...activeSets, ...Object.values(drafts).filter((draft) => !activeSets.some((set) => set.id === draft.id)).map((draft) => ({...draft, state: 'planned' as const, revision: inventory.revision, candidates: []}))].map((set: SetReference) => {
         const draft = drafts[set.id] ?? draftOf(set as SetReference);
         const changed = isDirty(draft, activeSets.find((item) => item.id === set.id));
-        const imageUrl = set.imagePath ? `/api/artifact?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(set.imagePath)}` : '';
+        const imageUrl = set.imagePath ? `/api/artifact?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(set.imagePath)}&revision=${encodeURIComponent(inventory.revision)}` : '';
         return <article className="set-reference-card" key={set.id}>
           <div className="set-reference-canonical">{imageUrl ? <a href={imageUrl} target="_blank" rel="noreferrer" aria-label={`Open selected reference for ${draft.name || set.id}`}><img className="set-reference-preview" src={imageUrl} alt={`${draft.name || set.id} selected location reference`} /><span><ExternalLink size={13}/> Selected set reference</span></a> : <div className="set-reference-placeholder"><ImagePlus size={22}/><span>No reference image selected</span></div>}</div>
           <div className="set-reference-fields"><div className="set-reference-title"><label>Set name<input value={draft.name} onChange={(event) => updateDraft(set.id, {name: event.target.value})} placeholder="Saloon" maxLength={160}/></label><span className={`set-reference-state state-${set.state}`}>{set.state}</span></div>
@@ -150,6 +151,7 @@ export function SetReferencesPanel({sessionId, root, revision, disabled, onGener
             })}</div> : <p className="set-candidate-empty">No alternatives yet. Image generation only starts after you explicitly authorize a request below.</p>}
             <p className="plan-hint">Use chooses one image; Approve is separate. Choosing a different image clears affected approvals but keeps existing media. Neither action generates images.</p>
             <div className="set-reference-actions"><button type="button" onClick={() => void save(set.id)} disabled={busy || disabled || !changed || !draft.name.trim()}><Save size={14}/> Save</button>
+              {onCreateAsset && activeSets.some((item) => item.id === set.id) && <button type="button" onClick={() => onCreateAsset({type: 'set', destination: {id: set.id, name: set.name || set.id}})}>Generate alternative…</button>}
               {activeSets.some((item) => item.id === set.id) && <button type="button" onClick={() => void submitRequest(true, set.id)} disabled={busy || disabled || !candidateSupport || changed || set.state === 'accepted'}><ImagePlus size={14}/> Request 1 image for {draft.name || set.id}</button>}
               {set.state === 'rendered' && !changed && <button type="button" onClick={() => void review(set as SetReference, true)} disabled={busy || disabled}><Check size={14}/> Approve {draft.name || 'reference'}</button>}
               {set.state === 'accepted' && <button type="button" onClick={() => void review(set as SetReference, false)} disabled={busy || disabled}><X size={14}/> Unlock</button>}

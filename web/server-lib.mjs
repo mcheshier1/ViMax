@@ -2482,6 +2482,7 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
   const clipSettings = await filmClipSettings(repoRoot, workingDir, context);
   return {
     root,
+    chainedKeyframes: await frameContinuityEnabled(workingDir),
     stages,
     characters: discovery.characters,
     portraitImageModel: discovery.portraitImageModel,
@@ -3918,11 +3919,8 @@ async function invalidateTimelineOutputs(
   if (continuityEnabled) {
     if (Array.isArray(orderBefore)) {
       playbackOrder = await filmOrder(workingDir, root);
-      const changedSuffix = timelineOrderChangedSuffix(orderBefore, playbackOrder);
-      invalidatedSlots = [
-        ...changedSuffix,
-        ...(changedSuffix.length || clearShotAcceptance ? shots : []),
-      ];
+      const changedTargets = timelineOrderChangedTargets(orderBefore, playbackOrder);
+      invalidatedSlots = [...changedTargets, ...shots.map(String)];
     } else if (continuitySourceSlots.length) {
       playbackOrder = await filmOrder(workingDir, root);
       invalidatedSlots = [
@@ -4000,21 +3998,23 @@ async function frameContinuityEnabled(workingDir) {
   }
 }
 
-function timelineOrderChangedSuffix(before, after) {
-  let firstChanged = 0;
-  while (firstChanged < before.length && firstChanged < after.length && before[firstChanged] === after[firstChanged]) {
-    firstChanged += 1;
-  }
-  return after.slice(firstChanged);
+function timelineOrderChangedTargets(before, after) {
+  const previousByShot = (order) => new Map(order.map((slot, index) => [slot, index ? order[index - 1] : null]));
+  const beforePrevious = previousByShot(before);
+  const afterPrevious = previousByShot(after);
+  return after.filter((slot) => beforePrevious.get(slot) !== afterPrevious.get(slot));
 }
 
 function continuitySuccessors(order, changedSlots, excluded = new Set()) {
   const changed = new Set(changedSlots.map(String));
-  const firstChanged = order.reduce(
-    (first, slot, index) => changed.has(slot) ? Math.min(first, index) : first,
-    order.length,
-  );
-  return order.slice(firstChanged + 1).filter((slot) => !changed.has(slot) && !excluded.has(slot));
+  const successors = [];
+  for (let index = 0; index < order.length - 1; index += 1) {
+    if (changed.has(order[index])) {
+      const successor = order[index + 1];
+      if (!changed.has(successor) && !excluded.has(successor)) successors.push(successor);
+    }
+  }
+  return successors;
 }
 async function timelineReuseChoices(workingDir, root, slots) {
   const choices = new Map();
@@ -4039,13 +4039,10 @@ async function timelineReuseChoices(workingDir, root, slots) {
 function linkedContinuitySuccessors(order, changedSlots, reuseChoices) {
   const changed = new Set(changedSlots.map(String));
   const invalidated = [];
-  for (let index = 1; index < order.length; index += 1) {
-    const previous = order[index - 1];
-    const slot = order[index];
-    if (changed.has(previous) && reuseChoices.get(slot) === true) {
-      invalidated.push(slot);
-      changed.add(slot);
-    }
+  for (let index = 0; index < order.length - 1; index += 1) {
+    const previous = order[index];
+    const slot = order[index + 1];
+    if (changed.has(previous) && reuseChoices.get(slot) === true) invalidated.push(slot);
   }
   return invalidated;
 }
@@ -4054,12 +4051,8 @@ function changedLinkedContinuityTargets(before, after, reuseChoices) {
   const previousByShot = (order) => new Map(order.map((slot, index) => [slot, index ? order[index - 1] : null]));
   const beforePrevious = previousByShot(before);
   const afterPrevious = previousByShot(after);
-  const changedTargets = after.filter((slot) => reuseChoices.get(slot) === true
+  return after.filter((slot) => reuseChoices.get(slot) === true
     && beforePrevious.get(slot) !== afterPrevious.get(slot));
-  return [...new Set([
-    ...changedTargets,
-    ...linkedContinuitySuccessors(after, changedTargets, reuseChoices),
-  ])];
 }
 
 function continuityInvalidationReason(order, slot, changedSlots) {
@@ -4317,22 +4310,27 @@ export async function readSetReferences(repoRoot, sessionId, requestedRoot = '')
     slot,
     brief,
     setIds: setIdsOverride ?? sets.filter((set) => defaults.get(set.id)?.includes(slot)).map((set) => set.id),
+    setBindingExplicit: setIdsOverride !== null,
   }));
   const activeShots = shots.map(({slot}) => slot);
   const knownSetIds = new Set(sets.map(({id}) => id));
   const unassignedShots = shots
-    .filter(({setIds}) => !setIds.some((id) => knownSetIds.has(id)))
+    .filter(({setIds, setBindingExplicit}) => setIds.some((id) => !knownSetIds.has(id))
+      || (!setBindingExplicit && !setIds.some((id) => knownSetIds.has(id))))
     .map(({slot}) => slot);
   const revision = createHash('sha256').update(JSON.stringify([
     root, model, style, sets.map(({id, revision: rev}) => [id, rev]),
-    shots.map(({slot, setIds}, index) => [slot, setIds, rawShots[index].setIdsOverride]), activeShots, unassignedShots,
+    shots.map(({slot, setIds, setBindingExplicit}, index) => [slot, setIds, setBindingExplicit, rawShots[index].setIdsOverride]), activeShots, unassignedShots,
   ])).digest('hex');
   return {sessionId, root, revision, imageModel: model, style, sets, shots, unassignedShots};
 }
 
 function shotSetIdsOverride(description) {
   if (!isPlainObject(description) || !Object.hasOwn(description, 'set_ids') || description.set_ids === null) return null;
-  return Array.isArray(description.set_ids) ? description.set_ids.filter((id) => typeof id === 'string') : [];
+  if (!Array.isArray(description.set_ids) || !description.set_ids.every((id) => typeof id === 'string' && SET_ID_PATTERN.test(id))) {
+    throw acceptanceError('Shot set_ids must be an array of valid set IDs');
+  }
+  return description.set_ids;
 }
 
 async function setInventoryShotSlots(workingDir, root, discovery, context) {
@@ -4594,6 +4592,155 @@ export async function selectSetReference(repoRoot, input = {}, isBusy = () => fa
   });
 }
 
+/** Apply a browser-reviewed PNG as the active set reference without a provider call. */
+export async function applySetReferenceImage(repoRoot, input = {}, isBusy = () => false) {
+  const body = isPlainObject(input) ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    if (isBusy()) throw conflictError('Wait for active and queued requests to finish before applying a set image');
+    const inventory = await readSetReferences(repoRoot, sessionId, body.root);
+    if (!inventory) return null;
+    if (body.revision !== inventory.revision) throw conflictError('Set references changed; refresh before applying an image');
+    const name = body.name;
+    if (typeof body.id === 'string' && !SET_ID_PATTERN.test(body.id)) throw acceptanceError('id must be a safe immutable set identifier');
+    if (body.id === undefined && (typeof name !== 'string' || !name.trim() || name.length > 160)) {
+      throw acceptanceError('name must be 1–160 characters for a new set');
+    }
+    if (body.name !== undefined && (typeof name !== 'string' || !name.trim() || name.length > 160)) {
+      throw acceptanceError('name must be 1–160 characters');
+    }
+    if (typeof body.sourcePath !== 'string' || !body.sourcePath.trim()) throw acceptanceError('sourcePath is required');
+    if (typeof body.pngBase64 !== 'string' || !body.pngBase64 || body.pngBase64.length > 44 * 1024 * 1024
+      || body.pngBase64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(body.pngBase64)) {
+      throw acceptanceError('pngBase64 must contain a bounded, valid base64 PNG');
+    }
+    const imageBytes = Buffer.from(body.pngBase64, 'base64');
+    if (imageBytes.length > 32 * 1024 * 1024 || !isCompletePng(imageBytes)) throw acceptanceError('Applied set image must be a complete PNG within the 32 MB size limit');
+    let crop;
+    if (body.crop !== undefined) {
+      const {x, y, width, height} = body.crop ?? {};
+      if (!isPlainObject(body.crop) || ![x, y, width, height].every(Number.isFinite)
+        || x < 0 || y < 0 || width <= 0 || height <= 0 || x + width > 100 || y + height > 100) {
+        throw acceptanceError('crop must be a positive percentage rectangle within the source image');
+      }
+      crop = {x, y, width, height};
+    }
+    const sourceRelative = safeSessionRelativePath(body.sourcePath);
+    const sourceAbsolute = path.resolve(workingDir, sourceRelative);
+    if (!isPathInside(workingDir, sourceAbsolute) || !IMAGE_EXTENSIONS.has(path.extname(sourceRelative).toLowerCase())) {
+      throw acceptanceError('sourcePath must name an allowed project image');
+    }
+    await assertSafeRegularFile(workingDir, sourceAbsolute);
+    const sourceInfo = await lstat(sourceAbsolute);
+    if (sourceInfo.size > 100 * 1024 * 1024) throw acceptanceError('sourcePath exceeds the 100 MB image limit');
+    const sourceBytes = await readFile(sourceAbsolute);
+    if (!isGenuineImage(sourceBytes, path.extname(sourceRelative).toLowerCase())) {
+      throw acceptanceError('sourcePath is not a genuine image file');
+    }
+    const sourceSha256 = createHash('sha256').update(sourceBytes).digest('hex');
+    const manifest = await readRenderManifest(repoRoot, workingDir);
+    const model = String(manifest?.image_model ?? inventory.imageModel ?? '');
+    const modelSlug = model ? safePathComponent(model) : '';
+    if (!modelSlug) throw conflictError('A current image model is required before applying a set image');
+    let set = typeof body.id === 'string' ? inventory.sets.find((item) => item.id === body.id) : null;
+    if (body.id && !set) throw acceptanceError('Unknown set identifier');
+    const id = set?.id ?? randomUUID();
+    if (set) {
+      if (body.name !== undefined && body.name.trim() !== set.name) throw acceptanceError('An existing set name cannot be changed while applying its image');
+    } else {
+      set = {id, name: name.trim(), description: `Imported set reference for ${name.trim()}.`, shots: []};
+    }
+    const base = path.join(workingDir, inventory.root, 'set_references', id);
+    const descriptorPath = path.join(base, 'set.json');
+    const descriptorBytes = set ? await readFile(descriptorPath).catch(() => null) : null;
+    const descriptor = descriptorBytes ?? Buffer.from(`${JSON.stringify({id, name: set.name, description: set.description, shots: []}, null, 2)}\n`);
+    const specSha256 = createHash('sha256').update(descriptor).digest('hex');
+    const modelDir = path.join(base, modelSlug);
+    const canonicalImage = path.join(modelDir, 'reference.png');
+    const canonicalProvenance = path.join(modelDir, 'provenance.json');
+    const imageExists = await pathExists(canonicalImage);
+    const provenanceExists = await pathExists(canonicalProvenance);
+    if (imageExists && !await safeSetFile(workingDir, canonicalImage)
+      || provenanceExists && !await safeSetFile(workingDir, canonicalProvenance)) {
+      throw acceptanceError('Set reference files are unsafe');
+    }
+    const [previousImage, previousProvenance] = await Promise.all([
+      imageExists ? readFile(canonicalImage) : null,
+      provenanceExists ? readFile(canonicalProvenance) : null,
+    ]);
+    const importedAt = isoSeconds();
+    const provenance = Buffer.from(`${JSON.stringify({
+      image_model: model,
+      style: inventory.style,
+      spec_sha256: specSha256,
+      source_import: {source_path: sourceRelative, source_sha256: sourceSha256,
+        ...(crop ? {crop, crop_units: 'percent'} : {}), imported_at: importedAt},
+    }, null, 2)}\n`);
+    const store = await readAcceptanceFile(workingDir);
+    const rootStore = isPlainObject(store[inventory.root]) ? store[inventory.root] : {};
+    const setRecords = isPlainObject(rootStore.sets) ? rootStore.sets : {};
+    delete setRecords[id];
+    rootStore.sets = setRecords;
+    store[inventory.root] = rootStore;
+    const boundShots = inventory.shots.filter((shot) => shot.setIds.includes(id)).map(({slot}) => slot);
+    await withMutationTransaction(async (transaction) => {
+      await ensureSetModelDirectory(workingDir, inventory.root, id, modelSlug, transaction);
+      if (!descriptorBytes) await transaction.write(descriptorPath, descriptor);
+      if (previousImage && isCompletePng(previousImage)) {
+        const candidateId = randomUUID().replaceAll('-', '');
+        const candidatePath = path.join(modelDir, `candidate_${candidateId}.png`);
+        const candidateMeta = path.join(modelDir, `candidate_${candidateId}.json`);
+        let prior = {};
+        try { prior = previousProvenance ? JSON.parse(previousProvenance.toString('utf8')) : {}; } catch {}
+        await transaction.write(candidatePath, previousImage);
+        await transaction.write(candidateMeta, Buffer.from(`${JSON.stringify({
+          image_model: model, style: inventory.style, spec_sha256: specSha256, candidate_id: candidateId,
+          prompt: 'Not generated; preserved previous canonical reference.',
+          source_import: prior.source_import ?? {preserved_canonical: true},
+        }, null, 2)}\n`));
+      }
+      await transaction.write(canonicalImage, imageBytes);
+      await transaction.write(canonicalProvenance, provenance);
+      await invalidateSetBoundShots(workingDir, inventory.root, boundShots, store, transaction);
+      const artifacts = await acceptanceArtifacts(workingDir, [
+        path.relative(workingDir, descriptorPath), path.relative(workingDir, canonicalImage),
+        path.relative(workingDir, canonicalProvenance),
+      ]);
+      setRecords[id] = {accepted_at: importedAt, artifacts};
+      await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
+    });
+    return readSetReferences(repoRoot, sessionId, inventory.root);
+  });
+}
+
+async function ensureSetModelDirectory(workingDir, root, id, modelSlug, transaction) {
+  let current = workingDir;
+  for (const component of [root, 'set_references', id, modelSlug]) {
+    current = path.join(current, component);
+    const info = await lstat(current).catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (info && (!info.isDirectory() || await realpath(current) !== path.resolve(current))) {
+      throw acceptanceError('Set reference directory is unsafe');
+    }
+    if (!info) await transaction.mkdir(current);
+  }
+}
+
+function isGenuineImage(bytes, extension) {
+  if (extension === '.png') return isCompletePng(bytes);
+  if (extension === '.jpg' || extension === '.jpeg') return bytes.length >= 4
+    && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes.at(-2) === 0xff && bytes.at(-1) === 0xd9;
+  if (extension === '.gif') return bytes.length >= 14 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6));
+  if (extension === '.webp') return bytes.length >= 16 && bytes.toString('ascii', 0, 4) === 'RIFF'
+    && bytes.toString('ascii', 8, 12) === 'WEBP' && bytes.readUInt32LE(4) + 8 <= bytes.length;
+  return false;
+}
+
 export async function updateSetReferenceAcceptance(repoRoot, input = {}) {
   const body = isPlainObject(input) ? input : {};
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
@@ -4655,19 +4802,14 @@ export async function updateSetReferenceAcceptance(repoRoot, input = {}) {
 async function invalidateSetBoundShots(workingDir, root, shots, store, transaction) {
   const affected = [...new Set(shots.map(String))];
   if (!affected.length) return;
-  const playbackOrder = await filmOrder(workingDir, root);
-  const reuseChoices = await timelineReuseChoices(workingDir, root, playbackOrder);
-  const linkedSuccessors = linkedContinuitySuccessors(playbackOrder, affected, reuseChoices);
   const rootStore = isPlainObject(store[root]) ? store[root] : {};
   const shotStore = isPlainObject(rootStore.shots) ? rootStore.shots : {};
   const now = isoSeconds();
-  for (const slot of [...new Set([...affected, ...linkedSuccessors])]) {
+  for (const slot of affected) {
     const record = isPlainObject(shotStore[slot]) ? shotStore[slot] : {};
     for (const stage of ['keyframes', 'clips']) {
       if (isPlainObject(record[stage])) record[stage] = {...record[stage], invalidated_at: now,
-        invalidation_reason: affected.includes(slot)
-          ? 'A bound set reference changed; re-review this shot.'
-          : 'An earlier linked keyframe changed; re-review this shot.'};
+        invalidation_reason: 'A bound set reference changed; re-review this shot.'};
     }
     if (Object.keys(record).length) shotStore[slot] = record;
   }

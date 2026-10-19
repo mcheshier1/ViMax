@@ -359,6 +359,27 @@ class AcceptanceGateTests(unittest.TestCase):
             # stills run cannot excuse portraits nobody has accepted.
             self.assertIsNotNone(_acceptance_refusal(working, "script2video", "stills", [0]))
 
+    def test_still_admission_allows_only_explicit_empty_set_binding_without_defaults(self):
+        from agent_runtime.vimax_adapters import _set_image_acceptance_refusal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, _ = self._session(tmp)
+            shot = working / "script2video" / "shots" / "1" / "shot_description.json"
+            shot.write_text(json.dumps({"idx": 1, "set_ids": []}), encoding="utf-8")
+
+            self.assertIsNone(_set_image_acceptance_refusal(
+                working, "script2video", "stills", "unknown-image-model", "cinematic", [1], None,
+            ))
+
+            for description in ({"idx": 1}, {"idx": 1, "set_ids": None}):
+                with self.subTest(description=description):
+                    shot.write_text(json.dumps(description), encoding="utf-8")
+                    refusal = _set_image_acceptance_refusal(
+                        working, "script2video", "stills", "unknown-image-model", "cinematic", [1], None,
+                    )
+                    self.assertIsNotNone(refusal)
+                    self.assertEqual(refusal["error_type"], "set_approval_required")
+
     def test_stills_redraw_does_not_wait_for_keyframe_approval(self):
         from agent_runtime.vimax_adapters import _acceptance_refusal
 
@@ -412,33 +433,36 @@ class AcceptanceGateTests(unittest.TestCase):
             self.assertIn("stale", [item["state"] for item in refusal["unaccepted"]])
 
 
-    def test_continuity_redraw_invalidates_playback_successors_without_touching_unrelated_slots(self):
+    def test_continuity_redraw_invalidates_only_direct_playback_successor(self):
         from agent_runtime.vimax_adapters import (
             _acceptance_slots,
             _invalidate_continuity_dependents,
-            _mark_slots_redone,
             _slot_state,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
             working, _ = self._session(tmp)
             root = working / "script2video"
-            # Playback is 1 then 0; slot 2 is planned and accepted but inactive.
+            # Playback crosses camera boundaries and follows stored order, not IDs.
             (root / "camera_tree.json").write_text(json.dumps([
-                {"idx": 0, "active_shot_idxs": [1]},
-                {"idx": 2, "active_shot_idxs": [0]},
+                {"idx": 0, "active_shot_idxs": [9]},
+                {"idx": 2, "active_shot_idxs": [2]},
+                {"idx": 5, "active_shot_idxs": [7]},
             ]), encoding="utf-8")
-            inactive = root / "shots" / "2"
+            inactive = root / "shots" / "8"
             inactive.mkdir(parents=True)
             (inactive / "shot_description.json").write_text("{}", encoding="utf-8")
             (inactive / "qwen_qwen-image-3").mkdir()
             (inactive / "qwen_qwen-image-3" / "first_frame.png").write_bytes(b"frame")
 
             records = {"shots": {}}
-            for shot in ("0", "1", "2"):
+            for shot in ("9", "2", "7", "8"):
                 shot_dir = root / "shots" / shot
                 model_dir = shot_dir / "kwaivgi_kling-video-o1"
                 model_dir.mkdir(parents=True, exist_ok=True)
+                (shot_dir / "shot_description.json").write_text("{}", encoding="utf-8")
+                (shot_dir / "qwen_qwen-image-3").mkdir(exist_ok=True)
+                (shot_dir / "qwen_qwen-image-3" / "first_frame.png").write_bytes(f"frame-{shot}".encode())
                 clip = model_dir / "video.mp4"
                 clip.write_bytes(f"clip-{shot}".encode())
                 records["shots"][shot] = {
@@ -452,30 +476,20 @@ class AcceptanceGateTests(unittest.TestCase):
             (working / "render_acceptance.json").write_text(json.dumps({"script2video": records}), encoding="utf-8")
             (working / "frame_continuity.json").write_text(json.dumps({"mode": "chained_keyframes"}), encoding="utf-8")
 
-            self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["1"]), ["0"])
+            self.assertEqual(_invalidate_continuity_dependents(working, "script2video", ["9"]), ["2"])
             slots = _acceptance_slots(working, "script2video")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "stale")
-            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["1"]), "accepted")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["2"]), "accepted")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["2"]), "stale")
+            self.assertEqual(_slot_state(working, slots["clips"]["2"]), "stale")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["9"]), "accepted")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["7"]), "accepted")
+            self.assertEqual(_slot_state(working, slots["keyframes"]["8"]), "accepted")
             self.assertEqual(_slot_state(working, slots["final_video"]["final_video"]), "stale")
             invalidated = json.loads((working / "render_acceptance.json").read_text(encoding="utf-8"))["script2video"]
-            self.assertIn("continuous handoff", invalidated["shots"]["0"]["keyframes"]["invalidation_reason"])
+            self.assertIn("continuous handoff", invalidated["shots"]["2"]["keyframes"]["invalidation_reason"])
             self.assertEqual(invalidated["final_video"]["accepted_at"], "reviewed")
             self.assertTrue((root / "final_video.mp4").exists())
-            self.assertTrue((root / "shots" / "0" / "kwaivgi_kling-video-o1" / "video.mp4").exists())
-            self.assertTrue((root / "shots" / "0" / "qwen_qwen-image-3" / "first_frame.png").exists())
-
-            _mark_slots_redone(working, "script2video", {"1": "keyframes"}, {})
-            slots = _acceptance_slots(working, "script2video")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["1"]), "rendered")
-            self.assertEqual(_slot_state(working, slots["clips"]["1"]), "stale")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "stale")
-            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
-            _mark_slots_redone(working, "script2video", {"0": "keyframes"}, {})
-            slots = _acceptance_slots(working, "script2video")
-            self.assertEqual(_slot_state(working, slots["keyframes"]["0"]), "rendered")
-            self.assertEqual(_slot_state(working, slots["clips"]["0"]), "stale")
+            self.assertTrue((root / "shots" / "2" / "kwaivgi_kling-video-o1" / "video.mp4").exists())
+            self.assertTrue((root / "shots" / "7" / "kwaivgi_kling-video-o1" / "video.mp4").exists())
 
     def test_continuity_invalidation_is_disabled_without_the_root_setting(self):
         from agent_runtime.vimax_adapters import _acceptance_slots, _invalidate_continuity_dependents, _slot_state

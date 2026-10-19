@@ -131,6 +131,19 @@ def effective_set_ids(
     return selected
 
 
+def _has_explicit_empty_set_binding(render_root: str | Path, slot: str) -> bool:
+    directory = shot_directories(render_root).get(slot)
+    if directory is None:
+        return False
+    try:
+        data = json.loads((directory / "shot_description.json").read_bytes())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("set_ids") == []
+
+
+
+
 def validate_set_coverage(render_root: str | Path, slots: list[str] | None = None) -> tuple[dict[str, dict[str, Any]], list[str]]:
     specs, errors = read_set_specs(render_root)
     active = set(active_shot_slots(render_root))
@@ -145,13 +158,15 @@ def validate_set_coverage(render_root: str | Path, slots: list[str] | None = Non
     uncovered = []
     for slot in sorted(requested & active, key=_slot_sort):
         try:
-            if not effective_set_ids(render_root, slot, specs):
+            if not effective_set_ids(render_root, slot, specs) and not _has_explicit_empty_set_binding(render_root, slot):
                 uncovered.append(slot)
         except ValueError as exc:
             errors.append(str(exc))
     if uncovered:
         errors.append("Assign a set reference to these shots: " + ", ".join(uncovered))
     return specs, errors
+
+
 
 
 
@@ -288,15 +303,17 @@ def accepted_set_references(working_dir: str | Path, slot: str, style: str, imag
     specs, errors = validate_set_coverage(root, [slot])
     if errors:
         raise RuntimeError("Set references are not ready: " + "; ".join(errors))
+    set_ids = effective_set_ids(root, slot, specs)
+    if not set_ids:
+        return []
     store = _approval_store(root.parent)
     references = []
-    for set_id in effective_set_ids(root, slot, specs):
+    for set_id in set_ids:
         spec = specs[set_id]
         image = _accepted_reference(root, spec, style, image_model, store)
         references.append((str(image), f"Approved set reference: {spec['name']}. Preserve its architecture, layout, props and lighting. {spec['description']}"))
-    if not references:
-        raise RuntimeError(f"Shot {slot} needs an assigned and accepted set reference")
     return references
+
 
 
 def _atomic_json(path: Path, value: Any) -> None:

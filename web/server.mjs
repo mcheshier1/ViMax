@@ -9,7 +9,7 @@ import {performance} from 'node:perf_hooks';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
 import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
 import {createAgentMessageQueue} from './agent-message-queue.mjs';
-import {approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, selectPortraitCharacter, selectSetReference, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
+import {applySetReferenceImage, approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, selectPortraitCharacter, selectSetReference, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
 import {getShotRestartPlan, restartShot} from './server-lib.mjs';
 import {BoundedPerformanceLog, createBridgeStreamState, isSseBackpressureExceeded, safeRuntimePerformanceRecord, validateAgentMetricsPayload} from './bridge-streaming.mjs';
 
@@ -195,6 +195,14 @@ const server = createServer(async (request, response) => {
       catch (error) { return sendJson(response, 400, {error: error.message}); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(response, 400, {error: 'A JSON object body is required'});
       const payload = await selectSetReference(repoRoot, body, () => agentQueue.hasWorkFor(body.sessionId));
+      return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+    }
+    if (url.pathname === '/api/set-reference-image' && request.method === 'POST') {
+      let body;
+      try { body = await readSmallJsonBody(request, 48 * 1024 * 1024); }
+      catch (error) { return sendJson(response, error.statusCode || 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return sendJson(response, 400, {error: 'A JSON object body is required'});
+      const payload = await applySetReferenceImage(repoRoot, body, () => agentQueue.hasWorkFor(body.sessionId));
       return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
     }
     if (url.pathname === '/api/set-references/acceptance' && request.method === 'PUT') {
@@ -441,6 +449,9 @@ const server = createServer(async (request, response) => {
       response.writeHead(200, {'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600'});
       createReadStream(path.join(repoRoot, 'assets', 'vimax.png')).pipe(response);
       return;
+    }
+    if (url.pathname.startsWith('/api/')) {
+      return sendJson(response, 404, {error: `Unknown API endpoint: ${request.method} ${url.pathname}. If the web server was recently updated, restart it when idle and reload the page.`});
     }
     if (vite) {
       vite.middlewares(request, response, () => sendJson(response, 404, {error: 'Not found'}));

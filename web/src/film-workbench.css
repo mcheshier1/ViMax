@@ -45,6 +45,7 @@
 .film-preview-missing { display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; min-height: 190px; padding: 24px; color: var(--muted); text-align: center; font-size: 13px; }
 .film-preview .film-preview-missing { color: #a9b1bc; }
 .film-expand { position: absolute; right: 10px; top: 10px; display: flex; gap: 5px; align-items: center; color: #f5f7fb; background: #101318cf; border: 1px solid #ffffff40; border-radius: 5px; padding: 7px; font-size: 11px; }
+.film-create-asset { position: absolute; left: 10px; bottom: 10px; padding: 8px 10px; color: #f5f7fb; background: #101318e8; border: 1px solid #ffffff60; border-radius: 5px; font-size: 11px; cursor: pointer; }
 .film-preview.is-expanded { position: fixed; inset: 20px; width: auto; height: auto; max-height: none; aspect-ratio: auto; z-index: 120; border-radius: 8px; box-shadow: 0 0 0 40px #000b; }
 .film-preview.is-expanded > img, .film-preview.is-expanded > video { max-height: calc(100dvh - 40px); }
 .film-session-thumbs { display: flex; gap: 6px; overflow-x: auto; padding: 10px; }

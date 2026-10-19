@@ -178,7 +178,7 @@ describe('adding a suggested shot', () => {
     for (const slot of slots) expect((await shotDescription(working, slot)).idx).toBe(Number(slot));
   });
 
-  it('invalidates accepted assemblies on create and reorder and keeps endings canonical', async () => {
+  it('invalidates accepted assemblies on create and changed adjacency targets on reorder', async () => {
     const {root, working} = await fixture();
     const finalFilm = path.join(working, ROOT, 'final_video.mp4');
     await writeFile(finalFilm, 'old film');
@@ -195,13 +195,23 @@ describe('adding a suggested shot', () => {
 
     await writeFile(finalFilm, 'old film after add');
     await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, stage: 'final_video', accepted: true});
+    await writeFile(path.join(working, 'frame_continuity.json'), JSON.stringify({mode: 'chained_keyframes'}));
+    const approval = {accepted_at: 'reviewed', artifacts: []};
+    const shots = Object.fromEntries(['2', '4', created.created.slot].map((slot) => [slot, {
+      keyframes: {...approval}, clips: {...approval},
+    }]));
+    await writeFile(path.join(working, 'render_acceptance.json'), JSON.stringify({[ROOT]: {shots}}));
     await moveShot(root, {sessionId: SESSION_ID, root: ROOT, slot: '2', after: created.created.slot});
 
     expect(await readFile(finalFilm).catch(() => null)).toBeNull();
     acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
     expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('planned');
-    const endingDescriptions = await Promise.all(['2', '4', created.created.slot].map((slot) => shotDescription(working, slot)));
-    expect(endingDescriptions.filter((plan) => plan.is_last).map((plan) => String(plan.idx))).toEqual(['2']);
+    const saved = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    for (const slot of ['4', '2']) {
+      expect(saved.shots[slot].keyframes.invalidated_at).toBeTruthy();
+      expect(saved.shots[slot].clips.invalidated_at).toBeTruthy();
+    }
+    expect(saved.shots[created.created.slot]).toEqual(shots[created.created.slot]);
     expect((await storyboard(working)).filter((row) => row.is_last).map((row) => String(row.idx))).toEqual(['2']);
   });
 });

@@ -81,13 +81,40 @@ class SetReferenceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "office"):
             accepted_set_references(self.root, "1", self.style, self.model)
 
+    def test_explicit_empty_binding_opts_out_but_missing_or_null_still_need_defaults(self):
+        shot = self.root / "shots" / "0" / "shot_description.json"
+        shot.write_text(json.dumps({"idx": 0, "set_ids": []}))
+        self.assertEqual(effective_set_ids(self.root, "0"), [])
+        self.write_spec("saloon", [])
+        self.assertEqual(validate_set_coverage(self.root, ["0"])[1], [])
+        self.assertEqual(accepted_set_references(self.root, "0", self.style, self.model), [])
+
+        for description in ({"idx": 0}, {"idx": 0, "set_ids": None}):
+            with self.subTest(description=description):
+                shot.write_text(json.dumps(description))
+                self.assertTrue(validate_set_coverage(self.root, ["0"])[1])
+                with self.assertRaisesRegex(RuntimeError, "Assign a set reference"):
+                    accepted_set_references(self.root, "0", self.style, self.model)
+
+        shot.write_text(json.dumps({"idx": 0, "set_ids": "saloon"}))
+        with self.assertRaisesRegex(RuntimeError, "must be a list of safe set IDs"):
+            accepted_set_references(self.root, "0", self.style, self.model)
+
+    def test_bound_rejected_set_still_blocks_still_reference_admission(self):
+        self.approve("saloon")
+        store_path = self.session / "render_acceptance.json"
+        store = json.loads(store_path.read_text())
+        store["script2video"]["sets"]["saloon"]["rejected_at"] = "2026-01-02T00:00:00Z"
+        store_path.write_text(json.dumps(store))
+        with self.assertRaisesRegex(RuntimeError, "not accepted"):
+            accepted_set_references(self.root, "0", self.style, self.model)
+
     def test_scoped_coverage_does_not_require_unrelated_unassigned_shots(self):
         self.write_spec("office", [])
         self.approve("saloon")
         self.assertEqual(validate_set_coverage(self.root, ["0"])[1], [])
         self.assertTrue(validate_set_coverage(self.root)[1])
         self.assertEqual(len(accepted_set_references(self.root, "0", self.style, self.model)), 1)
-
     def test_description_image_and_approval_mutations_fail_closed(self):
         image = self.approve("saloon")
         image.write_bytes(b"not a PNG")
@@ -267,8 +294,6 @@ class SetReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(errors, [])
         self.assertEqual(effective_set_ids(self.root, "0", specs), ["office"])
         self.assertEqual(effective_set_ids(self.root, "1", specs), [])
-        _, errors = validate_set_coverage(self.root)
-        self.assertTrue(any("Assign a set reference" in error for error in errors))
 
         shot_zero.write_text(json.dumps({"idx": 0, "set_ids": ["office", "office"]}))
         with self.assertRaisesRegex(RuntimeError, "duplicates"):

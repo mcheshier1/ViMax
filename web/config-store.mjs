@@ -5,7 +5,7 @@ import {credentialProvider} from './provider-credentials.mjs';
 
 const SECTION_FIELDS = {
   llm: ['model_provider', 'model', 'base_url'],
-  image: ['model', 'base_url', 'resolution'],
+  image: ['model', 'editing_model', 'base_url', 'resolution'],
   video: ['provider', 'model', 'base_url', 'resolution', 'clip_seconds', 'generate_audio'],
   embedding: ['model_provider', 'model', 'base_url'],
   reranker: ['model', 'base_url'],
@@ -181,6 +181,7 @@ function publicConfig(payload, effectiveSeconds, effectiveResolution) {
     result.configured_api_key_providers = Object.keys(apiKeys);
     sections[section] = result;
     if (section === 'image') result.effective_resolution = effectiveResolution;
+    if (section === 'image' && !result.editing_model) result.editing_model = 'black-forest-labs/flux-3-image-klein';
     if (section === 'video') result.effective_clip_seconds = String(effectiveSeconds);
   }
   return {sections};

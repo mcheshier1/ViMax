@@ -111,6 +111,7 @@ export type RenderAcceptance = {
   totals: AcceptanceTotals;
   characters: FilmCharacter[];
   portraitImageModel: string;
+  chainedKeyframes?: boolean;
 };
 
 export type ShotRestartPlan = {
@@ -141,7 +142,7 @@ export type SetReference = {
   revision: string;
 };
 
-export type SetReferenceShot = {slot: string; brief: string; setIds: string[]};
+export type SetReferenceShot = {slot: string; brief: string; setIds: string[]; setBindingExplicit: boolean};
 
 export type SetReferenceInventory = {
   sessionId: string;
@@ -328,6 +329,7 @@ export type ProjectUpdateResponse = {
 export type ConfigSection = {
   model_provider?: string;
   model: string;
+  editing_model?: string;
   base_url: string;
   api_key: string;
   has_api_key: boolean;

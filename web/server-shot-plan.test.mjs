@@ -220,7 +220,7 @@ describe('shot plans', () => {
     expect(await readFile(acceptancePath)).toEqual(acceptanceBefore);
   });
 
-  it('invalidates explicitly linked successors after an ending edit when global chaining is off', async () => {
+  it('invalidates only direct linked successors after an ending edit when global chaining is off', async () => {
     const {root, working} = await fixture();
     await withContinuityFilm(working);
     await rm(path.join(working, 'frame_continuity.json'));
@@ -237,13 +237,13 @@ describe('shot plans', () => {
     const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
     expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
     expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
   });
 
-  it('invalidates linked approvals on a toggle without deleting frame, clip, or final media', async () => {
+  it('invalidates only the immediate linked successor when ending reuse is toggled', async () => {
     const {root, working} = await fixture();
     await withContinuityFilm(working);
     await rm(path.join(working, 'frame_continuity.json'));
@@ -269,7 +269,7 @@ describe('shot plans', () => {
     expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
     expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
     expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
     expect(await Promise.all(keepPaths.map((file) => readFile(path.join(working, file))))).toEqual(before);
   });
@@ -436,7 +436,7 @@ describe('shot plans', () => {
 });
 
 describe('continuous keyframe approvals', () => {
-  it('stales playback successors after a last-frame plan edit and lets an explicit review accept only its target', async () => {
+  it('stales only the immediate successor after a last-frame edit and preserves later reviews', async () => {
     const {root, working} = await fixture();
     await withContinuityFilm(working);
 
@@ -448,9 +448,9 @@ describe('continuous keyframe approvals', () => {
     let acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
     expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'keyframes', '3').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('rendered');
     expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
@@ -472,10 +472,10 @@ describe('continuous keyframe approvals', () => {
     });
     expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('accepted');
   });
 
-  it('invalidates the successor chain after a structural removal without erasing dependent evidence', async () => {
+  it('invalidates only changed adjacency after removal without erasing dependent evidence', async () => {
     const {root, working} = await fixture();
     await withContinuityFilm(working);
 
@@ -483,7 +483,7 @@ describe('continuous keyframe approvals', () => {
 
     expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('accepted');
     const store = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
     expect(store.shots['2'].keyframes).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
@@ -507,7 +507,7 @@ describe('continuous keyframe approvals', () => {
 
     expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '2').state).toBe('stale');
-    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'keyframes', '0').state).toBe('accepted');
     expect(timelineSlot(acceptance, 'keyframes', '4').state).toBe('accepted');
     expect(await readFile(path.join(working, ROOT, '.removed_shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
       .toBe('clip-7');

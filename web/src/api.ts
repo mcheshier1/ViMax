@@ -124,6 +124,13 @@ export async function selectSetReference(payload: SetReferenceSelectionRequest) 
 export async function updateSetReferenceAcceptance(payload: SetReferenceAcceptanceRequest) {
   return request<SetReferenceInventory>('/api/set-references/acceptance', {method: 'PUT', body: JSON.stringify(payload)});
 }
+
+export async function applySetReferenceImage(payload: {
+  sessionId: string; root: string; revision: string; id?: string; name?: string;
+  sourcePath: string; pngBase64: string; crop?: {x: number; y: number; width: number; height: number};
+}) {
+  return request<SetReferenceInventory>('/api/set-reference-image', {method: 'POST', body: JSON.stringify(payload)});
+}
 export type AssembleRequest = {sessionId: string; root: string; revision?: string};
 export type AssembleResponse = {path: string; reused: boolean; shotCount: number};
 
@@ -265,7 +272,12 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: {'Content-Type': 'application/json', ...(init.headers || {})},
   });
-  const payload = await response.json();
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`HTTP ${response.status} from ${url}: the web server returned an empty or invalid JSON response. If the server was recently updated, restart the web backend when idle and reload the page. Check the saved state before retrying; this response does not confirm whether the operation was saved.`);
+  }
   if (!response.ok) throw new Error(payload.error || `Request failed with HTTP ${response.status}`);
   return payload as T;
 }

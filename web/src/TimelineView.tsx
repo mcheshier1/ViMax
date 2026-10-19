@@ -10,6 +10,7 @@ import type {AcceptanceSlot, AcceptanceStageName, Artifact, ConfigSection, Sessi
 import type {FilmSelection, FilmSessionState} from './filmSession';
 import {CharacterPortraitDecision} from './CharacterPortraitDecision';
 import {artifactUrl, thumbnailUrl} from './media';
+import type {AssetCreationRequest} from './AssetCreationDialog';
 import {isHeygenVideoModel, validHeygenVideoSettings, videoModelSelection, videoProviderPreset, VIDEO_PROVIDER_PRESETS} from './videoPresets';
 import './film-workbench.css';
 
@@ -35,13 +36,14 @@ type TimelineViewProps = {
   requestBusy?: boolean;
   onAskAgent: (text: string, restartAgent?: boolean) => Promise<void>;
   onSelectionChange?: (selection: FilmSelection | null) => void;
+  onCreateAsset?: (request: AssetCreationRequest) => void;
 };
 
 export function TimelineView(props: TimelineViewProps) {
   return <FilmWorkbench key={props.session?.sessionId || 'empty'} {...props} />;
 }
 
-function FilmWorkbench({session, artifacts, film, active = true, requestBusy = false, onAskAgent, onSelectionChange}: TimelineViewProps) {
+function FilmWorkbench({session, artifacts, film, active = true, requestBusy = false, onAskAgent, onSelectionChange, onCreateAsset}: TimelineViewProps) {
   const sessionId = session?.sessionId || '';
   const uiKey = `vimax:film-ui:${sessionId}`;
   const [ui, setUi] = useState<FilmUi>(() => {
@@ -86,8 +88,9 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
   const requiredFrameTypes = payload?.totals.requiredFrameTypes || BRACKETED_FRAMES;
   const setGateReady = Boolean(setInventoryReady && !setInventoryError && setInventory && generation?.slots.length
     && generation.slots.every((slot) => {
-      const ids = setInventory.shots.find((shot) => shot.slot === slot)?.setIds;
-      return Boolean(ids?.length && ids.every((id) => setInventory.sets.some((set) => set.id === id && set.state === 'accepted')));
+      const shot = setInventory.shots.find((shot) => shot.slot === slot);
+      return Boolean(shot && (shot.setIds.length > 0 || shot.setBindingExplicit === true)
+        && shot.setIds.every((id) => setInventory.sets.some((set) => set.id === id && set.state === 'accepted')));
     }));
   const generationFrameTypes = isHeygenVideoModel(videoSettings?.model) ? FIRST_FRAME_ONLY : BRACKETED_FRAMES;
   const root = payload?.root || '';
@@ -370,6 +373,18 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
       return target?.state === 'rejected' || target?.state === 'stale';
     }).map((row) => row.slot);
   }
+  function missingChainSources(slots: string[]): string[] {
+    if (payload?.chainedKeyframes !== true) return [];
+    const targets = new Set(slots);
+    const missing = new Set<string>();
+    for (const slot of slots) {
+      const position = order.indexOf(slot);
+      if (position <= 0) continue;
+      const source = order[position - 1];
+      if (!targets.has(source) && !hasRequiredFrames(frameMap.get(source)?.artifacts || [], ['last_frame'])) missing.add(source);
+    }
+    return [...missing];
+  }
   function openGeneration(phase: Generation['phase'], scope: Generation['scope']) {
     if (!generation) void loadSettings();
     const slots = generationSlots(phase, scope);
@@ -383,6 +398,8 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
   async function submitGeneration() {
     const decision = generation;
     if (!decision || !decision.slots.length || frozen || settingsLoading || settingsError || (decision.phase === 'video' ? !videoSettings?.model || !validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, videoSettings.clip_seconds || videoSettings.effective_clip_seconds || '8') : !imageModel)) return;
+    const missingSources = decision.phase === 'stills' ? missingChainSources(decision.slots) : [];
+    if (missingSources.length) { setError(`Saved predecessor endings are missing: ${missingSources.map((slot) => `${slotName('keyframes', slot)} [${slot}]`).join(', ')}. Generate those endings explicitly first; no request was sent.`); return; }
     if (hasFilmDrafts(sessionId, root, decision.slots)) { setError('Save or discard each targeted shot’s local draft before generating. No request was sent.'); return; }
     if (decision.revision !== (progress?.revision || '') || decision.drafts !== filmDraftToken(sessionId, root, decision.slots)) {
       setError('The film or a draft changed while you reviewed this decision. Review the refreshed scope and submit again.');
@@ -460,6 +477,8 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
   const missingCount = rows.filter((row) => matches(row, 'missing')).length;
   const phaseModel = generation?.phase === 'video' ? videoSettings?.model : imageModel;
   const targetHasDraft = Boolean(generation && hasFilmDrafts(sessionId, root, generation.slots));
+  const missingSources = generation?.phase === 'stills' ? missingChainSources(generation.slots) : [];
+  const chainIncomplete = missingSources.length > 0;
   const generationBlocked = generation?.phase === 'video' ? generation.slots.some((slot) => {
     const frames = frameMap.get(slot);
     return frames?.state !== 'accepted' || !hasRequiredFrames(frames.artifacts, generationFrameTypes);
@@ -512,6 +531,7 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
           <header className="film-selection-head"><div><h3>{selected ? slotName('keyframes', selected.slot) : sessionStage?.stage === 'portraits' ? 'Character portraits' : 'Final film'}</h3><span>{selected ? filmPosition(order, selected.slot) : 'Sequence-wide review and approval'}</span></div>{selected && <div className="film-preview-tabs" role="group" aria-label="Preview media">{([{key: 'first', label: 'First frame'}, {key: 'last', label: 'Last frame'}, {key: 'clip', label: 'Clip'}] as const).map((tab) => <button key={tab.key} aria-pressed={ui.preview === tab.key} onClick={() => { if (tab.key === ui.preview || leaveDraft()) remember({preview: tab.key}); }}>{tab.label}</button>)}</div>}</header>
           <div className={`film-preview${expanded ? ' is-expanded' : ''}`} role={expanded ? 'dialog' : undefined} aria-modal={expanded ? true : undefined} aria-label={expanded ? 'Expanded media viewer' : 'Media viewer'}>
             {selectedArtifact ? selectedArtifact.kind === 'video' ? <video ref={videoRef} key={artifactUrl(selectedArtifact)} src={artifactUrl(selectedArtifact)} poster={thumbnailUrl(selectedArtifact)} controls playsInline preload="metadata" /> : <img key={artifactUrl(selectedArtifact)} src={artifactUrl(selectedArtifact)} alt={selected ? `${slotName('keyframes', selected.slot)} ${ui.preview === 'last' ? 'last' : 'first'} frame` : selectedArtifact.name} /> : <div className="film-preview-missing"><ImageIcon size={30} /><span>{ui.preview === 'clip' ? 'No clip yet' : 'This frame has not been generated'}</span></div>}
+            {selectedArtifact && selectedArtifact.kind === 'image' && ui.preview !== 'clip' && onCreateAsset && <button type="button" className="film-create-asset" onClick={() => {setExpanded(false); onCreateAsset({source: selectedArtifact});}}>Generate asset from this still…</button>}
             {selectedArtifact && <button className="film-expand" aria-label={expanded ? 'Close expanded preview' : 'Expand preview'} onClick={() => setExpanded((value) => !value)}><ZoomIn size={15} />{expanded ? 'Close' : 'Expand'}</button>}
           </div>
           {sessionStage && previewPaths.length > 1 && <div className="film-session-thumbs">{previewPaths.map((path, index) => { const artifact = byPath.get(path); return artifact ? <button key={path} aria-label={`View ${artifact.name}`} aria-pressed={index === sessionMedia} onClick={() => setSessionMedia(index)}><img src={thumbnailUrl(artifact, 160)} loading="lazy" alt={artifact.name} /></button> : null; })}</div>}
@@ -546,6 +566,8 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
     {generation && <div className="film-generation-backdrop" onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setGeneration(null); }}><section className="film-generation" role="dialog" aria-modal="true" aria-labelledby="film-generation-title"><header><h3 id="film-generation-title">Generation decision</h3><button className="timeline-action" disabled={Boolean(busy)} onClick={() => setGeneration(null)}>Cancel</button></header>
       <div className="film-generation-fields"><label><span>Phase</span><select autoFocus value={generation.phase} disabled={Boolean(busy)} onChange={(event) => event.target.value === 'portraits' ? openPortraitGeneration() : openGeneration(event.target.value as Generation['phase'], generation.scope)}><option value="stills">First & last frames · stills</option><option value="video">Clips · video</option><option value="portraits" disabled={!portraitRecoverySupported}>Character portraits{portraitRecoverySupported ? '' : ' · unavailable for this workflow'}</option></select></label><label><span>Scope</span><select value={generation.scope} disabled={Boolean(busy)} onChange={(event) => openGeneration(generation.phase, event.target.value as Generation['scope'])}><option value="selected" disabled={!selected}>Selected shot</option><option value="missing">Missing in this phase</option><option value="changes">Needs changes in this phase</option></select></label></div>
       <p><strong>Exactly {generation.slots.length} shot{generation.slots.length === 1 ? '' : 's'}</strong>: {generation.slots.map((slot) => `${slotName('keyframes', slot)} [${slot}]`).join(', ') || 'Nothing eligible. Accepted takes are protected.'}</p><p className="plan-hint">Root: <code>{root}</code> · phase: <code>{generation.phase}</code>. {generation.phase === 'stills' ? 'Replaces selected frames and invalidates their clips and final approval.' : 'Replaces selected clips and may rebuild the final assembly; no other clips are requested.'}</p>
+      {generation.phase === 'stills' && payload.chainedKeyframes === true && <p className="plan-hint">Each targeted shot uses its immediate predecessor’s saved ending, or its fresh ending if both are targeted. Other shots are preserved; earlier approvals do not force regeneration.</p>}
+      {chainIncomplete && <p className="timeline-error">Saved predecessor endings are missing: {missingSources.map((slot) => `${slotName('keyframes', slot)} [${slot}]`).join(', ')}. Generate those endings explicitly first.</p>}
       {generation.phase === 'stills' && selected?.clip?.state === 'rejected' && selected.frames?.state !== 'rejected' && <p className="film-warning">This shot has clip feedback, so the renderer currently targets its clip. Save feedback against the frames first if you intend to redraw frames instead.</p>}
       {generation.phase === 'video' ? <>
         <div className="film-generation-fields">
@@ -573,7 +595,7 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
       <p className="film-warning">{generationCost}</p><p className="plan-hint">Video selection is saved to global configuration when you submit, affecting future renders in every project. Credentials are unchanged. Image model is configured globally in Settings. Failed requests are not automatically retried by this workbench.</p>
       {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? `Accept all required reference frames (${generationFrameTypes.join(', ')}) for each targeted shot first.` : !setGateReady ? setInventoryError || 'Approve matching set references for every targeted shot before generating its images. Prepare, select and approve them in Assets → Sets.' : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
       {error && <p className="timeline-error" role="alert">{error}</p>}
-      <button className="timeline-action is-primary" disabled={frozen || settingsLoading || Boolean(settingsError) || !phaseModel || !generation.slots.length || generationBlocked || targetHasDraft || generation.phase === 'video' && !videoSettingsValid} onClick={() => void submitGeneration()}><RefreshCw size={14} />{busy === 'generate' ? 'Submitting…' : `Generate ${generation.phase} · ${generation.slots.length} shot${generation.slots.length === 1 ? '' : 's'} · ${phaseModel || 'model unavailable'}`}</button>
+      <button className="timeline-action is-primary" disabled={frozen || settingsLoading || Boolean(settingsError) || !phaseModel || !generation.slots.length || generationBlocked || targetHasDraft || chainIncomplete || generation.phase === 'video' && !videoSettingsValid} onClick={() => void submitGeneration()}><RefreshCw size={14} />{busy === 'generate' ? 'Submitting…' : `Generate ${generation.phase} · ${generation.slots.length} shot${generation.slots.length === 1 ? '' : 's'} · ${phaseModel || 'model unavailable'}`}</button>
     </section></div>}
     {restartDecision && <div className="film-generation-backdrop" onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setRestartDecision(null); }}><section className="film-generation" role="dialog" aria-modal="true" aria-labelledby="shot-restart-title"><header><h3 id="shot-restart-title">Restart {slotName('keyframes', restartDecision.slot)}?</h3><button className="timeline-action" disabled={Boolean(busy)} onClick={() => setRestartDecision(null)}>Cancel</button></header>
       <p>This removes this shot’s generated frames, clips, prompts, and approvals, plus cached assembled film(s). The editable shot plan (including descriptions and brief), portraits, set references, and other shots’ media are preserved.</p>

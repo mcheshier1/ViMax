@@ -137,7 +137,7 @@ describe('confirmed asset deletion backend', () => {
     await expect(readFile(path.join(working, 'script2video/shots/0/last_frame.png'))).resolves.toBeTruthy();
     await expect(readFile(path.join(working, 'script2video/shots/0/model/video.mp4'))).resolves.toBeTruthy();
   });
-  it('invalidates linked playback successors after a last-frame deletion with global chaining off', async () => {
+  it('invalidates only the direct linked successor after a last-frame deletion with global chaining off', async () => {
     const {repo, working} = await fixture();
     const order = [1, 2, 3, 4];
     await put(working, 'script2video/camera_tree.json', JSON.stringify([
@@ -164,10 +164,11 @@ describe('confirmed asset deletion backend', () => {
     await deleteAsset(repo, {sessionId, path: target, revision: plan.revision});
 
     const approvals = (await readAcceptance(working)).script2video;
-    for (const slot of ['1', '2', '3']) {
+    for (const slot of ['1', '2']) {
       expect(approvals.shots[slot].keyframes.invalidated_at).toBeTruthy();
       expect(approvals.shots[slot].clips.invalidated_at).toBeTruthy();
     }
+    expect(approvals.shots[3]).toEqual(original.script2video.shots[3]);
     expect(approvals.shots[4]).toEqual(original.script2video.shots[4]);
     expect(approvals.final_video.invalidated_at).toBeTruthy();
     await expect(readFile(path.join(working, target))).rejects.toMatchObject({code: 'ENOENT'});
