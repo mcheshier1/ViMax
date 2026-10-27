@@ -1997,6 +1997,10 @@ a:focus-visible {
   animation: dialog-in 160ms ease both;
 }
 
+.project-dialog > .film-warning {
+  grid-column: 1 / -1;
+}
+
 .dialog-icon {
   display: grid;
   width: 36px;

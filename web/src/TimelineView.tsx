@@ -92,6 +92,15 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
       return Boolean(shot && (shot.setIds.length > 0 || shot.setBindingExplicit === true)
         && shot.setIds.every((id) => setInventory.sets.some((set) => set.id === id && set.state === 'accepted')));
     }));
+  const unassignedSetSlots = (generation?.slots || []).filter((slot) => {
+    const shot = setInventory?.shots.find((shot) => shot.slot === slot);
+    return shot && !shot.setIds.length && shot.setBindingExplicit !== true;
+  });
+  const setGateMessage = setInventoryError || (!setInventoryReady || !setInventory
+    ? 'Loading current set-reference metadata before image generation.'
+    : unassignedSetSlots.length
+      ? `No location sets assigned to ${unassignedSetSlots.map((slot) => slotName('keyframes', slot)).join(', ')}. Cancel this dialog, open Edit first frame for each shot, choose its location set(s), then Save plan. Existing set approval does not assign a set to a shot.`
+      : 'Approve matching set references for every targeted shot before generating its images. Prepare, select and approve them in Assets → Sets.');
   const generationFrameTypes = isHeygenVideoModel(videoSettings?.model) ? FIRST_FRAME_ONLY : BRACKETED_FRAMES;
   const root = payload?.root || '';
   const portraitRecoverySupported = /(?:^|[\\/])script2video(?:[\\/]|$)/i.test(root);
@@ -411,7 +420,7 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
     });
     if (decision.phase === 'stills') {
       if (!setGateReady || !setInventory) {
-        setError(setInventoryError || 'Shot-image generation is locked until fresh set-reference metadata is available and every targeted shot has accepted location references.');
+        setError(setGateMessage);
         return;
       }
       try {
@@ -594,7 +603,7 @@ function FilmWorkbench({session, artifacts, film, active = true, requestBusy = f
         {heygen && !videoSettingsValid && <p className="timeline-error">Correct HeyGen’s resolution and 5–15 second clip duration before submitting.</p>}
       </> : <p>Image model: <strong>{imageModel || 'Loading configuration…'}</strong></p>}
       <p className="film-warning">{generationCost}</p><p className="plan-hint">Video selection is saved to global configuration when you submit, affecting future renders in every project. Credentials are unchanged. Image model is configured globally in Settings. Failed requests are not automatically retried by this workbench.</p>
-      {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? `Accept all required reference frames (${generationFrameTypes.join(', ')}) for each targeted shot first.` : !setGateReady ? setInventoryError || 'Approve matching set references for every targeted shot before generating its images. Prepare, select and approve them in Assets → Sets.' : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
+      {generationBlocked && <p className="timeline-error">{generation.phase === 'video' ? `Accept all required reference frames (${generationFrameTypes.join(', ')}) for each targeted shot first.` : !setGateReady ? setGateMessage : 'Accept character portraits first.'}</p>}{targetHasDraft && <p className="timeline-error">One or more targeted shots have protected local drafts. Cancel and save or discard them first.</p>}{settingsError && <p className="timeline-error">{settingsError}</p>}
       {error && <p className="timeline-error" role="alert">{error}</p>}
       <button className="timeline-action is-primary" disabled={frozen || settingsLoading || Boolean(settingsError) || !phaseModel || !generation.slots.length || generationBlocked || targetHasDraft || chainIncomplete || generation.phase === 'video' && !videoSettingsValid} onClick={() => void submitGeneration()}><RefreshCw size={14} />{busy === 'generate' ? 'Submitting…' : `Generate ${generation.phase} · ${generation.slots.length} shot${generation.slots.length === 1 ? '' : 's'} · ${phaseModel || 'model unavailable'}`}</button>
     </section></div>}

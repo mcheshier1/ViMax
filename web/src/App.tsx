@@ -132,6 +132,7 @@ export default function App() {
   const uploadingFiles = uploadingSession === selectedSessionId && Boolean(selectedSessionId);
   const sending = Boolean(sendingSession);
   const busy = chat.busy;
+  const projectCreationBlocked = !queueBridgeReady || sending || Object.values(chats).some((state) => state.busy);
   const queuedCount = chat.messages.filter((message) => message.role === 'user' && message.delivery === 'queued').length;
   const selectedSession = sessions.find((session) => session.sessionId === selectedSessionId);
   const slashMatches = useMemo(() => matchingSlashCommands(draft), [draft]);
@@ -509,7 +510,7 @@ export default function App() {
 
   async function newProject() {
     const projectName = newProjectName.trim();
-    if (!projectName || creatingProject) return;
+    if (!projectName || creatingProject || projectCreationBlocked) return;
     const initiatingSessionId = selectedSessionId;
     const previousSessionIds = new Set(sessions.map((session) => session.sessionId));
     setCreatingProject(true);
@@ -833,7 +834,7 @@ export default function App() {
         if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before refreshing assets.');
         await filmRef.current.refresh();
       }} />}
-      <NewProjectDialog open={newProjectOpen} name={newProjectName} style={newProjectStyle} requirement={newProjectRequirement} error={newProjectError} creating={creatingProject}
+      <NewProjectDialog open={newProjectOpen} name={newProjectName} style={newProjectStyle} requirement={newProjectRequirement} error={newProjectError} creating={creatingProject} blocked={projectCreationBlocked}
         onNameChange={(value) => {setNewProjectName(value); setNewProjectError('');}} onStyleChange={setNewProjectStyle} onRequirementChange={setNewProjectRequirement}
         onCancel={() => {if (!creatingProject) {setNewProjectOpen(false); setNewProjectError('');}}} onConfirm={() => void newProject()} />
     </div>
@@ -1543,13 +1544,14 @@ function DeleteProjectDialog({session, deleting, onCancel, onConfirm}: {
   );
 }
 
-function NewProjectDialog({open, name, style, requirement, error, creating, onNameChange, onStyleChange, onRequirementChange, onCancel, onConfirm}: {
+function NewProjectDialog({open, name, style, requirement, error, creating, blocked, onNameChange, onStyleChange, onRequirementChange, onCancel, onConfirm}: {
   open: boolean;
   name: string;
   style: string;
   requirement: string;
   error: string;
   creating: boolean;
+  blocked: boolean;
   onNameChange: (value: string) => void;
   onStyleChange: (value: string) => void;
   onRequirementChange: (value: string) => void;
@@ -1608,9 +1610,10 @@ function NewProjectDialog({open, name, style, requirement, error, creating, onNa
             disabled={creating}
           />
         </label>
+        {blocked && <p className="film-warning" role="status">Project creation is unavailable while the agent is busy or connecting. Wait for active and queued requests to finish. Browsing existing projects does not interrupt generation.</p>}
         <div className="dialog-actions">
           <button type="button" onClick={onCancel} disabled={creating}>Cancel</button>
-          <button type="submit" className="primary" disabled={creating || !name.trim()}>{creating ? 'Creating…' : 'Create'}</button>
+          <button type="submit" className="primary" disabled={creating || blocked || !name.trim()}>{creating ? 'Creating…' : 'Create'}</button>
         </div>
       </form>
     </div>

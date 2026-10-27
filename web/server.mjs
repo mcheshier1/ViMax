@@ -481,6 +481,11 @@ process.on('SIGTERM', shutdown);
 
 async function startAgent({newSession, sessionId, projectName = '', style = '', userRequirement = ''}) {
   if (newSession && sessionId) throw new Error('Choose either a new or existing session');
+  if (agentQueue.hasWorkFor(activeSessionId)) {
+    const error = new Error('The agent has active or queued work. Wait for it to finish before creating a project or restarting the agent. The current request has not been cancelled.');
+    error.statusCode = 409;
+    throw error;
+  }
   stopAgent('switch');
   const {command, args} = agentCommand();
   const sessionArgs = newSession
