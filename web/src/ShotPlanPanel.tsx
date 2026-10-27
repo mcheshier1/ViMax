@@ -3,19 +3,21 @@ import {AlertTriangle, MapPin, Save, User} from 'lucide-react';
 import {updateShotPlan} from './api';
 import {characterChips, planDirty, slotName, toggleCharacter} from './timeline';
 import type {AcceptanceStage, PlanFrame, ShotPlan} from './types';
+import {validateShotDuration} from '../video-durations.mjs';
 
 // Older stored drafts contain only frame fields; absent guidance stays at its saved value.
-type PlanDraft = {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]; brief?: string; motionDesc?: string; setIds?: string[]; reusePreviousLastFrame?: boolean; previousSlot?: string | null};
+type PlanDraft = {ffDesc: string; lfDesc: string; ffVis: number[]; lfVis: number[]; brief?: string; motionDesc?: string; setIds?: string[]; reusePreviousLastFrame?: boolean; previousSlot?: string | null; durationSeconds?: number | null};
 type StoredDraft = {plan: PlanDraft; base: PlanDraft; notes: Record<string, string>; revision: number};
 const memoryDrafts = new Map<string, StoredDraft>();
 const draftKey = (session: string, root: string, slot: string) => `vimax:film-draft:${encodeURIComponent(session)}:${encodeURIComponent(root)}:${encodeURIComponent(slot)}`;
-const fields = (plan: ShotPlan): PlanDraft => ({ffDesc: plan.firstFrame.description, lfDesc: plan.lastFrame.description, ffVis: plan.firstFrame.visible, lfVis: plan.lastFrame.visible, brief: plan.brief, motionDesc: plan.motionDescription, setIds: plan.setIds, reusePreviousLastFrame: plan.reusePreviousLastFrame, previousSlot: plan.previousSlot});
+const fields = (plan: ShotPlan): PlanDraft => ({ffDesc: plan.firstFrame.description, lfDesc: plan.lastFrame.description, ffVis: plan.firstFrame.visible, lfVis: plan.lastFrame.visible, brief: plan.brief, motionDesc: plan.motionDescription, setIds: plan.setIds, reusePreviousLastFrame: plan.reusePreviousLastFrame, previousSlot: plan.previousSlot, durationSeconds: plan.durationOverrideSeconds});
 function changedFromBase(value: StoredDraft): boolean {
   return planDirty({
     firstFrame: {description: value.base.ffDesc, visible: value.base.ffVis},
     lastFrame: {description: value.base.lfDesc, visible: value.base.lfVis},
     brief: value.base.brief ?? '', motionDescription: value.base.motionDesc ?? '', setIds: value.base.setIds,
     reusePreviousLastFrame: value.base.reusePreviousLastFrame, previousSlot: value.base.previousSlot,
+    durationOverrideSeconds: value.base.durationSeconds,
   }, value.plan);
 }
 function readDraft(key: string): StoredDraft | undefined {
@@ -95,7 +97,7 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
   canRegenerate: boolean;
   onChanged: () => Promise<void>;
   onSaveFeedback: (note: string) => Promise<void>;
-  onRegenerate: () => void;
+  onRegenerate: (phase?: 'stills' | 'video') => void;
   onDirtyChange: (dirty: boolean) => void;
 }>(function ShotPlanPanel({sessionId, root, slot, stage, plan, feedback, accepted, disabled, canRegenerate, onChanged, onSaveFeedback, onRegenerate, onDirtyChange}, ref) {
   const key = draftKey(sessionId, root, slot);
@@ -117,6 +119,10 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
   const operation = useRef(false);
   const bindingsReady = Boolean(plan && Array.isArray(plan.sets) && Array.isArray(plan.setIds) && typeof plan.setRevision === 'string');
   const planChanged = Boolean(plan && draft && planDirty(plan, draft.plan));
+  const guidanceChanged = Boolean(plan && planDirty(plan, {...draft.plan, durationSeconds: undefined}));
+  const durationOnly = planChanged && !guidanceChanged && !Object.keys(draft.notes).length;
+  const durationValue = draft.plan.durationSeconds === undefined ? plan?.durationOverrideSeconds ?? null : draft.plan.durationSeconds;
+  const durationError = durationValue !== null && plan?.durationPolicy ? validateShotDuration(durationValue, plan.durationPolicy) : '';
   const note = draft?.notes[stage] ?? feedback;
   const noteChanged = note !== feedback;
   const dirty = planChanged || Boolean(draft && Object.keys(draft.notes).length);
@@ -184,6 +190,12 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     const owner = current.current;
     if (!submitted || owner.disabled || operation.current) return false;
     const changed = mode !== 'feedback' && Boolean(owner.plan && planDirty(owner.plan, submitted.plan));
+    const changesGuidance = Boolean(owner.plan && planDirty(owner.plan, {...submitted.plan, durationSeconds: undefined}));
+    const durationChanged = submitted.plan.durationSeconds !== undefined && submitted.plan.durationSeconds !== owner.plan?.durationOverrideSeconds;
+    if (changed && durationChanged && submitted.plan.durationSeconds !== null && owner.plan?.durationPolicy) {
+      const invalidDuration = validateShotDuration(submitted.plan.durationSeconds, owner.plan.durationPolicy);
+      if (invalidDuration) { setError(invalidDuration); return false; }
+    }
     if (changed && (!owner.plan || !Array.isArray(owner.plan.sets) || !Array.isArray(owner.plan.setIds) || typeof owner.plan.setRevision !== 'string')) {
       setError('Shot set bindings are unavailable. Restart the updated bridge when idle before saving this plan.');
       return false;
@@ -195,14 +207,18 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
         : 'The previous shot changed while this draft was open. Turn the continuity checkbox off and on again to confirm its new source, or discard the draft.');
       return false;
     }
-    if (changed && !window.confirm(`${accepted ? 'This shot has accepted material. ' : ''}Saving shot guidance (brief, motion, frame descriptions, characters, sets or continuity) unlocks its frames, invalidates its clip and final-film approval and dependent continuity approvals, and makes the coverage review stale. No generation runs. Save this plan?`)) return false;
+    if (changed && !window.confirm(changesGuidance
+      ? `${accepted ? 'This shot has accepted material. ' : ''}Saving shot guidance (brief, motion, frame descriptions, characters, sets or continuity) unlocks its frames, invalidates its clip and final-film approval and dependent continuity approvals, and makes the coverage review stale. No generation runs. Save this plan?`
+      : 'Save this shot’s duration? Only its clip and final-film approval are invalidated. Frames, other shots, and all existing media are preserved. No generation runs.')) return false;
     if (changed && externalChange && !window.confirm('The saved plan changed while this draft was open. Replace those newer shot guidance fields with your draft?')) return false;
     operation.current = true;
     setSaving(true);
     setError('');
     try {
       const saved = changed ? await updateShotPlan({
-        sessionId, root, slot, ...submitted.plan,
+        sessionId, root, slot, ...(changesGuidance ? submitted.plan : {}),
+        revision: owner.plan?.revision,
+        durationSeconds: durationChanged ? submitted.plan.durationSeconds : undefined,
         brief: submitted.plan.brief?.trim() !== owner.plan?.brief.trim() ? submitted.plan.brief : undefined,
         motionDesc: submitted.plan.motionDesc?.trim() !== owner.plan?.motionDescription.trim() ? submitted.plan.motionDesc : undefined,
         setIds: submitted.plan.setIds && (submitted.plan.setIds.length !== owner.plan?.setIds.length || submitted.plan.setIds.some((id) => !owner.plan?.setIds.includes(id))) ? submitted.plan.setIds : undefined,
@@ -258,6 +274,18 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     {externalChange && <p className="film-warning"><AlertTriangle size={14} /> The saved plan changed. Your local draft is protected; saving will require confirmation.</p>}
     {plan && !bindingsReady && <p className="plan-error" role="alert">Shot set bindings are unavailable. Restart the updated bridge when idle before editing this plan.</p>}
     {plan && bindingsReady && <section className="film-plan-fields" aria-label="Shot guidance">
+      <div className="plan-frame film-shot-duration" role="group" aria-label="Shot duration">
+        <label><strong>Shot duration (seconds)</strong>
+          {plan.durationPolicy?.allowedSeconds ? <select aria-label="Shot duration (seconds)" value={durationValue === null ? '@default' : String(durationValue)} disabled={disabled || saving || !plan.durationPolicy.configured} onChange={(event) => edit({durationSeconds: event.target.value === '@default' ? null : Number(event.target.value)})}>
+            <option value="@default">Default · {plan.durationPolicy.defaultSeconds}s</option>
+            {durationValue !== null && !plan.durationPolicy.allowedSeconds.includes(durationValue) && <option value={durationValue}>{durationValue}s · unsupported for this model</option>}
+            {plan.durationPolicy.allowedSeconds.map((seconds) => <option key={seconds} value={seconds}>{seconds}s</option>)}
+          </select> : <input aria-label="Shot duration (seconds)" type="number" min={plan.durationPolicy?.minSeconds || 1} max={plan.durationPolicy?.maxSeconds} step={1} value={durationValue ?? ''} placeholder={`Default · ${plan.durationSeconds}s`} disabled={disabled || saving || !plan.durationPolicy?.configured} onChange={(event) => edit({durationSeconds: event.target.value === '' ? null : Number(event.target.value)})} />}
+        </label>
+        <p className="plan-hint">{plan.durationPolicy?.configured ? `Model: ${plan.durationPolicy.model} · configured maximum ${plan.durationPolicy.maxSeconds}s. Save plan to apply; generation is a separate decision.` : 'Configure and save this video model’s maximum shot duration in Settings → Video generation before changing shot lengths. Default: 8 seconds where supported.'}</p>
+        {!plan.durationPolicy?.configured && <button className="timeline-action" onClick={() => window.dispatchEvent(new CustomEvent('film-open-settings'))}>Configure model duration limits…</button>}
+        {durationError && <p className="plan-error" role="alert">{durationError}</p>}
+      </div>
       <GuidanceField label="Shot brief" value={draft.plan.brief ?? plan.brief} savedValue={plan.brief} disabled={disabled} saving={saving}
         onChange={(brief) => edit({brief})} onCancel={() => edit({brief: plan.brief})} />
       {(['firstFrame', 'lastFrame'] as const).map((part) => <FramePlan
@@ -277,8 +305,8 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
       />)}
       <GuidanceField label="Motion description" value={draft.plan.motionDesc ?? plan.motionDescription} savedValue={plan.motionDescription} disabled={disabled} saving={saving}
         onChange={(motionDesc) => edit({motionDesc})} onCancel={() => edit({motionDesc: plan.motionDescription})} />
-      {planChanged && <p className="film-warning">Saving shot guidance unlocks frames and invalidates downstream clip/final approval. It does not regenerate anything.</p>}
-      <button className="timeline-action" disabled={!planChanged || saving || disabled} onClick={() => void save('plan')}><Save size={13} />{saving ? 'Saving…' : 'Save plan'}</button>
+      {planChanged && <p className="film-warning">{guidanceChanged ? 'Saving shot guidance unlocks frames and invalidates downstream clip/final approval. It does not regenerate anything.' : 'Saving duration invalidates only this shot’s clip and final-film approval. Frames and other shots are preserved; nothing regenerates.'}</p>}
+      <button className="timeline-action" disabled={!planChanged || saving || disabled || Boolean(durationError)} onClick={() => void save('plan')}><Save size={13} />{saving ? 'Saving…' : 'Save plan'}</button>
     </section>}
     <details className="film-inspector-disclosure" open={editing} onToggle={(event) => setEditing(event.currentTarget.open)}>
       <summary>Edit feedback{Object.keys(draft.notes).length > 0 && <span>Unsaved feedback</span>}</summary>
@@ -289,7 +317,7 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
       <button className="timeline-action" disabled={!note.trim() || !noteChanged || saving || disabled} onClick={() => void save('feedback')}>Save feedback</button>
     </details>
     <div className="plan-actions">
-      {(stage === 'keyframes' || stage === 'clips') && <button className="timeline-action is-primary" disabled={!canRegenerate || saving || disabled || !bindingsReady} onClick={() => void save('all').then((saved) => { if (saved && mounted.current) current.current.onRegenerate(); })}>Save & regenerate…</button>}
+      {(stage === 'keyframes' || stage === 'clips') && <button className="timeline-action is-primary" disabled={!canRegenerate || saving || disabled || !bindingsReady || Boolean(durationError)} onClick={() => void save('all').then((saved) => { if (saved && mounted.current) current.current.onRegenerate(durationOnly ? 'video' : undefined); })}>{durationOnly ? 'Save & generate clip…' : 'Save & regenerate…'}</button>}
       {dirty && <button className="timeline-action" disabled={saving} onClick={() => {
         if (!window.confirm('Discard this shot’s unsaved guidance, character and set choices, and feedback?')) return;
         const restored = plan ? fields(plan) : draft.base;

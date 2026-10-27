@@ -16,6 +16,8 @@ export async function startAgentServer() {
     for (const file of await readdir(webRoot)) {
       if (file.endsWith('.mjs')) await copyFile(path.join(webRoot, file), path.join(web, file));
     }
+    await mkdir(path.join(root, 'configs'));
+    await copyFile(path.join(webRoot, '..', 'configs', 'video-duration-models.json'), path.join(root, 'configs', 'video-duration-models.json'));
     await symlink(path.join(webRoot, 'node_modules'), path.join(web, 'node_modules'), 'dir');
     await symlink(path.join(webRoot, 'dist'), path.join(web, 'dist'), 'dir');
     await mkdir(path.join(root, '.vimax'));

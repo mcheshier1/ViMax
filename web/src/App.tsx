@@ -42,6 +42,7 @@ import {createDeltaBatcher, type DeltaBatcher} from './streaming';
 import {IMAGE_PROVIDER_PRESETS, compatibleImageResolution, defaultImageResolution, imageProviderFromBaseUrl, imageProviderPreset, imageResolutionTiers} from './imagePresets';
 import {isHeygenVideoModel, validHeygenVideoSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
 import {credentialProvider} from '../provider-credentials.mjs';
+import {validateShotDuration, videoDurationPolicy} from '../video-durations.mjs';
 import {AssetCreationDialog, type AssetCreationRequest} from './AssetCreationDialog';
 import {TimelineView} from './TimelineView';
 import {useFilmSession, type FilmSelection} from './filmSession';
@@ -480,11 +481,14 @@ export default function App() {
       setDrawer('assistant');
       setAssistantScope('film');
     };
+    const onOpenSettings = () => setUtility('settings');
     window.addEventListener('film-drafts-change', onDraftChange);
     window.addEventListener('film-open-assistant', onOpenAssistant);
+    window.addEventListener('film-open-settings', onOpenSettings);
     return () => {
       window.removeEventListener('film-drafts-change', onDraftChange);
       window.removeEventListener('film-open-assistant', onOpenAssistant);
+      window.removeEventListener('film-open-settings', onOpenSettings);
     };
   }, []);
 
@@ -826,7 +830,7 @@ export default function App() {
             void refreshSessions().catch((error) => setLoadError(String(error)));
             void film.refresh().catch((error) => setLoadError(String(error)));
             film.wake();
-          }} /> : <SettingsView />}
+          }} /> : <SettingsView agentBusy={projectCreationBlocked} onSaved={film.refresh} />}
         </section>
       </div>}
       <DeleteProjectDialog session={pendingDelete} deleting={deleting} onCancel={() => !deleting && setPendingDelete(undefined)} onConfirm={() => void confirmDelete()} />
@@ -1006,7 +1010,7 @@ function redactConfig(config: AgentConfig): AgentConfig {
 }
 
 
-function SettingsView() {
+function SettingsView({agentBusy, onSaved}: {agentBusy: boolean; onSaved: () => Promise<void>}) {
   const [config, setConfig] = useState<AgentConfig>();
   const [drafts, setDrafts] = useState<Partial<Record<keyof AgentConfig['sections'], Record<string, string>>>>({});
   const [loading, setLoading] = useState(true);
@@ -1040,6 +1044,12 @@ function SettingsView() {
       if (!current) return current;
       const sectionValue = current.sections[section];
       const nextSection = {...sectionValue, [field]: value};
+      if (section === 'video' && field === 'shot_duration_limits') {
+        const limits = {...sectionValue.shot_duration_limits};
+        const key = `${sectionValue.provider || 'openrouter'}:${sectionValue.model}`;
+        if (value === '') delete limits[key]; else limits[key] = Number(value);
+        nextSection.shot_duration_limits = limits;
+      }
       if (section === 'video' && field === 'model') {
         Object.assign(nextSection, videoModelSelection(String(sectionValue.provider || 'openrouter'), value, sectionValue.resolution || '', sectionValue.clip_seconds || sectionValue.effective_clip_seconds || '8'));
       }
@@ -1089,7 +1099,7 @@ function SettingsView() {
   }
 
   async function save() {
-    if (!config || saving) return;
+    if (!config || saving || agentBusy || !validVideoSettings) return;
     setSaving(true);
     setStatus('');
     const request: AgentConfig = {
@@ -1106,6 +1116,7 @@ function SettingsView() {
     try {
       setConfig(redactConfig(await saveAgentConfig(request)));
       setDrafts({});
+      await onSaved();
       setStatus('Saved');
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1115,7 +1126,16 @@ function SettingsView() {
   }
 
   const videoSettings = config?.sections.video;
-  const validVideoSettings = videoSettings?.provider === 'openrouter' ? validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, videoSettings.clip_seconds || videoSettings.effective_clip_seconds || '8') : true;
+  const durationPolicy = videoSettings ? videoDurationPolicy(videoSettings) : undefined;
+  const knownDurationPolicy = videoSettings ? videoDurationPolicy({...videoSettings, shot_duration_limits: {}}) : undefined;
+  const configuredMaximum = videoSettings?.shot_duration_limits?.[`${videoSettings.provider || 'openrouter'}:${videoSettings.model}`];
+  const defaultSeconds = Number(videoSettings?.clip_seconds || videoSettings?.effective_clip_seconds || '8');
+  const validDuration = Number.isInteger(defaultSeconds) && defaultSeconds > 0
+    && (!knownDurationPolicy?.allowedSeconds || knownDurationPolicy.allowedSeconds.includes(defaultSeconds))
+    && (configuredMaximum === undefined || Number.isInteger(configuredMaximum) && configuredMaximum >= defaultSeconds
+      && (!knownDurationPolicy?.allowedSeconds || knownDurationPolicy.allowedSeconds.includes(configuredMaximum))
+      && durationPolicy !== undefined && !validateShotDuration(defaultSeconds, durationPolicy));
+  const validVideoSettings = validDuration && (videoSettings?.provider === 'openrouter' ? validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, String(defaultSeconds)) : true);
   const credentialsSupported = Boolean(config && CONFIG_SECTIONS.every(({key}) => Array.isArray(config.sections[key].configured_api_key_providers)));
   if (loading) return <div className="settings-loading">Loading configuration…</div>;
   if (!config) return <div className="settings-loading is-error">{status || 'Configuration unavailable'}</div>;
@@ -1126,11 +1146,12 @@ function SettingsView() {
         <div><span>Local configuration</span><h1>Settings</h1></div>
         <div className="settings-save-group">
           {status && <span className={status === 'Saved' ? 'is-saved' : 'is-error'}>{status}</span>}
-          <button className="settings-save" onClick={() => void save()} disabled={saving || !validVideoSettings || !credentialsSupported || !imageResolutionSupported}>
+          <button className="settings-save" onClick={() => void save()} disabled={saving || agentBusy || !validVideoSettings || !credentialsSupported || !imageResolutionSupported}>
             <Save size={15} />{saving ? 'Saving…' : 'Save'}
           </button>
           {!credentialsSupported && <span className="is-error">Restart the web server after the active request finishes, then reload settings to enable provider-specific key saving.</span>}
           {!imageResolutionSupported && <span className="is-error">Reload settings after the backend reloads to enable image resolution saving.</span>}
+          {agentBusy && <span className="is-error">The agent is busy or connecting. Wait before saving model settings; the current generation will not be interrupted.</span>}
         </div>
       </header>
       <div className="settings-sections">
@@ -1167,6 +1188,8 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
 }) {
   const heygen = definition.key === 'video' && value.provider === 'openrouter' && isHeygenVideoModel(value.model);
   const duration = value.clip_seconds || value.effective_clip_seconds || '8';
+  const modelDurationPolicy = videoDurationPolicy({...value, shot_duration_limits: {}});
+  const durationLimit = value.shot_duration_limits?.[`${value.provider || 'openrouter'}:${value.model}`];
   const resolutionOptions = heygen ? ['480p', '768p'] : value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p'];
   const imageProvider = definition.key === 'image' ? imageProviderFromBaseUrl(value.base_url) : undefined;
   const openrouterImage = imageProvider === 'openrouter';
@@ -1264,10 +1287,19 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
                     {resolutionOptions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
                   </select>
                 </label>
-                <label><span>Clip duration (seconds)</span><input type="number" min={heygen ? 5 : value.provider === 'agnes' ? 4 : value.provider === 'ltx' ? 6 : 1} max={heygen ? 15 : value.provider === 'agnes' ? 12 : 20} value={duration} onChange={(event) => onChange('clip_seconds', event.target.value)} /></label>
+                <label><span>Default shot duration (seconds)</span>{modelDurationPolicy.allowedSeconds ? <select value={duration} onChange={(event) => onChange('clip_seconds', event.target.value)}>
+                  {!modelDurationPolicy.allowedSeconds.includes(Number(duration)) && <option value={duration}>{duration}s · unsupported</option>}
+                  {modelDurationPolicy.allowedSeconds.map((seconds: number) => <option key={seconds} value={seconds}>{seconds}s</option>)}
+                </select> : <input type="number" min={1} step={1} value={duration} onChange={(event) => onChange('clip_seconds', event.target.value)} />}</label>
               </>
             )}
-            {!validVideoSettings && <p className="film-warning">Correct HeyGen’s resolution and 5–15 second clip duration before saving.</p>}
+            <label><span>Maximum shot duration for this model (seconds)</span>{modelDurationPolicy.allowedSeconds ? <select aria-label="Maximum shot duration for this model (seconds)" value={durationLimit === undefined ? '' : String(durationLimit)} onChange={(event) => onChange('shot_duration_limits', event.target.value)}>
+              <option value="">Not configured · shot overrides disabled</option>
+              {durationLimit !== undefined && !modelDurationPolicy.allowedSeconds.includes(durationLimit) && <option value={durationLimit}>{durationLimit}s · unsupported</option>}
+              {modelDurationPolicy.allowedSeconds.map((seconds: number) => <option key={seconds} value={seconds}>{seconds}s</option>)}
+            </select> : <input aria-label="Maximum shot duration for this model (seconds)" type="number" min={1} step={1} value={durationLimit ?? ''} placeholder="Configure to enable shot overrides" onChange={(event) => onChange('shot_duration_limits', event.target.value)} />}</label>
+            <p className="config-field-wide">Save a maximum for {value.model || 'the selected model'} to enable individual shot lengths in Film. Limits are remembered separately for each provider/model. {modelDurationPolicy.allowedSeconds ? `Supported durations: ${modelDurationPolicy.allowedSeconds.join(', ')} seconds.` : 'For custom models, verify supported durations with the provider before configuring a maximum.'} Existing clips are not regenerated.</p>
+            {!validVideoSettings && <p className="film-warning config-field-wide">Choose a supported default shot duration and a model maximum at least as long as the default. HeyGen also requires a supported resolution.</p>}
             {heygen && <p className="film-warning config-field-wide">HeyGen conditions the clip on the first frame only; the final pose is not constrained. Native audio is provided by the model and cannot be toggled via OpenRouter.</p>}
             {value.provider !== 'agnes' && value.provider !== 'yunwu' && !heygen && (
               <label><span>Generate audio</span>

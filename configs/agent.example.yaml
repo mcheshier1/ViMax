@@ -21,6 +21,9 @@ video:
   api_key: ''
   resolution: 720p
   clip_seconds: 8
+  # Save per-provider/model maxima in Settings before using per-shot duration overrides.
+  # Example entry: "openrouter:google/veo-3.1-lite": 8
+  shot_duration_limits: {}
   generate_audio: true
 
 # Optional. Fill these only when using novel2video planning.

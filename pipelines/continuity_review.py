@@ -222,6 +222,11 @@ def parse_runtime_range(requirement: str) -> Optional[Tuple[int, int]]:
     return (low, high) if low <= high else (high, low)
 
 
+def _effective_duration_seconds(shot_idx: int, plan_rows: Dict[int, Dict[str, Any]], default: int) -> int:
+    value = (plan_rows.get(shot_idx) or {}).get("duration_seconds")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+
+
 def run_checks(
     *,
     script: str,
@@ -265,18 +270,27 @@ def run_checks(
 
     wanted = parse_runtime_range(requirement)
     if wanted and clip_seconds > 0:
-        seconds = len(order) * clip_seconds
+        durations = [
+            _effective_duration_seconds(idx, plan_rows_by_idx or {}, clip_seconds)
+            for idx in order
+        ]
+        seconds = sum(durations)
         low, high = wanted
         if low <= seconds <= high:
             checks.append(
                 Check(id="runtime", status="ok", message=f"{seconds}s, inside the requested {low}-{high}s.", shots=order)
             )
         else:
+            breakdown = (
+                f"{len(order)} shots x {clip_seconds}s"
+                if not durations or all(duration == clip_seconds for duration in durations)
+                else " + ".join(f"{duration}s" for duration in durations)
+            )
             checks.append(
                 Check(
                     id="runtime",
                     status="warn",
-                    message=f"{seconds}s of the requested {low}-{high}s ({len(order)} shots x {clip_seconds}s).",
+                    message=f"{seconds}s of the requested {low}-{high}s ({breakdown}).",
                     shots=order,
                 )
             )
@@ -377,6 +391,7 @@ def build_evidence(
         "timeline": [
             {
                 "shot": idx,
+                "duration_seconds": _effective_duration_seconds(idx, plans, clip_seconds),
                 "camera": (rows_by_idx.get(idx) or {}).get("cam_idx"),
                 "visual": (rows_by_idx.get(idx) or {}).get("visual_desc"),
                 "audio": (rows_by_idx.get(idx) or {}).get("audio_desc"),

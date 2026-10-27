@@ -23,7 +23,31 @@ from pipelines.set_references import (
     validate_set_reference_generation,
 )
 
-from .config import api_provider_from_base_url, embedding_api_key, embedding_base_url, embedding_model, embedding_model_provider, image_api_key, image_base_url, image_model, image_resolution, llm_api_key, llm_base_url, llm_model, llm_model_provider, reranker_api_key, reranker_base_url, reranker_model, video_api_key, video_base_url, video_clip_seconds, video_generate_audio, video_model, video_provider, video_resolution
+from .config import (
+    api_provider_from_base_url,
+    embedding_api_key,
+    embedding_base_url,
+    embedding_model,
+    embedding_model_provider,
+    image_api_key,
+    image_base_url,
+    image_model,
+    image_resolution,
+    llm_api_key,
+    llm_base_url,
+    llm_model,
+    llm_model_provider,
+    reranker_api_key,
+    reranker_base_url,
+    reranker_model,
+    video_api_key,
+    video_base_url,
+    video_duration_policy,
+    video_generate_audio,
+    video_model,
+    video_resolution,
+    validate_video_shot_duration,
+)
 from .models import ToolResult
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
@@ -607,7 +631,7 @@ class ViMaxAdapters:
 
             chat_model = _build_chat_model()
             image_generator = _build_image_generator()
-            video_generator = _build_video_generator()
+            video_generator = _build_video_generator(self.workspace_root)
             style = str(session.get("style", "") or "")
             # A redraw names shots, and this run works on those shots only.
             only_shots = list(redo.get("slots") or {}) if redo else None
@@ -645,6 +669,21 @@ class ViMaxAdapters:
                         require_existing=True,
                     )
 
+            if stop_after != "sets":
+                try:
+                    _preflight_duration_overrides(
+                        working_dir / render_mode,
+                        only_shots,
+                        getattr(video_generator, "duration_policy", None),
+                    )
+                except ValueError as exc:
+                    refusal = {
+                        "error_type": "invalid_shot_duration",
+                        "retryable": False,
+                        "render_mode": render_mode,
+                        "error": str(exc),
+                    }
+                    return ToolResult("vimax_render_video", False, str(exc), refusal)
             # Validate the entire selected image scope before cutover, status changes,
             # destructive shot redo, or any media request. This gate is mandatory even
             # when the user has opted out of portrait/keyframe approval.
@@ -879,7 +918,7 @@ class ViMaxAdapters:
         rows_by_idx = _storyboard_by_idx(root_dir / "storyboard.json")
         removed_rows_by_idx = _removed_rows_by_idx(root_dir)
         plan_rows_by_idx = _plan_rows_by_idx(root_dir)
-        clip_seconds = _clip_seconds()
+        clip_seconds = _clip_seconds(self.workspace_root)
         requirement = str((self.session_index.get(session_id) or {}).get("user_requirement") or "")
 
         checks = run_checks(
@@ -1284,31 +1323,48 @@ def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGenerato
     return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url, resolution=resolution)
 
 
-def _build_video_generator():
-    api_key = video_api_key()
+def _build_video_generator(workspace_root: str | Path = "."):
+    policy = video_duration_policy(workspace_root)
+    api_key = video_api_key(workspace_root)
     if not api_key:
         raise RuntimeError("VIMAX_VIDEO_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml video/llm api_key is required for video generation")
-    model = video_model()
-    base_url = video_base_url()
-    provider = video_provider()
-    common = {"api_key": api_key, "model": model, "base_url": base_url, "clip_seconds": video_clip_seconds()}
+    model = video_model(workspace_root)
+    base_url = video_base_url(workspace_root)
+    provider = policy["provider"]
+    common = {
+        "api_key": api_key,
+        "model": model,
+        "base_url": base_url,
+        "clip_seconds": policy["defaultSeconds"],
+    }
     if provider == "openrouter":
         from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 
-        return VideoGeneratorOpenRouterAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
-    if provider == "yunwu":
+        generator = VideoGeneratorOpenRouterAPI(
+            **common,
+            resolution=video_resolution(workspace_root),
+            generate_audio=video_generate_audio(workspace_root),
+        )
+    elif provider == "yunwu":
         from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
-        return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
-    if provider == "agnes":
+        generator = VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
+    elif provider == "agnes":
         from tools.video_generator_agnes_api import VideoGeneratorAgnesAPI
 
-        return VideoGeneratorAgnesAPI(**common, resolution=video_resolution())
-    if provider == "ltx":
+        generator = VideoGeneratorAgnesAPI(**common, resolution=video_resolution(workspace_root))
+    elif provider == "ltx":
         from tools.video_generator_ltx_api import VideoGeneratorLTXAPI
 
-        return VideoGeneratorLTXAPI(**common, resolution=video_resolution(), generate_audio=video_generate_audio())
-    raise RuntimeError(f"Unsupported video provider '{provider}' for base URL: {base_url}")
+        generator = VideoGeneratorLTXAPI(
+            **common,
+            resolution=video_resolution(workspace_root),
+            generate_audio=video_generate_audio(workspace_root),
+        )
+    else:
+        raise RuntimeError(f"Unsupported video provider '{provider}' for base URL: {base_url}")
+    generator.duration_policy = policy
+    return generator
 
 
 class _IdentityRewriter:
@@ -1539,60 +1595,6 @@ def _read_render_manifest(working_dir: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-SUPERSEDED_CLIPS_DIRNAME = ".superseded_clips"
-
-
-def _clip_seconds_of(path: Path) -> float:
-    """A clip's own length, or 0 when it cannot be read."""
-    try:
-        from moviepy import VideoFileClip
-
-        clip = VideoFileClip(str(path))
-        try:
-            return float(clip.duration or 0.0)
-        finally:
-            clip.close()
-    except Exception:
-        return 0.0
-
-
-def _supersede_clips(root_dir: Path, clip_seconds: int) -> list[str]:
-    """Move the root's wrong-length clips aside, under the length they were rendered at.
-
-    They were paid for, so they are kept where nothing reads them: the acceptance derives
-    slot state from the shot directories, and a dot-directory is not a slot. The film joined
-    from them goes with them. A clip at the configured length stays, so a half-redrawn
-    sequence is not thrown away with the rest.
-    """
-    moved: list[str] = []
-    film = root_dir / "final_video.mp4"
-    candidates = [
-        *sorted(root_dir.glob("shots/*/*/video.mp4")),
-        *sorted(root_dir.glob("shots/*/*/transition_video_*.mp4")),
-        *sorted(root_dir.glob("scene_*/shots/*/*/video.mp4")),
-        *sorted(root_dir.glob("scene_*/shots/*/*/transition_video_*.mp4")),
-    ]
-    for path in candidates:
-        measured = _clip_seconds_of(path)
-        if measured and abs(measured - clip_seconds) < 0.5:
-            continue
-        bucket = f"{round(measured)}s" if measured else "unknown-length"
-        destination = root_dir / SUPERSEDED_CLIPS_DIRNAME / bucket / path.relative_to(root_dir)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.replace(destination)
-        except OSError:
-            continue
-        moved.append(str(path.relative_to(root_dir)))
-    if film.exists():
-        destination = root_dir / SUPERSEDED_CLIPS_DIRNAME / "film" / film.name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            film.replace(destination)
-            moved.append(str(film.relative_to(root_dir)))
-        except OSError:
-            pass
-    return moved
 
 def _discard_image_model_outputs(working_dir: Path, render_mode: str, old_model: str) -> None:
     """Remove generated images for a cut-over model without deleting set descriptors."""
@@ -1711,23 +1713,12 @@ def _enforce_render_sequence(
     if recorded_video_model and configured_video_model and recorded_video_model != configured_video_model:
         film = (working_dir / render_mode if render_mode else working_dir) / "final_video.mp4"
         film.unlink(missing_ok=True)
-    # A clip of the wrong length is not this film's clip: a line of dialogue cannot be
-    # stretched to fit one, and a five second clip of an eight second line loses the line.
-    # The keyframes stay — a clip is drawn between them, and they are the length they are —
-    # while the clips the sequence is not rendered at move aside, so the next renders draw
-    # one clip each at the configured length. A manifest written before the length was
-    # recorded says nothing, so the clips on disk are measured instead of trusted.
-    recorded_clip_seconds = int(manifest.get("clip_seconds") or 0)
-    configured_clip_seconds = int(getattr(video_generator, "clip_seconds", 0) or 0)
-    if configured_clip_seconds and recorded_clip_seconds != configured_clip_seconds:
-        root_dir = working_dir / render_mode if render_mode else working_dir
-        _supersede_clips(root_dir, configured_clip_seconds)
     updated = {
         "image_model": configured_model or recorded_model,
         "video_model": str(getattr(video_generator, "model", "") or ""),
         "style": style or recorded_style,
         "render_mode": render_mode or recorded_mode,
-        "clip_seconds": configured_clip_seconds or recorded_clip_seconds,
+        "clip_seconds": int(getattr(video_generator, "clip_seconds", 0) or manifest.get("clip_seconds") or 0),
         "created_at": str(manifest.get("created_at") or datetime.now().isoformat(timespec="seconds")),
     }
     if updated != manifest:
@@ -1923,6 +1914,35 @@ def _plan_rows_by_idx(root_dir: Path) -> dict[int, dict[str, Any]]:
     return rows
 
 
+def _preflight_duration_overrides(
+    root_dir: Path,
+    only_shots: list[str] | None,
+    policy: dict[str, Any],
+) -> None:
+    if not isinstance(policy, dict):
+        policy = {
+            "provider": "active video provider",
+            "model": "",
+            "configured": False,
+            "minSeconds": 1,
+            "maxSeconds": 0,
+            "allowedSeconds": None,
+        }
+    selected = {str(slot) for slot in only_shots} if only_shots is not None else None
+    for slot, shot_dir in _shot_dirs(root_dir):
+        if selected is not None and slot not in selected:
+            continue
+        try:
+            payload = json.loads((shot_dir / "shot_description.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read shot {slot} duration settings: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("duration_seconds") is None:
+            continue
+        error = validate_video_shot_duration(payload["duration_seconds"], policy)
+        if error:
+            raise ValueError(f"Shot {slot}: {error}")
+
+
 def _removed_rows_by_idx(root_dir: Path) -> dict[int, dict[str, Any]]:
     """The briefs of shots that were cut.
 
@@ -1947,9 +1967,9 @@ def _removed_rows_by_idx(root_dir: Path) -> dict[int, dict[str, Any]]:
     return rows
 
 
-def _clip_seconds() -> int:
-    """Seconds per clip, read the way the video generator reads them."""
-    return video_clip_seconds()
+def _clip_seconds(workspace_root: str | Path = ".") -> int:
+    """The default video duration after applying the active model's duration policy."""
+    return int(video_duration_policy(workspace_root)["defaultSeconds"])
 
 
 def _timeline_review_prompt(evidence: dict[str, Any]) -> str:

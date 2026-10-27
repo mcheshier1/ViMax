@@ -17,7 +17,6 @@ from agent_runtime.vimax_adapters import (
     ViMaxAdapters,
     _enforce_render_sequence,
     _read_render_manifest,
-    _supersede_clips,
 )
 from interfaces import Camera, CharacterInScene, ImageOutput, ShotDescription, VideoOutput
 from pipelines.idea2video_pipeline import Idea2VideoPipeline
@@ -55,7 +54,7 @@ def _character() -> CharacterInScene:
     )
 
 
-def _shot(idx: int, variation_type: str = "small") -> ShotDescription:
+def _shot(idx: int, variation_type: str = "small", duration_seconds: int | None = None) -> ShotDescription:
     return ShotDescription(
         idx=idx,
         is_last=True,
@@ -69,6 +68,7 @@ def _shot(idx: int, variation_type: str = "small") -> ShotDescription:
         lf_vis_char_idxs=[],
         motion_desc="m",
         audio_desc="a",
+        duration_seconds=duration_seconds,
     )
 
 
@@ -558,7 +558,7 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(Path(outcome.final_video_path).read_bytes(), b"film without removed shot 1")
 
 class ClipLengthTests(unittest.TestCase):
-    """A clip of the wrong length is not the film's clip."""
+    """A default change must not sweep paid clips with unrelated per-shot lengths."""
 
     def _root_with(self, tmp):
         root = Path(tmp) / "script2video"
@@ -568,30 +568,7 @@ class ClipLengthTests(unittest.TestCase):
         (root / "final_video.mp4").write_bytes(b"film")
         return root, clip
 
-    def test_wrong_length_clips_and_the_film_move_aside(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, clip = self._root_with(tmp)
-
-            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=5.04):
-                moved = _supersede_clips(root, 8)
-
-            self.assertEqual(len(moved), 2)
-            self.assertFalse(clip.exists())
-            self.assertFalse((root / "final_video.mp4").exists())
-            # Kept, under the length they were rendered at, where no slot reads them.
-            self.assertTrue((root / ".superseded_clips/5s/shots/2/test_video-model/video.mp4").exists())
-
-    def test_a_clip_at_the_configured_length_stays(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, clip = self._root_with(tmp)
-
-            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=8.04):
-                moved = _supersede_clips(root, 8)
-
-            self.assertEqual(moved, ["final_video.mp4"])
-            self.assertTrue(clip.exists())
-
-    def test_the_sequence_records_the_length_and_sheds_the_old_clips(self):
+    def test_default_duration_change_records_default_without_moving_cached_media(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, clip = self._root_with(tmp)
             manifest = Path(tmp) / RENDER_MANIFEST_FILENAME
@@ -600,23 +577,88 @@ class ClipLengthTests(unittest.TestCase):
                 "video_model": VIDEO_MODEL,
                 "style": "cinematic",
                 "render_mode": "script2video",
+                "clip_seconds": 5,
             }), encoding="utf-8")
             generator = _Generator(VIDEO_MODEL)
             generator.clip_seconds = 8
 
-            with patch("agent_runtime.vimax_adapters._clip_seconds_of", return_value=5.04):
-                refusal = _enforce_render_sequence(
-                    Path(tmp),
-                    image_generator=_Generator(IMAGE_MODEL),
-                    video_generator=generator,
-                    style="cinematic",
-                    allow_model_change=False,
-                    render_mode="script2video",
-                )
+            refusal = _enforce_render_sequence(
+                Path(tmp),
+                image_generator=_Generator(IMAGE_MODEL),
+                video_generator=generator,
+                style="cinematic",
+                allow_model_change=False,
+                render_mode="script2video",
+            )
 
             self.assertIsNone(refusal)
-            self.assertFalse(clip.exists())
+            self.assertTrue(clip.exists())
+            self.assertTrue((root / "final_video.mp4").exists())
             self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["clip_seconds"], 8)
+
+
+class ShotDurationSchemaTests(unittest.TestCase):
+    def test_positive_integer_override_survives_saved_schema_roundtrip(self):
+        shot = _shot(3, duration_seconds=10)
+        reloaded = ShotDescription.model_validate(json.loads(json.dumps(shot.model_dump())))
+        self.assertEqual(reloaded.duration_seconds, 10)
+        self.assertIsNone(_shot(4).duration_seconds)
+        for invalid in (0, -1, 2.5, True):
+            with self.subTest(duration_seconds=invalid):
+                payload = shot.model_dump()
+                payload["duration_seconds"] = invalid
+                with self.assertRaises(ValueError):
+                    ShotDescription.model_validate(payload)
+
+
+class ShotDurationPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unconfigured_override_aborts_before_image_or_video_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, image_generator, video_generator = _pipeline(tmp)
+            video_generator.duration_policy = {
+                "provider": "openrouter",
+                "model": "test/model",
+                "configured": False,
+                "defaultSeconds": 8,
+                "minSeconds": 4,
+                "maxSeconds": 8,
+                "allowedSeconds": [4, 6, 8],
+            }
+            description_path = Path(pipeline.working_dir, "shots", "0", "shot_description.json")
+            description_path.write_text(json.dumps(_shot(0, duration_seconds=6).model_dump()), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Configure a limit"):
+                await pipeline(
+                    script="script",
+                    user_requirement="req",
+                    style="cinematic",
+                    characters=[_character()],
+                    character_portraits_registry={},
+                    stop_after="video",
+                )
+
+            self.assertEqual(image_generator.calls, [])
+            self.assertEqual(video_generator.calls, [])
+
+    async def test_scoped_preflight_ignores_an_unrelated_invalid_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, video_generator = _pipeline(tmp, shots=[_shot(0), _shot(1)])
+            video_generator.duration_policy = {
+                "provider": "openrouter",
+                "model": "test/model",
+                "configured": True,
+                "defaultSeconds": 8,
+                "minSeconds": 5,
+                "maxSeconds": 10,
+                "allowedSeconds": [5, 10],
+            }
+            for shot_idx, duration in ((0, 5), (1, 6)):
+                path = Path(pipeline.working_dir, "shots", str(shot_idx), "shot_description.json")
+                path.write_text(json.dumps(_shot(shot_idx, duration_seconds=duration).model_dump()), encoding="utf-8")
+
+            pipeline._preflight_saved_shot_durations({0})
+            with self.assertRaisesRegex(ValueError, "Shot 1 duration 6s is unsupported"):
+                pipeline._preflight_saved_shot_durations(None)
 
 
 class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):

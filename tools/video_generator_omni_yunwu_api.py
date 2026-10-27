@@ -6,6 +6,7 @@ import aiohttp
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 from utils.rate_limiter import RateLimiter
 
 
@@ -63,8 +64,7 @@ class VideoGeneratorOmniYunwuAPI:
 
         payload = {
             "model": self.t2v_model if len(reference_image_paths) == 0 else self.i2v_model,
-            "prompt": prompt,
-            "seconds": str(seconds or self.seconds),
+            "seconds": str(seconds if seconds is not None else self.seconds),
         }
 
         if len(reference_image_paths) == 0:
@@ -97,6 +97,7 @@ class VideoGeneratorOmniYunwuAPI:
         enable_upsample: Optional[bool] = None,
         enable_sample: Optional[bool] = None,
     ) -> tuple[str, str]:
+        seconds = resolve_duration_seconds(seconds, self.seconds)
         payload = self._build_payload(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
@@ -207,6 +208,10 @@ class VideoGeneratorOmniYunwuAPI:
         enable_sample: Optional[bool] = None,
         **kwargs,
     ) -> VideoOutput:
+        seconds = resolve_duration_seconds(
+            kwargs.get("duration_seconds"),
+            seconds if seconds is not None else self.seconds,
+        )
         task_id, model = await self.create_video_generation_task(
             prompt=prompt,
             reference_image_paths=reference_image_paths,

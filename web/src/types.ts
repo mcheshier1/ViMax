@@ -182,15 +182,29 @@ export type SetReferenceAcceptanceRequest = {
   reason?: string;
 };
 
+export type VideoDurationPolicy = {
+  provider: string;
+  model: string;
+  configured: boolean;
+  defaultSeconds: number;
+  minSeconds: number;
+  maxSeconds: number;
+  allowedSeconds: number[] | null;
+};
+
 export type ShotPlan = {
   slot: string;
   root: string;
+  revision: string;
   /** The one-line brief the shot came from. */
   brief: string;
   characters: {idx: number; name: string}[];
   firstFrame: PlanFrame;
   lastFrame: PlanFrame;
   motionDescription: string;
+  durationSeconds: number;
+  durationOverrideSeconds: number | null;
+  durationPolicy: VideoDurationPolicy;
   sets: Array<{id: string; name: string; accepted: boolean}>;
   setIds: string[];
   setRevision: string;
@@ -211,6 +225,7 @@ export type ShotPlanUpdateRequest = {
   sessionId: string;
   root: string;
   slot: string;
+  revision?: string;
   ffDesc?: string;
   lfDesc?: string;
   ffVis?: number[];
@@ -221,6 +236,7 @@ export type ShotPlanUpdateRequest = {
   setRevision?: string;
   reusePreviousLastFrame?: boolean;
   previousSlot?: string | null;
+  durationSeconds?: number | null;
 };
 /** One row of the render's trail: either a phase decision or a pipeline progress note. */
 export type RenderEvent = {
@@ -293,7 +309,7 @@ export type ContinuityPayload = {
   staleReason: string;
   /** Slot keys of the film's shots, in playing order. */
   shots: string[];
-  /** Seconds one clip runs, which is what the runtime finding multiplies. */
+  /** Default duration for shots without a saved per-shot override. */
   clipSeconds: number;
 };
 
@@ -340,6 +356,7 @@ export type ConfigSection = {
   effective_resolution?: string;
   clip_seconds?: string;
   effective_clip_seconds?: string;
+  shot_duration_limits?: Record<string, number>;
   generate_audio?: string;
 };
 

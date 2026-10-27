@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {addSuggestionRequest, coverageCounts, coverageNeedsAttention, gapBeats, reviewRequestText, reviewStatusLine, runtimeLine, suggestionAddable, suggestionAnchor, suggestionCharacterIndices, suggestionFraming, suggestionPosition, warnChecks} from './continuity';
+import {addSuggestionRequest, coverageCounts, coverageNeedsAttention, gapBeats, reviewRequestText, reviewStatusLine, suggestionAddable, suggestionAnchor, suggestionCharacterIndices, suggestionFraming, suggestionPosition, warnChecks} from './continuity';
 import type {ContinuityPayload, ContinuityReview, ContinuitySuggestion, ShotPlan} from './types';
 
 const suggestion: ContinuitySuggestion = {
@@ -23,6 +23,8 @@ const plans: ShotPlan[] = [
     firstFrame: {description: '', visible: [], prompt: ''},
     lastFrame: {description: '', visible: [], prompt: ''},
     motionDescription: '',
+    revision: 'saved', durationSeconds: 8, durationOverrideSeconds: null,
+    durationPolicy: {provider: 'openrouter', model: 'google/veo-3.1-lite', configured: false, defaultSeconds: 8, minSeconds: 4, maxSeconds: 8, allowedSeconds: [4, 6, 8]},
     sets: [],
     setIds: [],
     setRevision: '',
@@ -151,12 +153,6 @@ describe('script coverage review', () => {
     expect(reviewRequestText('script2video')).toContain('vimax_review_timeline');
     expect(reviewRequestText('script2video')).toContain('render_mode="script2video"');
     expect(reviewRequestText()).not.toContain('render_mode');
-  });
-
-  it('says how long the film runs', () => {
-    expect(runtimeLine(10, 5)).toBe('10 shots x 5s = 50s');
-    expect(runtimeLine(0, 5)).toBe('');
-    expect(runtimeLine(10, 0)).toBe('');
   });
 
   it('describes the review it is showing', () => {

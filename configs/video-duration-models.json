@@ -1,0 +1,14 @@
+{
+  "agnes:agnes-video-2.5": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+  "agnes:agnes-video-2.5-flash": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+  "ltx:ltx-2-3-fast": [6, 8, 10, 12, 14, 16, 18, 20],
+  "ltx:ltx-2-3-pro": [6, 8, 10],
+  "ltx:ltx-2-5-fast": [6, 8, 10, 12, 14, 16, 18, 20],
+  "ltx:ltx-2-5-pro": [6, 8, 10],
+  "openrouter:google/veo-3.1-lite": [4, 6, 8],
+  "openrouter:heygen/heygen-video-1": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "openrouter:kwaivgi/kling-video-o1": [5, 10],
+  "openrouter:kwaivgi/kling-v3.0-pro": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "openrouter:kwaivgi/kling-v3.0-std": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "yunwu:veo3.1-fast": [8]
+}

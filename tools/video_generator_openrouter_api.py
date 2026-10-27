@@ -8,6 +8,7 @@ import aiohttp
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 
 
 def _env_int(name: str, default: int) -> int:
@@ -86,7 +87,7 @@ class VideoGeneratorOpenRouterAPI:
         request_timeout_seconds = _env_float("VIMAX_VIDEO_REQUEST_TIMEOUT_SECONDS", 60.0)
         query_timeout_seconds = _env_float("VIMAX_VIDEO_QUERY_TIMEOUT_SECONDS", 600.0)
         poll_interval_seconds = _env_float("VIMAX_VIDEO_POLL_INTERVAL_SECONDS", 10.0)
-        duration = self.clip_seconds
+        duration = resolve_duration_seconds(kwargs.get("duration_seconds"), self.clip_seconds)
         resolution = self._resolution or os.environ.get("VIMAX_OPENROUTER_VIDEO_RESOLUTION", "720p")
         generate_audio = self._generate_audio if self._generate_audio is not None else _env_bool("VIMAX_OPENROUTER_GENERATE_AUDIO", True)
 

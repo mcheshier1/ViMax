@@ -4,7 +4,7 @@ import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {createShot, readRemovedShots, readSetReferences, readShotPlan, readShotPlans, readRenderAcceptance, removeShot, restoreShot, updateRenderAcceptance, updateSetReference, updateShotPlan} from './server-lib.mjs';
+import {createShot, readRemovedShots, readSetReferences, readShotPlan, readShotPlans, readRenderAcceptance, readContinuityReview, removeShot, restoreShot, updateRenderAcceptance, updateSetReference, updateShotPlan} from './server-lib.mjs';
 import {getShotRestartPlan, restartShot} from './server-lib.mjs';
 
 const storageTestControl = vi.hoisted(() => ({failAcceptanceWrite: false}));
@@ -37,11 +37,15 @@ async function fixture() {
   roots.push(root);
   const working = path.join(root, '.working_dir', SESSION_ID);
   await mkdir(path.join(root, '.vimax'), {recursive: true});
+  await mkdir(path.join(root, 'configs'), {recursive: true});
   await writeFile(path.join(root, '.vimax', 'sessions.json'), JSON.stringify({
     active_session_id: SESSION_ID,
     sessions: {[SESSION_ID]: {session_id: SESSION_ID, project_name: 'Film', working_dir: `.working_dir/${SESSION_ID}`, stage: 'stills_ready', updated_at: '2026-09-21T09:00:00'}},
   }));
   await mkdir(working, {recursive: true});
+  await writeFile(path.join(root, 'configs', 'agent.local.yaml'), JSON.stringify({
+    video: {provider: 'openrouter', model: 'google/veo-3.1-lite', clip_seconds: 8},
+  }));
   await writeFile(path.join(working, 'render_manifest.json'), JSON.stringify({render_mode: ROOT}));
   await mkdir(path.join(working, ROOT, 'shots', '7'), {recursive: true});
   await writeFile(path.join(working, ROOT, 'characters.json'), JSON.stringify([
@@ -58,6 +62,16 @@ async function fixture() {
   await writeFile(path.join(working, ROOT, 'shots', '7', 'last_frame_selector_output.json'), JSON.stringify({sent_prompt: 'the prompt that was sent'}));
   await writeFile(path.join(working, ROOT, 'storyboard.json'), JSON.stringify([{idx: 7, is_last: false, cam_idx: 3, visual_desc: 'the shot being removed', audio_desc: ''}]));
   return {root, working};
+}
+async function configureKlingDuration(root, maximum = 10) {
+  await writeFile(path.join(root, 'configs', 'agent.local.yaml'), JSON.stringify({
+    video: {
+      provider: 'openrouter',
+      model: 'kwaivgi/kling-video-o1',
+      clip_seconds: 10,
+      shot_duration_limits: {'openrouter:kwaivgi/kling-video-o1': maximum},
+    },
+  }));
 }
 
 const read = (root) => readShotPlan(root, SESSION_ID, ROOT, '7');
@@ -129,11 +143,42 @@ describe('shot plans', () => {
     const {root} = await fixture();
 
     const plan = await read(root);
+    expect(plan).toMatchObject({durationSeconds: 8, durationOverrideSeconds: null, durationPolicy: {configured: false}});
 
     expect(plan.characters.map((character) => character.name)).toEqual(['Claude', 'Wife', 'DeepSeek']);
     expect(plan.brief).toBe('the shot being removed');
     expect(plan.firstFrame).toMatchObject({description: 'DeepSeek enters from the right.', visible: [0], prompt: ''});
     expect(plan.lastFrame).toMatchObject({description: 'DeepSeek beside the Wife.', visible: [0, 1], prompt: 'the prompt that was sent'});
+  });
+
+  it('requires a configured maximum, persists explicit durations, and rejects stale plan revisions', async () => {
+    const {root, working} = await fixture();
+    const initial = await read(root);
+    expect(initial).toMatchObject({
+      durationSeconds: 8,
+      durationOverrideSeconds: null,
+      durationPolicy: {configured: false, defaultSeconds: 8, allowedSeconds: [4, 6, 8]},
+    });
+    const descriptionPath = path.join(working, ROOT, 'shots', '7', 'shot_description.json');
+    const before = await readFile(descriptionPath, 'utf8');
+    await expect(update(root, {durationSeconds: 6, revision: initial.revision})).rejects.toMatchObject({statusCode: 400});
+    expect(await readFile(descriptionPath, 'utf8')).toBe(before);
+
+    await configureKlingDuration(root);
+    const configured = await read(root);
+    expect(configured).toMatchObject({
+      durationSeconds: 10,
+      durationPolicy: {configured: true, defaultSeconds: 10, maxSeconds: 10, allowedSeconds: [5, 10]},
+    });
+    const saved = await update(root, {durationSeconds: 5, revision: configured.revision});
+    expect(JSON.parse(await readFile(descriptionPath, 'utf8')).duration_seconds).toBe(5);
+    expect(saved).toMatchObject({durationSeconds: 5, durationOverrideSeconds: 5});
+    expect(await read(root)).toMatchObject({durationSeconds: 5, durationOverrideSeconds: 5});
+    await expect(update(root, {durationSeconds: 10, revision: configured.revision})).rejects.toMatchObject({statusCode: 409});
+
+    const cleared = await update(root, {durationSeconds: null, revision: (await read(root)).revision});
+    expect(JSON.parse(await readFile(descriptionPath, 'utf8'))).not.toHaveProperty('duration_seconds');
+    expect(cleared).toMatchObject({durationSeconds: 10, durationOverrideSeconds: null});
   });
   it('derives reuse from playback neighbors, including camera boundaries, and keeps list/detail plans aligned', async () => {
     const {root, working} = await fixture();
@@ -475,6 +520,48 @@ describe('continuous keyframe approvals', () => {
     expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('accepted');
   });
 
+  it('duration-only edits preserve frame reviews and all cached media while invalidating only the target clip, final approval, and coverage', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    await configureKlingDuration(root);
+    const coveragePath = path.join(working, 'continuity_review.json');
+    await writeFile(coveragePath, JSON.stringify({
+      root: ROOT,
+      shots_reviewed: ['4', '7', '2', '0'],
+      reviewed_at: new Date().toISOString(),
+    }));
+    expect((await readContinuityReview(root, SESSION_ID, ROOT)).stale).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const plan = await read(root);
+    const mediaPaths = [
+      `${ROOT}/shots/7/qwen_qwen-image-3/first_frame.png`,
+      `${ROOT}/shots/7/qwen_qwen-image-3/last_frame.png`,
+      `${ROOT}/shots/7/kwaivgi_kling-video-o1/video.mp4`,
+      `${ROOT}/shots/2/kwaivgi_kling-video-o1/video.mp4`,
+      `${ROOT}/final_video.mp4`,
+    ];
+    const beforeMedia = await Promise.all(mediaPaths.map((relative) => readFile(path.join(working, relative))));
+
+    await update(root, {durationSeconds: 5, revision: plan.revision});
+
+    const acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('accepted');
+    expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
+    expect(timelineSlot(acceptance, 'clips', '2').state).toBe('accepted');
+    expect(acceptance.stages.find((stage) => stage.stage === 'final_video').slots[0].state).toBe('stale');
+    expect((await readContinuityReview(root, SESSION_ID, ROOT)).stale).toBe(true);
+    expect(await Promise.all(mediaPaths.map((relative) => readFile(path.join(working, relative)))))
+      .toEqual(beforeMedia);
+
+    const store = JSON.parse(await readFile(path.join(working, 'render_acceptance.json'), 'utf8'))[ROOT];
+    expect(store.shots['7'].keyframes).toMatchObject({accepted_at: 'reviewed'});
+    expect(store.shots['7'].keyframes).not.toHaveProperty('invalidated_at');
+    expect(store.shots['7'].clips).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+    expect(store.shots['2'].clips).toMatchObject({accepted_at: 'reviewed'});
+    expect(store.shots['2'].clips).not.toHaveProperty('invalidated_at');
+    expect(store.final_video).toMatchObject({accepted_at: 'reviewed', invalidated_at: expect.any(String)});
+  });
+
   it('invalidates only changed adjacency after removal without erasing dependent evidence', async () => {
     const {root, working} = await fixture();
     await withContinuityFilm(working);
@@ -635,6 +722,9 @@ describe('adding and restoring shots', () => {
   it('adds a shot after another one, copying its plan and saying so', async () => {
     const {root, working} = await fixture();
     await withFilm(working, [2, 4]);
+    const sourcePath = path.join(working, ROOT, 'shots', '2', 'shot_description.json');
+    const source = JSON.parse(await readFile(sourcePath, 'utf8'));
+    await writeFile(sourcePath, JSON.stringify({...source, duration_seconds: 12}));
 
     const payload = await createShot(root, {sessionId: SESSION_ID, root: ROOT, after: '2', brief: 'the Wife sets the table behind him'});
 
@@ -646,6 +736,11 @@ describe('adding and restoring shots', () => {
     const plan = JSON.parse(await readFile(path.join(working, ROOT, 'shots', '5', 'shot_description.json'), 'utf8'));
     expect(plan.ff_desc).toBe('first 2');
     expect(plan.idx).toBe(5);
+    expect(plan).not.toHaveProperty('duration_seconds');
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '5')).toMatchObject({
+      durationSeconds: 8,
+      durationOverrideSeconds: null,
+    });
     const storyboard = JSON.parse(await readFile(path.join(working, ROOT, 'storyboard.json'), 'utf8'));
     expect(storyboard.find((entry) => entry.idx === 5).visual_desc).toBe('the Wife sets the table behind him');
     expect(payload.stages.find((stage) => stage.stage === 'keyframes').slots.map((slot) => slot.shot)).toContain('5');

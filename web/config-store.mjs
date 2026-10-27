@@ -2,11 +2,12 @@ import {readFile, rename, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {parse, stringify} from 'yaml';
 import {credentialProvider} from './provider-credentials.mjs';
+import {validateVideoDurationLimit, videoDurationPolicy} from './video-durations.mjs';
 
 const SECTION_FIELDS = {
   llm: ['model_provider', 'model', 'base_url'],
   image: ['model', 'editing_model', 'base_url', 'resolution'],
-  video: ['provider', 'model', 'base_url', 'resolution', 'clip_seconds', 'generate_audio'],
+  video: ['provider', 'model', 'base_url', 'resolution', 'clip_seconds', 'generate_audio', 'shot_duration_limits'],
   embedding: ['model_provider', 'model', 'base_url'],
   reranker: ['model', 'base_url'],
 };
@@ -66,7 +67,9 @@ export async function saveAgentConfig(repoRoot, input) {
     const prepared = {fields: Object.create(null), apiKeyUpdates: [], apiKey: ''};
     for (const field of fields) {
       if (Object.hasOwn(update, field)) {
-        prepared.fields[field] = validatedValue(update[field], `${section}.${field}`, 2_048);
+        prepared.fields[field] = field === 'shot_duration_limits'
+          ? validatedDurationLimits(update[field])
+          : validatedValue(update[field], `${section}.${field}`, 2_048);
       }
     }
     if (Object.hasOwn(update, 'api_key') && typeof update.api_key === 'string' && update.api_key.trim()) {
@@ -108,7 +111,11 @@ async function saveConfigFile(configPath, updatesBySection) {
     const legacyKey = typeof current.api_key === 'string' && current.api_key.trim() ? current.api_key : '';
     if (!Object.hasOwn(current, 'api_keys') && legacyKey) apiKeys[previousIdentity] = legacyKey;
 
-    for (const [field, value] of Object.entries(prepared.fields)) current[field] = value;
+    for (const [field, value] of Object.entries(prepared.fields)) {
+      current[field] = field === 'shot_duration_limits'
+        ? mergeDurationLimits(current, value)
+        : value;
+    }
     const selectedIdentity = credentialProvider(current);
     for (const [identity, key] of prepared.apiKeyUpdates) {
       if (key) apiKeys[identity] = key;
@@ -119,6 +126,8 @@ async function saveConfigFile(configPath, updatesBySection) {
     payload[section] = current;
   }
 
+  validateActiveVideoDurationLimit(payload);
+
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, stringify(payload, {lineWidth: 0}), {mode: 0o600});
   await rename(temporaryPath, configPath);
@@ -127,6 +136,47 @@ async function saveConfigFile(configPath, updatesBySection) {
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validatedDurationLimits(value) {
+  if (!isRecord(value)) throw new Error('video.shot_duration_limits must be a mapping');
+  const result = Object.create(null);
+  for (const [identity, maximum] of Object.entries(value)) {
+    if (!identity.trim() || identity !== identity.trim() || !/^[^:\s]+:.+$/.test(identity)) {
+      throw new Error('video.shot_duration_limits contains an invalid provider/model identity');
+    }
+    if (!Number.isSafeInteger(maximum) || maximum <= 0) {
+      throw new Error(`video.shot_duration_limits.${identity} must be a positive whole number of seconds`);
+    }
+    result[identity] = maximum;
+  }
+  return result;
+}
+
+function validateActiveVideoDurationLimit(payload) {
+  const video = Object.hasOwn(payload, 'video') && isRecord(payload.video) ? payload.video : {};
+  const effectiveVideo = {...video, effective_clip_seconds: String(effectiveClipSeconds(payload))};
+  const policy = videoDurationPolicy(effectiveVideo);
+  if (!Number.isSafeInteger(policy.defaultSeconds) || policy.defaultSeconds <= 0
+    || policy.allowedSeconds && !videoDurationPolicy({...effectiveVideo, shot_duration_limits: {}}).allowedSeconds.includes(policy.defaultSeconds)) {
+    throw new Error('video.clip_seconds must be a supported positive whole duration for the selected model and resolution');
+  }
+  if (!Object.hasOwn(video, 'shot_duration_limits')) return;
+  const registry = video.shot_duration_limits;
+  if (!isRecord(registry)) throw new Error('video.shot_duration_limits must be a mapping');
+  const identity = `${policy.provider}:${policy.model}`;
+  if (!Object.hasOwn(registry, identity)) return;
+  const error = validateVideoDurationLimit(registry[identity], effectiveVideo);
+  if (error) throw new Error(`video.shot_duration_limits.${identity}: ${error}`);
+}
+
+function mergeDurationLimits(video, incoming) {
+  const limits = Object.assign(Object.create(null), isRecord(video.shot_duration_limits) ? video.shot_duration_limits : {});
+  const policy = videoDurationPolicy(video);
+  const activeIdentity = `${policy.provider}:${policy.model}`;
+  for (const [identity, maximum] of Object.entries(incoming)) limits[identity] = maximum;
+  if (!Object.hasOwn(incoming, activeIdentity)) delete limits[activeIdentity];
+  return limits;
 }
 
 function copyApiKeys(value) {
@@ -162,14 +212,19 @@ function publicConfig(payload, effectiveSeconds, effectiveResolution) {
     const source = Object.hasOwn(payload, section) && isRecord(payload[section]) ? payload[section] : {};
     const result = {};
     for (const field of fields) {
+      if (field === 'shot_duration_limits') continue;
       const value = Object.hasOwn(source, field) ? source[field] : undefined;
       result[field] = typeof value === 'string' ? value : typeof value === 'boolean' || (field === 'clip_seconds' && typeof value === 'number') ? String(value) : '';
     }
-    if (section === 'video' && !result.provider) {
-      const baseUrl = String(source.base_url || '').toLowerCase();
-      result.provider = baseUrl.includes('agnes-ai.com') ? 'agnes'
-        : baseUrl.includes('ltx.io') ? 'ltx'
-          : baseUrl.includes('yunwu.ai') ? 'yunwu' : 'openrouter';
+    if (section === 'video') {
+      const limits = source.shot_duration_limits;
+      result.shot_duration_limits = isRecord(limits) ? {...limits} : {};
+      if (!result.provider) {
+        const baseUrl = String(source.base_url || '').toLowerCase();
+        result.provider = baseUrl.includes('agnes-ai.com') ? 'agnes'
+          : baseUrl.includes('ltx.io') ? 'ltx'
+            : baseUrl.includes('yunwu.ai') ? 'yunwu' : 'openrouter';
+      }
     }
     const apiKeys = copyApiKeys(source.api_keys);
     const selectedIdentity = credentialProvider(source);

@@ -355,6 +355,7 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
                 stop_after=stop_after,
                 progress=progress,
                 only_shots=scene_scope,
+                video_budget=video_budget,
                 continuity_scope=only_shots,
                 revision_notes={
                     slot.split("/", 1)[1]: note

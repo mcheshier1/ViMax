@@ -26,8 +26,10 @@ from agent_runtime.config import (
     reranker_model,
     video_api_key,
     video_base_url,
+    video_duration_policy,
     video_model,
     video_provider,
+    validate_video_shot_duration,
 )
 
 
@@ -201,6 +203,136 @@ class AgentConfigTests(unittest.TestCase):
         self.assertEqual(api_provider_from_base_url("https://openrouter.ai/api/v1"), "openrouter")
         self.assertEqual(api_provider_from_base_url("https://yunwu.ai/v1"), "yunwu")
         self.assertEqual(api_provider_from_base_url("https://example.com/v1"), "")
+
+    def test_video_duration_policy_defaults_and_model_specific_limits(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            config_dir = Path(tmp) / "configs"
+            config_dir.mkdir()
+            config_path = config_dir / "agent.local.yaml"
+            limits = {
+                "openrouter:google/veo-3.1-lite": 6,
+                "openrouter:kwaivgi/kling-video-o1": 10,
+            }
+            config_path.write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "openrouter",
+                    "model": "google/veo-3.1-lite",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
+            }), encoding="utf-8")
+            unconfigured = video_duration_policy(tmp)
+            self.assertFalse(unconfigured["configured"])
+            self.assertEqual(unconfigured["defaultSeconds"], 8)
+            self.assertIn("Configure a maximum", validate_video_shot_duration(6, unconfigured))
+            config_path.write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "openrouter",
+                    "model": "google/veo-3.1-lite",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "clip_seconds": "6",
+                    "shot_duration_limits": limits,
+                },
+            }), encoding="utf-8")
+            load_agent_config.cache_clear()
+            policy = video_duration_policy(tmp)
+            self.assertEqual(policy["defaultSeconds"], 6)
+            self.assertEqual(policy["allowedSeconds"], [4, 6])
+            self.assertEqual(policy["maxSeconds"], 6)
+            self.assertEqual(validate_video_shot_duration(4, policy), "")
+            self.assertEqual(validate_video_shot_duration(6, policy), "")
+            self.assertIn("allowed durations", validate_video_shot_duration(8, policy))
+            self.assertIn("positive whole number", validate_video_shot_duration(True, policy))
+
+            config_path.write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "openrouter",
+                    "model": "kwaivgi/kling-video-o1",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "shot_duration_limits": limits,
+                },
+            }), encoding="utf-8")
+            load_agent_config.cache_clear()
+            kling_policy = video_duration_policy(tmp)
+            self.assertTrue(kling_policy["configured"])
+            self.assertEqual(kling_policy["defaultSeconds"], 10)
+            self.assertEqual(kling_policy["allowedSeconds"], [5, 10])
+            self.assertEqual(validate_video_shot_duration(10, kling_policy), "")
+
+    def test_ltx_fast_duration_limits_follow_configured_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            config_dir = Path(tmp) / "configs"
+            config_dir.mkdir()
+            config_path = config_dir / "agent.local.yaml"
+            model_key = "ltx:ltx-2-5-fast"
+            config_path.write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "ltx",
+                    "model": "ltx-2-5-fast",
+                    "base_url": "https://api.ltx.io",
+                    "resolution": "4K",
+                    "shot_duration_limits": {model_key: 10},
+                },
+            }), encoding="utf-8")
+            policy = video_duration_policy(tmp)
+            self.assertEqual(policy["allowedSeconds"], [6, 8, 10])
+            self.assertEqual(validate_video_shot_duration(10, policy), "")
+            self.assertIn("allowed durations", validate_video_shot_duration(12, policy))
+
+            config_path.write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "ltx",
+                    "model": "ltx-2-5-fast",
+                    "base_url": "https://api.ltx.io",
+                    "resolution": "720p",
+                    "shot_duration_limits": {model_key: 20},
+                },
+            }), encoding="utf-8")
+            load_agent_config.cache_clear()
+            hd_policy = video_duration_policy(tmp)
+            self.assertEqual(hd_policy["allowedSeconds"], [6, 8, 10, 12, 14, 16, 18, 20])
+            self.assertEqual(validate_video_shot_duration(20, hd_policy), "")
+
+    def test_custom_model_policy_uses_the_configured_integer_range(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            config_dir = Path(tmp) / "configs"
+            config_dir.mkdir()
+            (config_dir / "agent.local.yaml").write_text(yaml.safe_dump({
+                "video": {
+                    "provider": "openrouter",
+                    "model": "custom/video",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "clip_seconds": "5",
+                    "shot_duration_limits": {"openrouter:custom/video": 7},
+                },
+            }), encoding="utf-8")
+            policy = video_duration_policy(tmp)
+            self.assertIsNone(policy["allowedSeconds"])
+            self.assertEqual((policy["minSeconds"], policy["maxSeconds"]), (1, 7))
+            self.assertEqual(validate_video_shot_duration(1, policy), "")
+            self.assertEqual(validate_video_shot_duration(7, policy), "")
+            self.assertIn("exceeds the configured maximum", validate_video_shot_duration(8, policy))
+
+    def test_invalid_model_duration_limits_and_explicit_defaults_are_not_clamped(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            config_dir = Path(tmp) / "configs"
+            config_dir.mkdir()
+            config_path = config_dir / "agent.local.yaml"
+            base = {
+                "provider": "openrouter",
+                "model": "kwaivgi/kling-video-o1",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+            config_path.write_text(yaml.safe_dump({
+                "video": {**base, "clip_seconds": 8},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Configured default duration 8s"):
+                video_duration_policy(tmp)
+            config_path.write_text(yaml.safe_dump({
+                "video": {**base, "shot_duration_limits": {"openrouter:kwaivgi/kling-video-o1": 7}},
+            }), encoding="utf-8")
+            load_agent_config.cache_clear()
+            with self.assertRaisesRegex(ValueError, "maximum 7s is unsupported"):
+                video_duration_policy(tmp)
 
 
 if __name__ == "__main__":

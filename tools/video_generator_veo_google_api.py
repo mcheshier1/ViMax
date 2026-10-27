@@ -6,6 +6,7 @@ from google.genai import types
 from google.genai.errors import ClientError
 from interfaces.video_output import VideoOutput
 from utils.rate_limiter import RateLimiter
+from tools.video_duration import resolve_duration_seconds
 
 # https://ai.google.dev/gemini-api/docs/video-generation?hl=zh-cn
 
@@ -38,6 +39,7 @@ class VideoGeneratorVeoGoogleAPI:
         duration: int = 8,
         **kwargs,
     ) -> VideoOutput:
+        duration = resolve_duration_seconds(kwargs.get("duration_seconds"), duration)
 
         params = {
             "prompt": prompt,

@@ -108,6 +108,12 @@ class ShotDescription(BaseModel):
             "An over-the-shoulder shot at eye level, positioned behind <Alice>. The foreground, including <Alice>'s shoulder and head, is softly blurred, directing focus onto <Bob>'s face. <Bob>'s subtle reactions—shifting from surprise to delight—are clearly visible. The supermarket background is gently blurred with cool fluorescent lighting.",
         ]
     )
+    duration_seconds: Optional[int] = Field(
+        default=None,
+        gt=0,
+        strict=True,
+        description="Optional positive whole-second duration override for this shot. None uses the configured video default.",
+    )
     variation_type: Literal["large", "medium", "small"] = Field(
         description="Indicates the degree of change in the shot's content.",
         examples=["large", "medium", "small"],

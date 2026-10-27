@@ -4,6 +4,7 @@ import {lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utime
 import path from 'node:path';
 import {crc32} from 'node:zlib';
 import {readAgentConfig, readClipSettings} from './config-store.mjs';
+import {validateShotDuration, videoDurationPolicy} from './video-durations.mjs';
 import {withProjectWriteLock} from './project-lock.mjs';
 import {assembleClips} from './film-assembly.mjs';
 
@@ -2132,6 +2133,7 @@ export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
   const resolved = await resolveRenderRoot(repoRoot, workingDir, root, context);
   const discovery = await collectAcceptanceState(workingDir, resolved, context);
   const sets = await readSetReferences(repoRoot, sessionId, resolved);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
   const setArtifacts = (sets?.sets ?? []).flatMap((set) => {
     const base = path.join(workingDir, resolved, 'set_references', set.id);
     return [path.join(base, 'set.json'), ...(['reference.png', 'provenance.json'].map((name) =>
@@ -2145,7 +2147,7 @@ export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
   ].map((relative) => path.isAbsolute(relative) ? relative : path.resolve(workingDir, relative));
   const [acceptance, plans, removed, continuity, artifacts] = await Promise.all([
     acceptancePayload(repoRoot, workingDir, resolved, context, discovery),
-    shotPlansPayload(workingDir, resolved, discovery, context, sets),
+    shotPlansPayload(workingDir, resolved, discovery, context, sets, undefined, durationPolicy),
     listRemoved(workingDir, resolved, context),
     continuityPayload(repoRoot, workingDir, resolved, record, context, discovery),
     collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, context, referenced),
@@ -2267,8 +2269,10 @@ export async function readFilmProgress(repoRoot, sessionId, root = '') {
   const [statusFile, trailFile, watched] = await Promise.all([
     readProgressFile(path.join(workingDir, 'render_status.json')),
     readProgressFile(path.join(workingDir, 'render_events.jsonl'), true),
-    Promise.all(['render_manifest.json', ACCEPTANCE_FILENAME, CONTINUITY_FILENAME, resolved]
-      .map(async (relative) => fileRevision(await stat(path.join(workingDir, relative)).catch(() => null)))),
+    Promise.all([
+      ...['render_manifest.json', ACCEPTANCE_FILENAME, CONTINUITY_FILENAME, resolved].map((relative) => path.join(workingDir, relative)),
+      path.join(repoRoot, 'configs', 'agent.local.yaml'),
+    ].map(async (file) => fileRevision(await stat(file).catch(() => null)))),
   ]);
   const belongsToRoot = (value) => {
     const eventRoot = value?.render_mode || value?.root;
@@ -2480,6 +2484,7 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
   // One clip's length and its per-second price, not a running total: the timeline
   // multiplies them by the clips that do not exist yet.
   const clipSettings = await filmClipSettings(repoRoot, workingDir, context);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
   return {
     root,
     chainedKeyframes: await frameContinuityEnabled(workingDir),
@@ -2491,7 +2496,7 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
       keyframes,
       clips,
       rejected,
-      clipSeconds: clipSettings.seconds,
+      clipSeconds: durationPolicy.defaultSeconds,
       clipCostUsd: clipUsdPerSecond(clipSettings.model, clipSettings.resolution),
       requiredFrameTypes: clipSettings.model === 'heygen/heygen-video-1' ? ['first_frame'] : ['first_frame', 'last_frame'],
     },
@@ -2502,6 +2507,10 @@ function filmClipSettings(repoRoot, workingDir, context) {
   context.clipSettings ??= readRenderManifest(repoRoot, workingDir, context)
     .then((manifest) => readClipSettings(repoRoot, String(manifest?.video_model || '')));
   return context.clipSettings;
+}
+
+async function activeVideoDurationPolicy(repoRoot) {
+  return videoDurationPolicy((await readAgentConfig(repoRoot)).sections.video);
 }
 
 /** The payload slot: its state, plus the note against it, whether or not it was redrawn. */
@@ -3134,14 +3143,14 @@ async function continuityPayload(repoRoot, workingDir, root, record, context, di
   const shots = playing.length ? playing
     : (discovery ?? await collectAcceptanceState(workingDir, root, context)).shots.map((entry) => String(entry.shot));
   const {stale, reason} = await reviewStaleness(workingDir, root, review, shots, String(record.user_requirement ?? ''), context);
-  const clipSettings = await filmClipSettings(repoRoot, workingDir, context);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
   return {
     root,
     review,
     stale,
     staleReason: reason,
     shots,
-    clipSeconds: clipSettings.seconds,
+    clipSeconds: durationPolicy.defaultSeconds,
   };
 }
 
@@ -3273,13 +3282,14 @@ export async function readShotPlans(repoRoot, sessionId, root = '') {
   const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
   const discovery = await collectAcceptanceState(workingDir, resolved, context);
   const setInventory = await readSetReferences(repoRoot, sessionId, resolved);
-  return {root: resolved, plans: await shotPlansPayload(workingDir, resolved, discovery, context, setInventory, reuseContext)};
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
+  return {root: resolved, plans: await shotPlansPayload(workingDir, resolved, discovery, context, setInventory, reuseContext, durationPolicy)};
 }
 
-async function shotPlansPayload(workingDir, root, discovery, context, setInventory, reuseContext) {
+async function shotPlansPayload(workingDir, root, discovery, context, setInventory, reuseContext, durationPolicy) {
   const plans = [];
   for (const {shot} of discovery.shots) {
-    try { plans.push(await shotPlanPayload(workingDir, root, shot, context, setInventory, reuseContext)); }
+    try { plans.push(await shotPlanPayload(workingDir, root, shot, context, setInventory, reuseContext, durationPolicy)); }
     catch { /* A shot with no readable plan is simply not part of what can be shown. */ }
   }
   return plans;
@@ -3335,7 +3345,8 @@ export async function readShotPlan(repoRoot, sessionId, root = '', slot = '') {
   const playback = await filmPlaybackContext(workingDir, resolved, context);
   const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
   const inventory = await readSetReferences(repoRoot, sessionId, resolved);
-  return shotPlanPayload(workingDir, resolved, slot, context, inventory, reuseContext);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
+  return shotPlanPayload(workingDir, resolved, slot, context, inventory, reuseContext, durationPolicy);
 }
 
 /** Rewrite one shot's plan: guidance, frame descriptions, and visible characters. */
@@ -3356,6 +3367,7 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
   const reuseContext = {playback, continuityEnabled: await frameContinuityEnabled(workingDir)};
   const discovery = await collectAcceptanceState(workingDir, root, context);
   if (!discovery.shots.some((entry) => entry.shot === slot)) throw acceptanceError(`Unknown shot: ${slot || '(missing)'}`);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
   if (Object.hasOwn(body, 'reusePreviousLastFrame')) {
     if (typeof body.reusePreviousLastFrame !== 'boolean') {
       throw acceptanceError('reusePreviousLastFrame must be a boolean');
@@ -3374,6 +3386,9 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
     }
   }
   const setInventory = await readSetReferences(repoRoot, sessionId, root);
+  if (Object.hasOwn(body, 'revision') && (typeof body.revision !== 'string' || !body.revision)) {
+    throw acceptanceError('revision must be a non-empty string when supplied');
+  }
   if (Object.hasOwn(body, 'setIds')) {
     if (body.setRevision !== setInventory?.revision) throw conflictError('Set references changed; refresh before saving shot bindings');
     if (!Array.isArray(body.setIds) || !body.setIds.every((id) => typeof id === 'string') || new Set(body.setIds).size !== body.setIds.length) {
@@ -3383,7 +3398,10 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
     const unknown = body.setIds.filter((id) => !SET_ID_PATTERN.test(id) || !known.has(id));
     if (unknown.length) throw acceptanceError(`Unknown set identifier: ${unknown.join(', ')}`);
   }
-  const plan = await shotPlanPayload(workingDir, root, slot, context, setInventory, reuseContext);
+  const plan = await shotPlanPayload(workingDir, root, slot, context, setInventory, reuseContext, durationPolicy);
+  if (Object.hasOwn(body, 'revision') && body.revision !== plan.revision) {
+    throw conflictError('Shot plan or video duration settings changed; refresh before saving');
+  }
 
   const edits = {};
   if (Object.hasOwn(body, 'setIds')) edits.set_ids = [...body.setIds];
@@ -3416,8 +3434,14 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
       edits[`${frame}_vis_char_idxs`] = wanted.sort((left, right) => left - right);
     }
   }
-  if (!Object.keys(edits).length) throw acceptanceError('Nothing to save');
-
+  if (Object.hasOwn(body, 'durationSeconds')) {
+    if (body.durationSeconds !== null) {
+      const error = validateShotDuration(body.durationSeconds, durationPolicy);
+      if (error) throw acceptanceError(error);
+      edits.duration_seconds = body.durationSeconds;
+    }
+  }
+  if (!Object.keys(edits).length && !Object.hasOwn(body, 'durationSeconds')) throw acceptanceError('Nothing to save');
   const location = shotLocation(workingDir, root, slot);
   const target = path.join(location.shotDir, SHOT_DESCRIPTION_FILENAME);
   const current = JSON.parse(await readFile(target, 'utf8'));
@@ -3438,15 +3462,27 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
     && JSON.stringify(plan.setIds) !== JSON.stringify(body.setIds);
   const reuseChoiceChanged = Object.hasOwn(body, 'reusePreviousLastFrame')
     && current.reuse_previous_last_frame !== body.reusePreviousLastFrame;
-  const invalidateOutputs = Object.keys(edits).some((key) => !['set_ids', 'reuse_previous_last_frame'].includes(key))
-    || effectiveSetIdsChanged || reuseChoiceChanged;
+  const changedEditKeys = Object.keys(edits).filter((key) => JSON.stringify(current[key]) !== JSON.stringify(edits[key]));
+  const durationChanged = Object.hasOwn(body, 'durationSeconds')
+    && (body.durationSeconds === null ? Object.hasOwn(current, 'duration_seconds') : current.duration_seconds !== body.durationSeconds);
+  const nonDurationOutputChanged = changedEditKeys.some(
+    (key) => !['set_ids', 'reuse_previous_last_frame', 'duration_seconds'].includes(key),
+  );
+  const durationOnly = durationChanged && !nonDurationOutputChanged && !effectiveSetIdsChanged && !reuseChoiceChanged;
+  const invalidateOutputs = nonDurationOutputChanged || effectiveSetIdsChanged || reuseChoiceChanged || durationChanged;
   await withMutationTransaction(async (transaction) => {
-    if (Object.keys(edits).length) await transaction.write(target, `${JSON.stringify({...current, ...edits}, null, 4)}\n`);
+    if (changedEditKeys.length || durationChanged) {
+      const updatedDescription = {...current, ...edits};
+      if (Object.hasOwn(body, 'durationSeconds') && body.durationSeconds === null) delete updatedDescription.duration_seconds;
+      await transaction.write(target, `${JSON.stringify(updatedDescription, null, 4)}\n`);
+    }
     if (Object.hasOwn(body, 'brief')) {
       await transaction.write(location.storyboardPath, `${JSON.stringify(storyboard, null, 4)}\n`);
       if (isPlainObject(currentBrief)) await transaction.write(briefTarget, `${JSON.stringify(currentBrief, null, 4)}\n`);
     }
-    if (invalidateOutputs) {
+    if (durationOnly) {
+      await invalidateDurationOutputs(transaction, workingDir, root, slot);
+    } else if (invalidateOutputs) {
       await invalidateTimelineOutputs(transaction, workingDir, root, [slot], true, {
         continuitySourceSlots: sourceEndingChanged || effectiveSetIdsChanged || reuseChoiceChanged ? [slot] : [],
         forceContinuity: reuseChoiceChanged,
@@ -3460,7 +3496,7 @@ async function updateShotPlanUnlocked(repoRoot, input = {}) {
   return shotPlanPayload(workingDir, root, slot, updatedContext, updatedInventory, {
     playback: updatedPlayback,
     continuityEnabled: await frameContinuityEnabled(workingDir),
-  });
+  }, durationPolicy);
 
 }
 /** Preview a shot reset against the exact outputs and dependency metadata on disk. */
@@ -3823,7 +3859,12 @@ async function createShotUnlocked(repoRoot, input = {}) {
   const camera = cameras.find((entry) => (entry.active_shot_idxs || []).map(String).includes(afterLocation.local));
   if (!camera) throw acceptanceError(`Shot ${after} is not part of a camera, so there is nothing to add a shot after`);
   const setInventory = await readSetReferences(repoRoot, sessionId, root);
-  const reference = await shotPlanPayload(workingDir, root, after, createFilmReadContext(), setInventory);
+  const durationPolicy = await activeVideoDurationPolicy(repoRoot);
+  if (Object.hasOwn(body, 'durationSeconds') && body.durationSeconds !== null) {
+    const error = validateShotDuration(body.durationSeconds, durationPolicy);
+    if (error) throw acceptanceError(error);
+  }
+  const reference = await shotPlanPayload(workingDir, root, after, createFilmReadContext(), setInventory, undefined, durationPolicy);
   const sourcePath = path.join(afterLocation.shotDir, SHOT_DESCRIPTION_FILENAME);
   const source = JSON.parse(await readFile(sourcePath, 'utf8'));
 
@@ -3874,6 +3915,10 @@ async function createShotUnlocked(repoRoot, input = {}) {
   if (!Array.isArray(storyboard)) throw acceptanceError('The storyboard is not a list');
   storyboard = [...storyboard, {idx: localSlot, is_last: false, cam_idx: camera.idx, visual_desc: brief, audio_desc: audioDesc}];
   const created = {...source, idx: localSlot, is_last: false, cam_idx: camera.idx, set_ids: [...reference.setIds], ...frames, audio_desc: audioDesc};
+  delete created.duration_seconds;
+  if (Object.hasOwn(body, 'durationSeconds') && body.durationSeconds !== null) {
+    created.duration_seconds = body.durationSeconds;
+  }
   if (motionDesc) created.motion_desc = motionDesc;
 
   await withMutationTransaction(async (transaction) => {
@@ -3986,6 +4031,36 @@ async function invalidateTimelineOutputs(
       if (location.scene) films.add(path.join(location.container, 'final_video.mp4'));
     }
     for (const film of films) await transaction.remove(film);
+  }
+}
+async function invalidateDurationOutputs(transaction, workingDir, root, slot) {
+  const store = await readAcceptanceFile(workingDir);
+  const rootStore = isPlainObject(store[root]) ? store[root] : {};
+  const shots = isPlainObject(rootStore.shots) ? rootStore.shots : {};
+  const shotRecord = shots[String(slot)];
+  const now = isoSeconds();
+  let changed = false;
+  if (isPlainObject(shotRecord) && isPlainObject(shotRecord.clips)) {
+    shotRecord.clips = {
+      ...shotRecord.clips,
+      invalidated_at: now,
+      invalidation_reason: 'The shot duration changed; regenerate and review this clip.',
+    };
+    shots[String(slot)] = shotRecord;
+    rootStore.shots = shots;
+    changed = true;
+  }
+  if (isPlainObject(rootStore.final_video)) {
+    rootStore.final_video = {
+      ...rootStore.final_video,
+      invalidated_at: now,
+      invalidation_reason: 'A shot duration changed; rebuild and review the final assembly.',
+    };
+    changed = true;
+  }
+  if (changed) {
+    store[root] = rootStore;
+    await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(store, null, 2)}\n`);
   }
 }
 
@@ -4130,7 +4205,7 @@ async function pathExists(target) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-async function shotPlanPayload(workingDir, root, slot, context = createFilmReadContext(), setInventory, reuseContext) {
+async function shotPlanPayload(workingDir, root, slot, context = createFilmReadContext(), setInventory, reuseContext, durationPolicy) {
   const location = shotLocation(workingDir, root, slot);
   const shotDir = location.shotDir;
   let description;
@@ -4163,13 +4238,19 @@ async function shotPlanPayload(workingDir, root, slot, context = createFilmReadC
     } catch { return ''; }
   };
   const setShot = setInventory?.shots.find((shot) => shot.slot === String(slot));
+  const durationOverrideSeconds = Number.isSafeInteger(description.duration_seconds) && description.duration_seconds > 0
+    ? description.duration_seconds : null;
+  const revision = createHash('sha256').update(JSON.stringify([root, String(slot), description, durationPolicy])).digest('hex');
   return {
-    slot: String(slot), root,
+    slot: String(slot), root, revision,
     brief,
     characters,
     firstFrame: {description: String(description.ff_desc || ''), visible: [...(description.ff_vis_char_idxs || [])], prompt: await prompt('first_frame')},
     lastFrame: {description: String(description.lf_desc || ''), visible: [...(description.lf_vis_char_idxs || [])], prompt: await prompt('last_frame')},
     motionDescription: String(description.motion_desc || ''),
+    durationSeconds: durationOverrideSeconds ?? durationPolicy.defaultSeconds,
+    durationOverrideSeconds,
+    durationPolicy,
     reusePreviousLastFrame,
     previousSlot,
     previousLastFrameAvailable,

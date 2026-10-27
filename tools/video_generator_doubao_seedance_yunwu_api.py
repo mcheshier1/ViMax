@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 
 
 class VideoGeneratorDoubaoSeedanceYunwuAPI:
@@ -45,6 +46,7 @@ class VideoGeneratorDoubaoSeedanceYunwuAPI:
         Returns:
             Task ID string
         """
+        duration = resolve_duration_seconds(duration, 5, allowed=(5, 10))
         if len(reference_image_paths) == 0:
             model = self.t2v_model
         elif len(reference_image_paths) == 1:
@@ -206,6 +208,7 @@ class VideoGeneratorDoubaoSeedanceYunwuAPI:
         Returns:
             VideoOutput containing the video URL
         """
+        duration = resolve_duration_seconds(kwargs.get("duration_seconds"), duration, allowed=(5, 10))
         task_id = await self.create_video_generation_task(prompt, reference_image_paths, resolution, aspect_ratio, fps, duration)
         video_url = await self.query_video_generation_task(task_id)
         return VideoOutput(fmt="url", ext="mp4", data=video_url)

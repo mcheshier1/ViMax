@@ -160,6 +160,61 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         """
         return getattr(self.video_generator, "clip_seconds", None)
 
+    def _effective_shot_duration(self, shot_description: ShotDescription) -> int:
+        policy = getattr(self.video_generator, "duration_policy", None)
+        duration = shot_description.duration_seconds
+        if duration is None:
+            if isinstance(policy, dict):
+                return int(policy.get("defaultSeconds") or self.clip_seconds() or 8)
+            return int(self.clip_seconds() or 8)
+        if not isinstance(policy, dict) or not policy.get("configured"):
+            provider = policy.get("provider") if isinstance(policy, dict) else "active video model"
+            model = policy.get("model") if isinstance(policy, dict) else ""
+            raise ValueError(
+                f"Shot {shot_description.idx} has an explicit duration override, but no maximum is configured "
+                f"for {provider}:{model}. Configure a limit in video settings before rendering."
+            )
+        allowed = policy.get("allowedSeconds")
+        if isinstance(allowed, list):
+            if duration not in allowed:
+                raise ValueError(
+                    f"Shot {shot_description.idx} duration {duration}s is unsupported by "
+                    f"{policy.get('provider')}:{policy.get('model')}; allowed durations: {allowed}."
+                )
+        elif duration > int(policy.get("maxSeconds") or 0):
+            raise ValueError(
+                f"Shot {shot_description.idx} duration {duration}s exceeds the configured maximum "
+                f"of {policy.get('maxSeconds')}s."
+            )
+        if duration < int(policy.get("minSeconds") or 1):
+            raise ValueError(
+                f"Shot {shot_description.idx} duration {duration}s is below the minimum supported "
+                f"duration of {policy.get('minSeconds')}s."
+            )
+        return duration
+
+    def _preflight_saved_shot_durations(self, only_shots: set[int] | None) -> None:
+        shot_root = Path(self.working_dir) / "shots"
+        if not shot_root.is_dir():
+            return
+        for path in shot_root.glob("*/shot_description.json"):
+            if not path.parent.name.isdigit():
+                continue
+            shot_idx = int(path.parent.name)
+            if only_shots is not None and shot_idx not in only_shots:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Cannot read shot {shot_idx} duration settings: {exc}") from exc
+            if not isinstance(payload, dict) or payload.get("duration_seconds") is None:
+                continue
+            try:
+                shot = ShotDescription.model_validate(payload)
+            except Exception as exc:
+                raise ValueError(f"Invalid duration override in shot {shot_idx}: {exc}") from exc
+            self._effective_shot_duration(shot)
+
     async def _brackets_clips(self) -> bool:
         """Whether the video model accepts an end keyframe.
 
@@ -329,6 +384,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 progress=progress,
             )
             return self.render_outcome("sets", style, set_references=set_images, awaiting="stills")
+        self._preflight_saved_shot_durations(only_set)
         if characters is None:
             _emit_render_progress(progress, "extract_characters", "Extracting characters before render")
             characters = await self.extract_characters(script=script, quiet=quiet)
@@ -1457,6 +1513,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         shot_description: ShotDescription,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ):
+        duration_seconds = self._effective_shot_duration(shot_description)
         video_path = self.clip_path(shot_description.idx)
         if os.path.exists(video_path):
             print(f"🚀 Skipped generating video for shot {shot_description.idx}, already exists.")
@@ -1478,6 +1535,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             video_output = await self.video_generator.generate_single_video(
                 prompt=self._review_note(shot_description.idx, shot_description.motion_desc + "\n" + shot_description.audio_desc),
                 reference_image_paths=frame_paths,
+                duration_seconds=duration_seconds,
                 progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
             )
             os.makedirs(os.path.dirname(video_path), exist_ok=True)

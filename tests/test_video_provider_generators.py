@@ -1,15 +1,22 @@
-import unittest
 import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from PIL import Image
+from interfaces import ShotDescription
 
+from pipelines.script2video_pipeline import Script2VideoPipeline
 from tools.video_generator_agnes_api import VideoGeneratorAgnesAPI, _retry_after_seconds
 from tools.video_generator_ltx_api import VideoGeneratorLTXAPI
-
+from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
+from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
 VIDEO_BYTES = b"\x00\x00\x00\x18ftypmp42video"
 
@@ -42,13 +49,126 @@ class ProviderGenerationTests(unittest.IsolatedAsyncioTestCase):
             clip_seconds=10, resolution="720p", generate_audio=False,
         )
 
-        output = await generator.generate_single_video(prompt="A lighthouse in a storm", aspect_ratio="9:16")
+        output = await generator.generate_single_video(
+            prompt="A lighthouse in a storm",
+            aspect_ratio="9:16",
+            duration_seconds=6,
+        )
 
         self.assertEqual(requests, [("/v1/text-to-video", {
-            "prompt": "A lighthouse in a storm", "model": "ltx-2-5-fast", "duration": 10,
+            "prompt": "A lighthouse in a storm", "model": "ltx-2-5-fast", "duration": 6,
             "resolution": "720x1280", "generate_audio": False,
         }, "Bearer ltx-secret")])
         self.assertEqual(output.data, VIDEO_BYTES)
+
+    async def test_yunwu_veo_rejects_non_eight_second_override_before_submission(self):
+        generator = VideoGeneratorVeoYunwuAPI(api_key="offline-test-key")
+        self.assertEqual(generator.clip_seconds, 8)
+        with self.assertRaisesRegex(ValueError, "fixed 8-second clips only"):
+            await generator.generate_single_video(duration_seconds=10)
+
+    async def test_agnes_rejects_known_unsupported_duration_before_submission(self):
+        generator = VideoGeneratorAgnesAPI(api_key="offline-test-key", model="agnes-video-2.5")
+        with self.assertRaisesRegex(ValueError, "supported durations"):
+            await generator.generate_single_video(duration_seconds=13)
+
+    async def test_pipeline_sends_distinct_shot_durations_in_real_provider_payloads(self):
+        requests = []
+
+        async def capabilities(_request):
+            return web.json_response({"data": [{
+                "id": "test/duration",
+                "supported_frame_images": ["first_frame"],
+                "supported_durations": [5, 10],
+                "supported_resolutions": ["720p"],
+                "supported_aspect_ratios": ["16:9"],
+                "generate_audio": True,
+            }]})
+
+        async def create(request):
+            payload = await request.json()
+            requests.append(payload)
+            job_id = f"job-{len(requests)}"
+            return web.json_response({
+                "id": job_id,
+                "polling_url": f"/api/v1/videos/{job_id}",
+                "status": "queued",
+            })
+
+        async def poll(request):
+            job_id = request.match_info["job_id"]
+            return web.json_response({
+                "status": "completed",
+                "unsigned_urls": [str(server.make_url(f"/api/v1/videos/{job_id}/content"))],
+            })
+
+        async def content(_request):
+            return web.Response(body=VIDEO_BYTES, content_type="video/mp4")
+
+        app = web.Application()
+        app.router.add_get("/api/v1/videos/models", capabilities)
+        app.router.add_post("/api/v1/videos", create)
+        app.router.add_get("/api/v1/videos/{job_id}", poll)
+        app.router.add_get("/api/v1/videos/{job_id}/content", content)
+        server = TestServer(app)
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+
+        generator = VideoGeneratorOpenRouterAPI(
+            api_key="offline-test-key",
+            model="test/duration",
+            base_url=str(server.make_url("/api/v1")).rstrip("/"),
+            clip_seconds=8,
+            resolution="720p",
+            generate_audio=True,
+        )
+        generator.duration_policy = {
+            "provider": "openrouter",
+            "model": "test/duration",
+            "configured": True,
+            "defaultSeconds": 8,
+            "minSeconds": 5,
+            "maxSeconds": 10,
+            "allowedSeconds": [5, 10],
+        }
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        pipeline = Script2VideoPipeline(
+            chat_model=object(),
+            image_generator=SimpleNamespace(model="test/image"),
+            video_generator=generator,
+            working_dir=temporary.name,
+        )
+        pipeline.frame_bracketing = False
+        with patch.dict("os.environ", {"VIMAX_VIDEO_POLL_INTERVAL_SECONDS": "0"}, clear=True):
+            for shot_idx, duration in enumerate((5, 10)):
+                frame_path = Path(pipeline.frame_path(shot_idx, "first_frame"))
+                frame_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (16, 9), "blue").save(frame_path)
+                pipeline.frame_events[shot_idx] = {
+                    "first_frame": asyncio.Event(),
+                    "last_frame": asyncio.Event(),
+                }
+                pipeline.frame_events[shot_idx]["first_frame"].set()
+                shot = ShotDescription(
+                    idx=shot_idx,
+                    is_last=True,
+                    cam_idx=0,
+                    visual_desc=f"shot {shot_idx}",
+                    variation_type="small",
+                    variation_reason="test",
+                    ff_desc="first frame",
+                    ff_vis_char_idxs=[],
+                    lf_desc="last frame",
+                    lf_vis_char_idxs=[],
+                    motion_desc=f"shot {shot_idx}",
+                    audio_desc="",
+                    duration_seconds=duration,
+                )
+                await pipeline.generate_video_for_single_shot(shot)
+
+        self.assertEqual([request["duration"] for request in requests], [5, 10])
+        self.assertEqual(generator.clip_seconds, 8)
 
     async def test_agnes_creates_polls_and_downloads_completed_video(self):
         requests = []
@@ -76,11 +196,11 @@ class ProviderGenerationTests(unittest.IsolatedAsyncioTestCase):
             clip_seconds=8, resolution="1080p",
         )
         with patch("tools.video_generator_agnes_api.asyncio.sleep"):
-            output = await generator.generate_single_video(prompt="A quiet sunrise")
+            output = await generator.generate_single_video(prompt="A quiet sunrise", duration_seconds=10)
 
         self.assertEqual(requests[0], ("/v1/videos", {
             "model": "agnes-video-2.5", "prompt": "A quiet sunrise", "mode": "text",
-            "seconds": "8", "size": "1080P", "aspect_ratio": "16:9",
+            "seconds": "10", "size": "1080P", "aspect_ratio": "16:9",
         }))
         self.assertEqual(requests[1], ("/agnesapi", {"video_id": "video-1", "model_name": "agnes-video-2.5"}))
         self.assertEqual(output.data, VIDEO_BYTES)

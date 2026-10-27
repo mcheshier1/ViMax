@@ -11,6 +11,7 @@ import aiohttp
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 
 
 VIDEO_CREATE_BACKOFF_INITIAL = 3.0
@@ -38,11 +39,17 @@ class VideoGeneratorAgnesAPI:
 
     async def generate_single_video(self, prompt: str = "", reference_image_paths=None, aspect_ratio: str = "16:9", **kwargs) -> VideoOutput:
         paths = reference_image_paths or []
+        allowed_durations = range(4, 13) if self.model in {"agnes-video-2.5", "agnes-video-2.5-flash"} else None
+        duration = resolve_duration_seconds(
+            kwargs.get("duration_seconds"),
+            self.clip_seconds,
+            allowed=allowed_durations,
+        )
         payload = {
             "model": self.model,
             "prompt": prompt,
             "mode": "keyframe" if paths else "text",
-            "seconds": str(self.clip_seconds),
+            "seconds": str(duration),
             "size": _resolution(self.resolution),
             "aspect_ratio": aspect_ratio,
         }
@@ -52,7 +59,7 @@ class VideoGeneratorAgnesAPI:
                 payload["last_frame"] = image_path_to_b64(paths[-1])
         progress = kwargs.get("progress")
         if progress:
-            progress("video_create", f"Creating Agnes video with {self.model}", {"model": self.model, "duration": self.clip_seconds, "resolution": payload["size"]})
+            progress("video_create", f"Creating Agnes video with {self.model}", {"model": self.model, "duration": duration, "resolution": payload["size"]})
         request_timeout = float(os.environ.get("VIMAX_VIDEO_REQUEST_TIMEOUT_SECONDS", "60"))
         query_timeout = float(os.environ.get("VIMAX_VIDEO_QUERY_TIMEOUT_SECONDS", "0"))
         timeout = aiohttp.ClientTimeout(total=request_timeout)

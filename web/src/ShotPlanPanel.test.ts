@@ -2,7 +2,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {hasFilmDrafts, hasSessionFilmDrafts, reconcileFilmDrafts} from './ShotPlanPanel';
 import type {AcceptanceStage, ShotPlan} from './types';
 
-const fields = {ffDesc: 'Empty saloon', lfDesc: 'Empty saloon at dusk', ffVis: [], lfVis: [], brief: 'Exterior', motionDesc: 'Static camera', setIds: ['saloon']};
+const fields = {ffDesc: 'Empty saloon', lfDesc: 'Empty saloon at dusk', ffVis: [], lfVis: [], brief: 'Exterior', motionDesc: 'Static camera', setIds: ['saloon'], durationSeconds: null};
 const key = (slot: string) => `vimax:film-draft:${sessionId}:script2video:${encodeURIComponent(slot)}`;
 let records: Map<string, string>;
 let sessionId: string;
@@ -32,6 +32,8 @@ function savedPlan(slot: string): ShotPlan {
     firstFrame: {description: fields.ffDesc, visible: fields.ffVis, prompt: ''},
     lastFrame: {description: fields.lfDesc, visible: fields.lfVis, prompt: ''},
     motionDescription: fields.motionDesc, sets: [], setIds: fields.setIds, setRevision: 'saved',
+    revision: 'saved', durationSeconds: 8, durationOverrideSeconds: null,
+    durationPolicy: {provider: 'agnes', model: 'agnes-video-2.5', configured: true, defaultSeconds: 8, minSeconds: 4, maxSeconds: 12, allowedSeconds: [4, 5, 6, 7, 8, 9, 10, 11, 12]},
     reusePreviousLastFrame: false, previousSlot: slot === '0' ? null : '0', previousLastFrameAvailable: false};
 }
 
@@ -120,5 +122,21 @@ describe('persisted shot draft protection', () => {
     reconcileFilmDrafts(sessionId, 'script2video', [moved], []);
     expect(hasFilmDrafts(sessionId, 'script2video', ['1'])).toBe(true);
     expect(JSON.parse(records.get(key('1'))!).plan.previousSlot).toBe('0');
+  });
+  it('preserves an unsaved shot length until that exact override is saved', () => {
+    const changed = store('1', {durationSeconds: 12});
+    reconcileFilmDrafts(sessionId, 'script2video', [savedPlan('0'), savedPlan('1')], []);
+    expect(hasFilmDrafts(sessionId, 'script2video', ['1'])).toBe(true);
+    expect(records.get(key('1'))).toBe(changed);
+    reconcileFilmDrafts(sessionId, 'script2video', [{...savedPlan('1'), durationSeconds: 12, durationOverrideSeconds: 12}], []);
+    expect(hasFilmDrafts(sessionId, 'script2video', ['1'])).toBe(false);
+  });
+
+  it('keeps resetting a custom duration to the default as a genuine draft', () => {
+    records.set(key('1'), JSON.stringify({base: {...fields, durationSeconds: 12}, plan: fields, notes: {}, revision: 1}));
+    reconcileFilmDrafts(sessionId, 'script2video', [{...savedPlan('1'), durationSeconds: 12, durationOverrideSeconds: 12}], []);
+    expect(hasFilmDrafts(sessionId, 'script2video', ['1'])).toBe(true);
+    reconcileFilmDrafts(sessionId, 'script2video', [savedPlan('1')], []);
+    expect(hasFilmDrafts(sessionId, 'script2video', ['1'])).toBe(false);
   });
 });

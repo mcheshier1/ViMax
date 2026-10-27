@@ -35,6 +35,9 @@ describe('agent replacement safety', () => {
       const pid = await readFile(path.join(server.root, 'started-first'), 'utf8');
       const queued = await server.request('/api/messages', {sessionId: 'original', text: 'second', messageId: 'second'});
       expect(await queued.json()).toMatchObject({queued: true});
+      const configSave = await fetch(server.url + '/api/config', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sections: {video: {model: 'agnes-video-2.5', shot_duration_limits: {'agnes:agnes-video-2.5': 12}}}})});
+      expect(configSave.status).toBe(409);
+      expect(existsSync(path.join(server.root, 'configs', 'agent.local.yaml'))).toBe(false);
 
       for (const body of [{newSession: true, projectName: 'New project'}, {sessionId: 'other'}, {sessionId: 'original'}]) {
         const response = await server.request('/api/agent/start', body);

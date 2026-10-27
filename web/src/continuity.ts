@@ -142,12 +142,6 @@ export function reviewRequestText(root = ''): string {
   );
 }
 
-/** How long the film runs, which is what the runtime finding compares against the request. */
-export function runtimeLine(shots: number, clipSeconds: number): string {
-  if (!shots || !clipSeconds) return '';
-  return `${shots} shots x ${clipSeconds}s = ${shots * clipSeconds}s`;
-}
-
 /** What the card's header says about the review it is showing. */
 export function reviewStatusLine(payload: ContinuityPayload | null, options: {asking?: boolean} = {}): string {
   if (options.asking) return 'Reviewing the timeline against the script…';

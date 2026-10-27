@@ -6,6 +6,7 @@ import aiohttp
 import os
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 
 
 def _env_int(name: str, default: int) -> int:
@@ -57,6 +58,7 @@ class VideoGeneratorVeoYunwuAPI:
         self.t2v_model = t2v_model
         self.ff2v_model = ff2v_model
         self.flf2v_model = flf2v_model
+        self.clip_seconds = 8
 
     async def generate_single_video(
         self,
@@ -66,6 +68,7 @@ class VideoGeneratorVeoYunwuAPI:
         **kwargs,
     ) -> VideoOutput:
         progress = kwargs.get("progress")
+        resolve_duration_seconds(kwargs.get("duration_seconds"), 8, fixed=8)
         create_retries = _env_int("VIMAX_VIDEO_CREATE_RETRIES", 3)
         query_timeout_seconds = _env_float("VIMAX_VIDEO_QUERY_TIMEOUT_SECONDS", 600.0)
         request_timeout_seconds = _env_float("VIMAX_VIDEO_REQUEST_TIMEOUT_SECONDS", 60.0)

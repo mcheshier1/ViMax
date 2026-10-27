@@ -151,6 +151,25 @@ def test_runtime_check_warns_outside_the_requested_range():
     assert next(check for check in inside if check.id == "runtime").status == "ok"
 
 
+def test_runtime_check_sums_per_shot_durations_in_playback_order():
+    checks = run_checks(
+        script=SCRIPT,
+        requirement="23-23 second short.",
+        characters=_characters(),
+        camera_tree=_tree(),
+        rows_by_idx={0: _rows(), 3: _rows(), 1: _rows()},
+        plan_rows_by_idx={
+            0: {"duration_seconds": 5},
+            3: {"duration_seconds": 10},
+            1: {"duration_seconds": 8},
+        },
+        clip_seconds=8,
+    )
+    runtime = next(check for check in checks if check.id == "runtime")
+    assert runtime.status == "ok"
+    assert "23s" in runtime.message
+
+
 def test_dialogue_check_reports_ok_when_nothing_is_missing():
     rows = {0: _rows(audio='[Speaker] Claude: "What? I\'m eating tokens and reasoning here!"')}
     checks = run_checks(
@@ -244,16 +263,21 @@ def test_evidence_lists_shots_in_play_order_and_separates_cut_shots():
         script=SCRIPT, requirement="45-60 second comedic short.", characters=_characters(),
         camera_tree=_tree(), rows_by_idx={0: _rows(), 1: _rows(), 3: _rows()},
         removed_rows_by_idx={5: {"visual_desc": "Wife steels herself", "audio_desc": "", "cam_idx": 2}},
-        plan_rows_by_idx={0: {"ff_desc": "Medium shot of the living room.", "lf_desc": "The same frame."}},
-        checks=[Check(id="runtime", status="ok", message="15s")], clip_seconds=5,
+        plan_rows_by_idx={
+            0: {"ff_desc": "Medium shot of the living room.", "lf_desc": "The same frame.", "duration_seconds": 5},
+            1: {"duration_seconds": 8},
+            3: {"duration_seconds": 10},
+        },
+        checks=[Check(id="runtime", status="ok", message="23s")], clip_seconds=8,
     )
     assert [row["shot"] for row in evidence["timeline"]] == [0, 3, 1]
     assert [row["shot"] for row in evidence["cut_shots"]] == [5]
+    assert [row["duration_seconds"] for row in evidence["timeline"]] == [5, 10, 8]
     # a shot carries the frames it will be drawn from, so suggestions can match the film's style
     assert evidence["timeline"][0]["frames"] == {"first": "Medium shot of the living room.", "last": "The same frame."}
     assert evidence["timeline"][1]["frames"] == {"first": None, "last": None}
     assert evidence["deterministic_findings"][0]["id"] == "runtime"
-    assert evidence["clip_seconds"] == 5
+    assert evidence["clip_seconds"] == 8
 
 
 def test_review_round_trips_through_disk(tmp_path):

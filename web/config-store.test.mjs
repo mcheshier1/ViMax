@@ -5,6 +5,7 @@ import {afterEach, describe, expect, it} from 'vitest';
 import {parse, stringify} from 'yaml';
 import {readAgentConfig, readClipSettings, saveAgentConfig} from './config-store.mjs';
 import {credentialProvider} from './provider-credentials.mjs';
+import {videoDurationPolicy} from './video-durations.mjs';
 
 const roots = [];
 
@@ -386,6 +387,71 @@ describe('agent config store', () => {
     });
     expect(JSON.stringify(config)).not.toContain('video-secret');
     expect(await readClipSettings(root)).toMatchObject({seconds: 10, model: 'ltx-2-5-fast'});
+  });
+
+  it('saves model-specific maxima, preserves other model entries, and leaves cached media untouched', async () => {
+    const root = await fixture();
+    const cachedClip = path.join(root, '.working_dir', 'session', 'script2video', 'shots', '0', 'model', 'video.mp4');
+    await mkdir(path.dirname(cachedClip), {recursive: true});
+    await writeFile(cachedClip, 'existing clip');
+    const otherIdentity = 'agnes:agnes-video-2.5';
+    await writeConfig(root, {
+      video: {
+        provider: 'ltx', model: 'ltx-2-5-fast', clip_seconds: 10,
+        shot_duration_limits: {[otherIdentity]: 12},
+      },
+    });
+
+    const saved = await saveAgentConfig(root, {
+      sections: {video: {shot_duration_limits: {'ltx:ltx-2-5-fast': 14}}},
+    });
+    expect(saved.sections.video.shot_duration_limits).toEqual({
+      [otherIdentity]: 12,
+      'ltx:ltx-2-5-fast': 14,
+    });
+    expect(videoDurationPolicy(saved.sections.video).configured).toBe(true);
+
+    await saveAgentConfig(root, {sections: {video: {model: 'ltx-2-5-pro'}}});
+    expect((await readAgentConfig(root)).sections.video.shot_duration_limits).toEqual({
+      [otherIdentity]: 12,
+      'ltx:ltx-2-5-fast': 14,
+    });
+    expect(await readFile(cachedClip, 'utf8')).toBe('existing clip');
+  });
+
+  it('rejects an invalid active model maximum without modifying the config file', async () => {
+    const root = await fixture();
+    const configPath = path.join(root, 'configs', 'agent.local.yaml');
+    await writeConfig(root, {
+      video: {
+        provider: 'openrouter', model: 'google/veo-3.1-lite', clip_seconds: 8,
+        shot_duration_limits: {'openrouter:google/veo-3.1-lite': 9},
+      },
+    });
+    const before = await readFile(configPath, 'utf8');
+
+    await expect(saveAgentConfig(root, {sections: {image: {model: 'not-written'}}}))
+      .rejects.toThrow(/supported values/);
+    expect(await readFile(configPath, 'utf8')).toBe(before);
+    await writeConfig(root, {
+      video: {
+        provider: 'openrouter', model: 'google/veo-3.1-lite', clip_seconds: 8,
+        shot_duration_limits: {'openrouter:google/veo-3.1-lite': 6},
+      },
+    });
+    const beforeBelowDefault = await readFile(configPath, 'utf8');
+    await expect(saveAgentConfig(root, {sections: {image: {model: 'still-not-written'}}}))
+      .rejects.toThrow(/at least the default duration of 8/);
+    expect(await readFile(configPath, 'utf8')).toBe(beforeBelowDefault);
+  });
+
+  it('rejects an unsupported default without silently normalizing or writing it', async () => {
+    const root = await fixture();
+    await writeConfig(root, {video: {provider: 'openrouter', model: 'google/veo-3.1-lite', clip_seconds: 8}});
+    const configPath = path.join(root, 'configs', 'agent.local.yaml');
+    const before = await readFile(configPath, 'utf8');
+    await expect(saveAgentConfig(root, {sections: {video: {clip_seconds: '7'}}})).rejects.toThrow(/supported positive whole duration/);
+    expect(await readFile(configPath, 'utf8')).toBe(before);
   });
 
   it('does not migrate a stale active-key mirror into an already scoped provider bank', async () => {

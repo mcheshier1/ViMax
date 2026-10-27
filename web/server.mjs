@@ -89,8 +89,12 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, await readAgentConfig(repoRoot));
     }
     if (url.pathname === '/api/config' && request.method === 'PUT') {
-      const config = await saveAgentConfig(repoRoot, await readJsonBody(request));
-      stopAgent('config');
+      const body = await readJsonBody(request);
+      if (agentQueue.hasWorkFor(activeSessionId)) {
+        return sendJson(response, 409, {error: 'The agent has active or queued work. Wait for it to finish before saving model settings. The current request has not been cancelled.'});
+      }
+      const config = await saveAgentConfig(repoRoot, body);
+      if (!agentQueue.hasWorkFor(activeSessionId)) stopAgent('config');
       return sendJson(response, 200, config);
     }
     if (url.pathname === '/api/sessions' && request.method === 'DELETE') {

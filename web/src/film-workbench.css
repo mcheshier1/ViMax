@@ -70,6 +70,8 @@
 .film-plan-fields { padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; }
 .film-plan-fields .plan-frame { margin-top: 14px; }
 .film-plan-fields .plan-frame:first-child { margin-top: 0; }
+.film-shot-duration label { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; color: var(--ink); font-size: 12px; }
+.film-shot-duration select, .film-shot-duration input { max-width: 220px; min-height: 32px; padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--ink); background: var(--surface-soft); font: inherit; }
 .film-workbench .plan-frame-description { margin: 10px 0; color: var(--ink); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .film-workbench .plan-frame header strong { color: var(--ink); font-size: 12px; }
 .film-workbench .plan-frame textarea, .film-workbench .film-feedback textarea, .film-workbench .film-feedback input, .film-workbench .coverage-field textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; padding: 9px 10px; resize: vertical; color: var(--ink); background: var(--surface-soft); line-height: 1.6; font-size: 12px; }

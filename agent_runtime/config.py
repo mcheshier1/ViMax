@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -200,6 +201,139 @@ def video_clip_seconds(workspace_root: str | Path = ".") -> int:
         return max(1, int(float(raw)))
     except (TypeError, ValueError):
         return DEFAULT_VIDEO_CLIP_SECONDS
+
+
+@lru_cache(maxsize=1)
+def _video_duration_models() -> dict[str, list[int]]:
+    """Load the shared provider/model duration catalog."""
+    path = Path(__file__).resolve().parents[1] / "configs" / "video-duration-models.json"
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Video duration catalog {path} is missing") from exc
+    try:
+        catalog = json.loads(payload)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid video duration catalog {path}: {exc}") from exc
+    if not isinstance(catalog, dict):
+        raise RuntimeError(f"Video duration catalog {path} must be a JSON object")
+    normalized: dict[str, list[int]] = {}
+    for key, values in catalog.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values)
+            or values != sorted(set(values))
+        ):
+            raise RuntimeError(f"Invalid duration entry for {key!r} in {path}")
+        normalized[key] = values
+    return normalized
+
+
+def video_duration_policy(workspace_root: str | Path = ".") -> dict[str, Any]:
+    """Resolve the active model's default and explicit shot-duration bounds."""
+    provider = video_provider(workspace_root)
+    model = video_model(workspace_root)
+    key = f"{provider}:{model}"
+    catalog = _video_duration_models()
+    supported = [8] if provider == "yunwu" else catalog.get(key)
+    if provider == "ltx" and model.endswith("-fast") and supported:
+        resolution = video_resolution(workspace_root).strip().lower().replace(" ", "")
+        if resolution in {"1440p", "4k", "2560x1440", "3840x2160"}:
+            supported = [seconds for seconds in supported if seconds <= 10]
+    section = load_agent_config(workspace_root).get("video", {})
+    section = section if isinstance(section, dict) else {}
+    limits = section.get("shot_duration_limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("video.shot_duration_limits must be a mapping")
+    configured = key in limits
+    configured_max = limits.get(key)
+    if configured and (
+        not isinstance(configured_max, int)
+        or isinstance(configured_max, bool)
+        or configured_max < 1
+    ):
+        raise ValueError(f"video.shot_duration_limits[{key!r}] must be a positive whole number")
+    if provider == "yunwu" and configured and configured_max != 8:
+        raise ValueError(f"{key} supports fixed 8-second clips only")
+    if supported and configured and configured_max not in supported:
+        raise ValueError(
+            f"Configured shot duration maximum {configured_max}s is unsupported by {key}; "
+            f"supported durations: {supported}"
+        )
+
+    allowed = [seconds for seconds in supported if seconds <= configured_max] if supported and configured else supported
+    if allowed == []:
+        raise ValueError(f"Configured shot duration maximum for {key} is below its minimum supported duration")
+    saved_default = section.get("clip_seconds")
+    environment_default = os.environ.get("VIMAX_OPENROUTER_VIDEO_DURATION")
+    explicit_default = saved_default not in (None, "") or environment_default not in (None, "")
+    if saved_default not in (None, ""):
+        if isinstance(saved_default, bool) or not isinstance(saved_default, (int, str)):
+            raise ValueError("video.clip_seconds must be a positive whole number")
+        try:
+            parsed_default = float(saved_default)
+        except ValueError as exc:
+            raise ValueError("video.clip_seconds must be a positive whole number") from exc
+        if not parsed_default.is_integer() or parsed_default < 1:
+            raise ValueError("video.clip_seconds must be a positive whole number")
+        raw_default = int(parsed_default)
+    elif environment_default not in (None, ""):
+        try:
+            parsed_default = float(environment_default)
+        except ValueError as exc:
+            raise ValueError("VIMAX_OPENROUTER_VIDEO_DURATION must be a positive whole number") from exc
+        if not parsed_default.is_integer() or parsed_default < 1:
+            raise ValueError("VIMAX_OPENROUTER_VIDEO_DURATION must be a positive whole number")
+        raw_default = int(parsed_default)
+    else:
+        raw_default = DEFAULT_VIDEO_CLIP_SECONDS
+    if supported and raw_default not in supported and explicit_default:
+        raise ValueError(
+            f"Configured default duration {raw_default}s is unsupported by {key}; "
+            f"supported durations: {supported}"
+        )
+    if provider == "yunwu":
+        default_seconds = 8
+    elif supported and raw_default not in supported:
+        default_seconds = 8 if 8 in supported else supported[-1]
+    else:
+        default_seconds = raw_default
+    if configured and default_seconds > configured_max:
+        raise ValueError(
+            f"Configured maximum {configured_max}s is below the default duration {default_seconds}s for {key}"
+        )
+
+    return {
+        "provider": provider,
+        "model": model,
+        "configured": configured,
+        "defaultSeconds": default_seconds,
+        "minSeconds": min(allowed) if allowed else 1,
+        "maxSeconds": configured_max if configured else (max(allowed) if allowed else 0),
+        "allowedSeconds": allowed,
+    }
+
+
+def validate_video_shot_duration(seconds: Any, policy: dict[str, Any]) -> str:
+    """Return a validation error for an explicit shot override, or an empty string."""
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds < 1:
+        return "Shot duration must be a positive whole number of seconds."
+    if not policy.get("configured"):
+        return f"Configure a maximum duration for {policy.get('provider')}:{policy.get('model')} in video settings before setting a shot duration."
+    allowed = policy.get("allowedSeconds")
+    if isinstance(allowed, list):
+        if seconds not in allowed:
+            return (
+                f"{seconds}s is not supported by {policy.get('provider')}:{policy.get('model')} "
+                f"with the configured maximum; allowed durations: {allowed}."
+            )
+    elif seconds > int(policy.get("maxSeconds") or 0):
+        return f"{seconds}s exceeds the configured maximum of {policy.get('maxSeconds')}s."
+    if seconds < int(policy.get("minSeconds") or 1):
+        return f"{seconds}s is below the minimum supported duration of {policy.get('minSeconds')}s."
+    return ""
 
 
 def video_base_url(workspace_root: str | Path = ".") -> str:

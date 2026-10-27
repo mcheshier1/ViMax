@@ -6,6 +6,7 @@ import aiohttp
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
+from tools.video_duration import resolve_duration_seconds
 
 
 class VideoGeneratorLTXAPI:
@@ -24,10 +25,26 @@ class VideoGeneratorLTXAPI:
     async def generate_single_video(self, prompt: str = "", reference_image_paths=None, aspect_ratio: str = "16:9", **kwargs) -> VideoOutput:
         paths = reference_image_paths or []
         endpoint = "image-to-video" if paths else "text-to-video"
+        resolution = self.resolution.strip().lower().replace(" ", "")
+        if self.model in {"ltx-2-5-pro", "ltx-2-3-pro"}:
+            allowed_durations = (6, 8, 10)
+        elif self.model in {"ltx-2-5-fast", "ltx-2-3-fast"}:
+            allowed_durations = (
+                (6, 8, 10)
+                if resolution in {"1440p", "4k", "2560x1440", "3840x2160"}
+                else (6, 8, 10, 12, 14, 16, 18, 20)
+            )
+        else:
+            allowed_durations = None
+        duration = resolve_duration_seconds(
+            kwargs.get("duration_seconds"),
+            self.clip_seconds,
+            allowed=allowed_durations,
+        )
         payload = {
             "prompt": prompt,
             "model": self.model,
-            "duration": self.clip_seconds,
+            "duration": duration,
             "resolution": _resolution(self.resolution, aspect_ratio),
             "generate_audio": self.generate_audio,
         }
@@ -37,7 +54,7 @@ class VideoGeneratorLTXAPI:
                 payload["last_frame_uri"] = image_path_to_b64(paths[-1])
         progress = kwargs.get("progress")
         if progress:
-            progress("video_create", f"Creating LTX video with {self.model}", {"model": self.model, "duration": self.clip_seconds, "resolution": payload["resolution"]})
+            progress("video_create", f"Creating LTX video with {self.model}", {"model": self.model, "duration": duration, "resolution": payload["resolution"]})
         timeout_seconds = float(os.environ.get("VIMAX_VIDEO_REQUEST_TIMEOUT_SECONDS", "600"))
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:

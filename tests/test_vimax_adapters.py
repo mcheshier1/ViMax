@@ -886,6 +886,10 @@ class RedoArtifactTests(unittest.TestCase):
         clip = working / "script2video" / "shots" / "0" / "kwaivgi_kling-video-o1" / "video.mp4"
         clip.parent.mkdir(parents=True)
         clip.write_bytes(b"clip")
+        other_clip = working / "script2video" / "shots" / "1" / "kwaivgi_kling-video-o1" / "video.mp4"
+        other_clip.parent.mkdir(parents=True)
+        other_clip.write_bytes(b"unrelated clip")
+        other_frame = working / "script2video" / "shots" / "1" / "qwen_qwen-image-3" / "first_frame.png"
 
         # The clip goes, and so does the film built from it: concatenation is skipped while a
         # film exists, so leaving it would strand the old cut on disk.
@@ -894,6 +898,8 @@ class RedoArtifactTests(unittest.TestCase):
             ["script2video/shots/0/kwaivgi_kling-video-o1/video.mp4", "script2video/final_video.mp4"],
         )
         self.assertTrue((working / "script2video" / "shots" / "0" / "qwen_qwen-image-3" / "first_frame.png").exists())
+        self.assertTrue(other_clip.exists())
+        self.assertTrue(other_frame.exists())
 
     def test_the_note_survives_as_the_reason_the_shot_was_redrawn(self):
         from agent_runtime.vimax_adapters import _acceptance_slots, _mark_slots_redone, _slot_state
