@@ -6,8 +6,7 @@ import {crc32} from 'node:zlib';
 import {readAgentConfig, readClipSettings} from './config-store.mjs';
 import {validateShotDuration, videoDurationPolicy} from './video-durations.mjs';
 import {withProjectWriteLock} from './project-lock.mjs';
-import {assembleClips} from './film-assembly.mjs';
-
+import {assembleClips, prepareRenderedEnding} from './film-assembly.mjs';
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
 const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
@@ -64,28 +63,52 @@ export async function readSessionState(repoRoot) {
   }
 }
 
-export async function deleteSession(repoRoot, sessionId) {
+export async function deleteSession(repoRoot, sessionId, beforeDelete = null) {
   assertSessionId(sessionId);
-  const statePath = path.join(repoRoot, '.vimax', 'sessions.json');
-  const payload = JSON.parse(await readFile(statePath, 'utf8'));
-  const sessions = payload.sessions && typeof payload.sessions === 'object' ? payload.sessions : {};
-  if (!sessions[sessionId]) throw new Error('Project not found');
+  const canonicalRepoRoot = await realpath(repoRoot);
+  await assertSafeSessionStorageRoots(canonicalRepoRoot);
+  const statePath = path.join(canonicalRepoRoot, '.vimax', 'sessions.json');
+  await assertSafeStorageFile(statePath);
+  const initialPayload = JSON.parse(await readFile(statePath, 'utf8'));
+  const initialSessions = initialPayload.sessions && typeof initialPayload.sessions === 'object' ? initialPayload.sessions : {};
+  const initialRecord = initialSessions[sessionId];
+  if (!initialRecord) throw new Error('Project not found');
+  const initialDirectories = await projectDeletionDirectories(canonicalRepoRoot, sessionId, initialRecord, initialSessions);
+  await assertSafeLogDirectory(canonicalRepoRoot);
+  await ensureProjectDeletionDirectories(canonicalRepoRoot, initialDirectories);
 
-  delete sessions[sessionId];
-  const remaining = Object.values(sessions)
-    .filter((record) => record && typeof record === 'object')
-    .sort((left, right) => String(right.updated_at ?? right.created_at ?? '').localeCompare(String(left.updated_at ?? left.created_at ?? '')));
-  if (payload.active_session_id === sessionId || !sessions[payload.active_session_id]) {
-    payload.active_session_id = String(remaining[0]?.session_id ?? '');
-  }
-  payload.sessions = sessions;
+  return withProjectWriteLocks(initialDirectories, async () => {
+    await assertSafeSessionStorageRoots(canonicalRepoRoot);
+    await assertSafeStorageFile(statePath);
+    const payload = JSON.parse(await readFile(statePath, 'utf8'));
+    const sessions = payload.sessions && typeof payload.sessions === 'object' ? payload.sessions : {};
+    const record = sessions[sessionId];
+    if (!record) throw new Error('Project not found');
+    const directories = await projectDeletionDirectories(canonicalRepoRoot, sessionId, record, sessions);
+    if (directories.join('\0') !== initialDirectories.join('\0')) {
+      throw conflictError('Project storage changed while deletion was waiting for its write lock');
+    }
+    await assertSafeLogDirectory(canonicalRepoRoot);
+    if (typeof beforeDelete === 'function') await beforeDelete();
+    await assertSafeSessionStorageRoots(canonicalRepoRoot);
+    await assertSafeLogDirectory(canonicalRepoRoot);
+    for (const directory of directories) await assertSafeStorageDirectory(directory, true);
 
-  const temporaryPath = `${statePath}.${process.pid}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {mode: 0o600});
-  await rename(temporaryPath, statePath);
-  await rm(resolveSessionRoot(repoRoot, sessionId), {recursive: true, force: true});
-  await removeSessionLogRecords(repoRoot, sessionId);
-  return readSessionState(repoRoot);
+    for (const directory of directories) await rm(directory, {recursive: true, force: true});
+    await removeSessionLogRecords(canonicalRepoRoot, sessionId);
+
+    delete sessions[sessionId];
+    const remaining = Object.values(sessions)
+      .filter((remainingRecord) => remainingRecord && typeof remainingRecord === 'object')
+      .sort((left, right) => String(right.updated_at ?? right.created_at ?? '').localeCompare(String(left.updated_at ?? left.created_at ?? '')));
+    if (payload.active_session_id === sessionId || !sessions[payload.active_session_id]) {
+      payload.active_session_id = String(remaining[0]?.session_id ?? '');
+    }
+    payload.sessions = sessions;
+
+    await writeAtomic(statePath, `${JSON.stringify(payload, null, 2)}\n`, 0o600);
+    return readSessionState(canonicalRepoRoot);
+  });
 }
 
 export async function readSessionHistory(repoRoot, sessionId) {
@@ -277,36 +300,48 @@ export async function readSessionHistory(repoRoot, sessionId) {
 
 export async function storeWorkspaceUpload(repoRoot, sessionId, fileName, data) {
   const sessionRoot = resolveSessionRoot(repoRoot, sessionId);
-  const sessionInfo = await stat(sessionRoot);
-  if (!sessionInfo.isDirectory()) throw new Error('Session workspace is not a directory');
-
   const safeName = validateUploadName(fileName);
-  const uploadRoot = path.join(sessionRoot, 'uploads');
-  await mkdir(uploadRoot, {recursive: true, mode: 0o700});
-  const uploadRootInfo = await lstat(uploadRoot);
-  if (!uploadRootInfo.isDirectory() || uploadRootInfo.isSymbolicLink()) {
-    throw new Error('Workspace upload directory is not safe');
+  if (!sessionRecord(await readSessionsPayload(repoRoot), sessionId)) {
+    const error = new Error('Project not found');
+    error.statusCode = 404;
+    throw error;
   }
-
-  const extension = path.extname(safeName);
-  const stem = safeName.slice(0, safeName.length - extension.length);
-  const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  for (let attempt = 1; attempt <= 1_000; attempt += 1) {
-    const storedName = attempt === 1 ? safeName : `${stem} (${attempt})${extension}`;
-    const destination = path.join(uploadRoot, storedName);
-    try {
-      await writeFile(destination, payload, {flag: 'wx', mode: 0o600});
-      return {
-        name: storedName,
-        path: path.relative(sessionRoot, destination).split(path.sep).join('/'),
-        size: payload.byteLength,
-      };
-    } catch (error) {
-      if (error?.code === 'EEXIST') continue;
+  return withProjectWriteLock(sessionRoot, async () => {
+    if (!sessionRecord(await readSessionsPayload(repoRoot), sessionId)) {
+      const error = new Error('Project not found');
+      error.statusCode = 404;
       throw error;
     }
-  }
-  throw new Error('Could not allocate a unique upload filename');
+    const sessionInfo = await stat(sessionRoot);
+    if (!sessionInfo.isDirectory()) throw new Error('Session workspace is not a directory');
+
+    const uploadRoot = path.join(sessionRoot, 'uploads');
+    await mkdir(uploadRoot, {recursive: true, mode: 0o700});
+    const uploadRootInfo = await lstat(uploadRoot);
+    if (!uploadRootInfo.isDirectory() || uploadRootInfo.isSymbolicLink()) {
+      throw new Error('Workspace upload directory is not safe');
+    }
+
+    const extension = path.extname(safeName);
+    const stem = safeName.slice(0, safeName.length - extension.length);
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    for (let attempt = 1; attempt <= 1_000; attempt += 1) {
+      const storedName = attempt === 1 ? safeName : `${stem} (${attempt})${extension}`;
+      const destination = path.join(uploadRoot, storedName);
+      try {
+        await writeFile(destination, payload, {flag: 'wx', mode: 0o600});
+        return {
+          name: storedName,
+          path: path.relative(sessionRoot, destination).split(path.sep).join('/'),
+          size: payload.byteLength,
+        };
+      } catch (error) {
+        if (error?.code === 'EEXIST') continue;
+        throw error;
+      }
+    }
+    throw new Error('Could not allocate a unique upload filename');
+  });
 }
 
 function historyToolResultText(result) {
@@ -992,53 +1027,63 @@ export async function updateProjectMetadata(repoRoot, input = {}) {
     }
   }
 
-  const payload = await readSessionsPayload(repoRoot);
-  const record = sessionRecord(payload, body.sessionId);
-  if (!record) return null;
+  const initialPayload = await readSessionsPayload(repoRoot);
+  const initialRecord = sessionRecord(initialPayload, body.sessionId);
+  if (!initialRecord) return null;
+  const workingDir = sessionWorkingDir(repoRoot, body.sessionId, initialRecord);
 
-  const changed = [];
-  for (const [field, key] of fields) {
-    if (body[field] === undefined) continue;
-    const value = body[field].trim();
-    if (String(record[key] ?? '') !== value) {
-      record[key] = value;
-      changed.push(field);
+  return withProjectWriteLock(workingDir, async () => {
+    const payload = await readSessionsPayload(repoRoot);
+    const record = sessionRecord(payload, body.sessionId);
+    if (!record) return null;
+    if (sessionWorkingDir(repoRoot, body.sessionId, record) !== workingDir) {
+      throw conflictError('Project storage changed while waiting for its write lock');
     }
-  }
 
-  // A style change invalidates the artifacts that were generated with the old
-  // style. Without an explicit confirmation we only report the paths (relative
-  // to the session working dir) so the caller can warn before spending money.
-  // The confirmation re-posts the same diff with `invalidate: true`, so the
-  // style may already be persisted and `changed` may be empty: deletion is
-  // keyed off the flag, not off a fresh diff.
-  let invalidated = [];
-  let requiresInvalidation = false;
-  if (body.invalidate === true) {
-    const derived = await listStyleDerivedArtifacts(repoRoot, body.sessionId);
-    invalidated = await removeStyleDerivedArtifacts(repoRoot, body.sessionId, derived);
-    // The render tool refuses to re-render while the manifest pins the old
-    // style, so the confirmed change must move the manifest with the session.
-    await updateRenderManifestStyle(repoRoot, record.working_dir, String(record.style ?? ''));
-  } else if (changed.includes('style')) {
-    requiresInvalidation = true;
-    invalidated = await listStyleDerivedArtifacts(repoRoot, body.sessionId);
-  }
+    const changed = [];
+    for (const [field, key] of fields) {
+      if (body[field] === undefined) continue;
+      const value = body[field].trim();
+      if (String(record[key] ?? '') !== value) {
+        record[key] = value;
+        changed.push(field);
+      }
+    }
 
-  if (changed.length) {
-    record.updated_at = new Date().toISOString();
-    const statePath = path.join(repoRoot, '.vimax', 'sessions.json');
-    const temporaryPath = `${statePath}.${process.pid}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {mode: 0o600});
-    await rename(temporaryPath, statePath);
-  }
+    // A style change invalidates the artifacts that were generated with the old
+    // style. Without an explicit confirmation we only report the paths (relative
+    // to the session working dir) so the caller can warn before spending money.
+    // The confirmation re-posts the same diff with `invalidate: true`, so the
+    // style may already be persisted and `changed` may be empty: deletion is
+    // keyed off the flag, not off a fresh diff.
+    let invalidated = [];
+    let requiresInvalidation = false;
+    if (body.invalidate === true) {
+      const derived = await listStyleDerivedArtifacts(repoRoot, body.sessionId);
+      invalidated = await removeStyleDerivedArtifacts(repoRoot, body.sessionId, derived);
+      // The render tool refuses to re-render while the manifest pins the old
+      // style, so the confirmed change must move the manifest with the session.
+      await updateRenderManifestStyle(repoRoot, record.working_dir, String(record.style ?? ''));
+    } else if (changed.includes('style')) {
+      requiresInvalidation = true;
+      invalidated = await listStyleDerivedArtifacts(repoRoot, body.sessionId);
+    }
 
-  return {
-    session: await projectMetadata(repoRoot, body.sessionId, record),
-    changed,
-    invalidated,
-    requiresInvalidation,
-  };
+    if (changed.length) {
+      record.updated_at = new Date().toISOString();
+      const statePath = path.join(repoRoot, '.vimax', 'sessions.json');
+      const temporaryPath = `${statePath}.${process.pid}.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {mode: 0o600});
+      await rename(temporaryPath, statePath);
+    }
+
+    return {
+      session: await projectMetadata(repoRoot, body.sessionId, record),
+      changed,
+      invalidated,
+      requiresInvalidation,
+    };
+  });
 }
 
 /**
@@ -2145,14 +2190,43 @@ export async function readFilmSnapshot(repoRoot, sessionId, root = '') {
     ...discovery.shots.flatMap((shot) => [...shot.keyframes, ...shot.clips]),
     ...setArtifacts,
   ].map((relative) => path.isAbsolute(relative) ? relative : path.resolve(workingDir, relative));
-  const [acceptance, plans, removed, continuity, artifacts] = await Promise.all([
+  const [acceptance, plans, removed, continuity, artifacts, assembly] = await Promise.all([
     acceptancePayload(repoRoot, workingDir, resolved, context, discovery),
     shotPlansPayload(workingDir, resolved, discovery, context, sets, undefined, durationPolicy),
     listRemoved(workingDir, resolved, context),
     continuityPayload(repoRoot, workingDir, resolved, record, context, discovery),
     collectSessionArtifacts(resolveSessionRoot(repoRoot, sessionId), sessionId, context, referenced),
+    readAssemblyCorrection(workingDir, resolved, context),
   ]);
-  return {acceptance, plans, removed, continuity, artifacts, sets};
+  return {acceptance, plans, removed, continuity, artifacts, sets, assembly};
+}
+
+async function readAssemblyCorrection(workingDir, root, context) {
+  const finalPath = path.join(workingDir, root, 'final_video.mp4');
+  const candidates = await Promise.all(['.assembly.json', '.correction.json'].map((suffix) =>
+    context.json(`${finalPath}${suffix}`).catch(() => null)));
+  if (!candidates.some((candidate) => candidate?.correction && candidate?.outputHash)) return null;
+  const currentHash = await context.hash(finalPath).catch(() => null);
+  return candidates.find((candidate) => candidate?.outputHash === currentHash && candidate?.correction)?.correction ?? null;
+}
+
+async function assemblyClipInput(workingDir, canonicalWorkingDir, shot) {
+  const insideProject = async (relative) => {
+    if (!relative) return null;
+    const absolute = await realpath(path.resolve(workingDir, relative));
+    if (!absolute.startsWith(`${canonicalWorkingDir}${path.sep}`)) throw conflictError(`Shot ${shot.shot} assembly input escapes the project`);
+    return absolute;
+  };
+  return {
+    path: await insideProject(shot.clips[0]),
+    slot: shot.shot,
+    first_frame: await insideProject(shot.keyframes.find((file) => file.endsWith('/first_frame.png'))),
+    last_frame: await insideProject(shot.keyframes.find((file) => file.endsWith('/last_frame.png'))),
+  };
+}
+
+async function assemblyInputHashes(input) {
+  return Promise.all([input.path, input.first_frame, input.last_frame].map((file) => file ? sha256File(file) : null));
 }
 
 /** Stitch the accepted active clips for a film, without involving the render agent. */
@@ -2188,17 +2262,15 @@ export async function assembleFilm(repoRoot, input = {}) {
       if (await slotState(workingDir, shotRecord, found.clips, context) !== 'accepted') {
         throw conflictError(`Shot ${shot} does not have a current accepted clip`);
       }
-      const clipPath = await realpath(path.resolve(workingDir, found.clips[0]));
-      if (!clipPath.startsWith(`${canonicalWorkingDir}${path.sep}`)) throw conflictError(`Shot ${shot} clip escapes the project`);
-      clips.push(clipPath);
+      clips.push(await assemblyClipInput(workingDir, canonicalWorkingDir, found));
     }
     // Every active tree slot must correspond to a real shot container; scenes are assembled
     // in numeric scene order by filmOrder rather than flattened or alphabetically guessed.
     const signature = createHash('sha256');
-    signature.update('vimax-local-assembly-v1\0');
+    signature.update('vimax-reference-assembly-v4\0');
     const inputHashes = [];
     for (let i = 0; i < order.length; i += 1) {
-      const hash = await sha256File(clips[i]);
+      const hash = JSON.stringify(await assemblyInputHashes(clips[i]));
       inputHashes.push(hash);
       signature.update(order[i]); signature.update('\0');
       signature.update(hash); signature.update('\0');
@@ -2209,13 +2281,13 @@ export async function assembleFilm(repoRoot, input = {}) {
     const cache = await readJsonOptional(cachePath).catch(() => undefined);
     if (cache?.key === key && typeof cache.outputHash === 'string' && await isRegularFile(finalPath)
       && await sha256File(finalPath) === cache.outputHash) {
-      return {path: relativeArtifactPath(workingDir, finalPath), reused: true, shotCount: order.length};
+      return {path: relativeArtifactPath(workingDir, finalPath), reused: true, shotCount: order.length, correction: cache.correction};
     }
 
     const temporaryPath = path.join(path.dirname(finalPath), `.final_video.${process.pid}.${randomUUID()}.tmp.mp4`);
     const oldFinalExists = await isRegularFile(finalPath);
     try {
-      await assembleClips(clips, temporaryPath).catch((cause) => {
+      const correction = await assembleClips(clips, temporaryPath).catch((cause) => {
         const error = new Error(`Local FFmpeg assembly failed: ${cause.message}`, {cause});
         error.statusCode = 500;
         throw error;
@@ -2224,15 +2296,16 @@ export async function assembleFilm(repoRoot, input = {}) {
       const verified = await collectAcceptanceState(workingDir, root, verifiedContext);
       if (JSON.stringify(verified.order) !== JSON.stringify(order)) throw conflictError('Film playback order changed during assembly');
       const verifiedStore = await readAcceptanceFile(workingDir, verifiedContext);
-      const after = createHash('sha256').update('vimax-local-assembly-v1\0');
+      const after = createHash('sha256').update('vimax-reference-assembly-v4\0');
       for (let index = 0; index < order.length; index += 1) {
         const found = verified.shots.find((shot) => shot.shot === order[index]);
         if (!found || found.clips.length !== 1
           || await slotState(workingDir, verifiedStore[root]?.shots?.[order[index]]?.clips, found.clips, verifiedContext) !== 'accepted') {
           throw conflictError(`Shot ${order[index]} is no longer accepted`);
         }
-        const hash = await sha256File(clips[index]);
-        if (hash !== inputHashes[index]) throw conflictError('An input clip changed during assembly');
+        const verifiedInput = await assemblyClipInput(workingDir, canonicalWorkingDir, found);
+        const hash = JSON.stringify(await assemblyInputHashes(verifiedInput));
+        if (hash !== inputHashes[index]) throw conflictError('An input clip or keyframe changed during assembly');
         after.update(order[index]); after.update('\0'); after.update(hash); after.update('\0');
       }
       if (after.digest('hex') !== key) throw conflictError('Input clips changed during assembly');
@@ -2248,9 +2321,9 @@ export async function assembleFilm(repoRoot, input = {}) {
             await transaction.write(path.join(workingDir, ACCEPTANCE_FILENAME), `${JSON.stringify(verifiedStore, null, 2)}\n`);
           }
         }
-        await transaction.write(cachePath, `${JSON.stringify({key, outputHash, shots: order})}\n`);
+        await transaction.write(cachePath, `${JSON.stringify({key, outputHash, shots: order, correction})}\n`);
       });
-      return {path: relativeArtifactPath(workingDir, finalPath), reused: false, shotCount: order.length};
+      return {path: relativeArtifactPath(workingDir, finalPath), reused: false, shotCount: order.length, correction};
     } finally {
       await rm(temporaryPath, {force: true}).catch(() => {});
     }
@@ -2398,6 +2471,12 @@ async function updateRenderAcceptanceUnlocked(repoRoot, input = {}) {
   const slot = scope === 'session' ? null : shot;
   if (body.accepted) {
     if (!paths.length) throw acceptanceError(`Cannot accept ${stage}${shot === null ? '' : ` for shot ${shot}`}: no artifacts on disk`);
+    if (stage === 'keyframes' || stage === 'clips') {
+      const plan = await readShotPlan(repoRoot, sessionId, root, shot);
+      if (plan && plan.renderedEndingStatus !== 'off' && plan.renderedEndingStatus !== 'current') {
+        throw acceptanceError(`Cannot accept ${stage}: ${plan.renderedEndingReason}`);
+      }
+    }
     if (stage === 'portraits') {
       if (!discovery.portraitComplete || !discovery.portraitCharacters.length) {
         throw acceptanceError('Cannot accept portraits: every visible character needs a complete active front, side, and back set');
@@ -2466,7 +2545,14 @@ async function acceptancePayload(repoRoot, workingDir, root, context = createFil
       for (const shot of discovery.shots) {
         const paths = shot[stage];
         const slotRecord = isPlainObject(shotStore[shot.shot]) ? shotStore[shot.shot][stage] : undefined;
-        slots.push(slotPayload(shot.shot, await slotState(workingDir, slotRecord, paths, context), paths, slotRecord));
+        let state = await slotState(workingDir, slotRecord, paths, context);
+        if ((stage === 'keyframes' || stage === 'clips') && state === 'accepted'
+          && await hasRenderedEndingProvenance(workingDir, root, shot)) {
+          const plan = await shotPlanPayload(workingDir, root, shot.shot, context, undefined, undefined,
+            await activeVideoDurationPolicy(repoRoot));
+          if (plan.renderedEndingStatus !== 'off' && plan.renderedEndingStatus !== 'current') state = 'stale';
+        }
+        slots.push(slotPayload(shot.shot, state, paths, slotRecord));
       }
     }
     const accepted = slots.length > 0 && slots.every((slot) => slot.state === 'accepted');
@@ -2891,6 +2977,107 @@ function assertSessionId(sessionId) {
     throw new Error('Invalid session id');
   }
 }
+async function assertSafeSessionStorageRoots(repoRoot) {
+  await assertSafeStorageDirectory(path.join(repoRoot, '.vimax'));
+  await assertSafeStorageDirectory(path.join(repoRoot, '.working_dir'), true);
+}
+
+async function assertSafeLogDirectory(repoRoot) {
+  await assertSafeSessionStorageRoots(repoRoot);
+  await assertSafeStorageDirectory(path.join(repoRoot, '.vimax', 'logs'), true);
+}
+
+async function assertSafeStorageDirectory(directory, optional = false) {
+  let info;
+  try {
+    info = await lstat(directory);
+  } catch (error) {
+    if (optional && error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (!info.isDirectory() || info.isSymbolicLink() || await realpath(directory) !== directory) {
+    throw deletionPathError('Project storage path is not a safe directory');
+  }
+}
+
+async function assertSafeStorageFile(filePath) {
+  const info = await lstat(filePath);
+  if (!info.isFile() || info.isSymbolicLink() || await realpath(filePath) !== filePath) {
+    throw deletionPathError('Project storage file is not safe');
+  }
+}
+
+async function projectDeletionDirectories(repoRoot, sessionId, record, sessions) {
+  const workingRoot = path.join(repoRoot, '.working_dir');
+  const canonicalDirectory = path.join(workingRoot, sessionId);
+  const stored = String(record?.working_dir ?? '').trim();
+  if (stored.includes('\0') || stored.split(path.sep).includes('..')) {
+    throw deletionPathError('Project working directory contains an unsafe path segment');
+  }
+  const recordedDirectory = stored ? path.resolve(repoRoot, stored) : canonicalDirectory;
+  const directories = [...new Set([recordedDirectory, canonicalDirectory])].sort();
+
+  for (const directory of directories) {
+    if (path.dirname(directory) !== workingRoot || path.basename(directory) === '' || path.basename(directory) === '.' || path.basename(directory) === '..') {
+      throw deletionPathError('Project working directory must be a dedicated child of .working_dir');
+    }
+    await assertSafeStorageDirectory(directory, true);
+  }
+
+  for (const [otherSessionId, otherRecord] of Object.entries(sessions)) {
+    if (otherSessionId === sessionId || !otherRecord || typeof otherRecord !== 'object') continue;
+    const otherDirectories = [];
+    const otherStored = String(otherRecord.working_dir ?? '').trim();
+    if (otherStored) otherDirectories.push(path.resolve(repoRoot, otherStored));
+    try {
+      assertSessionId(otherSessionId);
+      otherDirectories.push(path.join(workingRoot, otherSessionId));
+    } catch {
+      if (!otherDirectories.length) continue;
+    }
+    if (directories.some((directory) => otherDirectories.some((otherDirectory) => (
+      isSameOrInside(directory, otherDirectory) || isSameOrInside(otherDirectory, directory)
+    )))) {
+      throw deletionPathError('Project working directory is shared with another project');
+    }
+  }
+  return directories;
+}
+
+async function ensureProjectDeletionDirectories(repoRoot, directories) {
+  const workingRoot = path.join(repoRoot, '.working_dir');
+  try {
+    await mkdir(workingRoot);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+  await assertSafeStorageDirectory(workingRoot);
+  for (const directory of directories) {
+    try {
+      await mkdir(directory);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    await assertSafeStorageDirectory(directory);
+  }
+}
+
+function isSameOrInside(parent, candidate) {
+  return candidate === parent || candidate.startsWith(`${parent}${path.sep}`);
+}
+
+function deletionPathError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+
+async function withProjectWriteLocks(directories, operation) {
+  const acquireNext = (index) => index === directories.length
+    ? operation()
+    : withProjectWriteLock(directories[index], () => acquireNext(index + 1));
+  return acquireNext(0);
+}
 
 function validateUploadName(fileName) {
   const value = String(fileName || '').normalize('NFC').trim();
@@ -2905,12 +3092,14 @@ async function removeSessionLogRecords(repoRoot, sessionId) {
   let entries;
   try {
     entries = await readdir(logsRoot, {withFileTypes: true});
-  } catch {
-    return;
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
   }
   for (const entry of entries) {
     if (!entry.isFile() || path.extname(entry.name) !== '.jsonl') continue;
     const logPath = path.join(logsRoot, entry.name);
+    await assertSafeStorageFile(logPath);
     const lines = (await readFile(logPath, 'utf8')).split(/\r?\n/).filter(Boolean);
     const retained = lines.filter((line) => {
       try {
@@ -2926,9 +3115,7 @@ async function removeSessionLogRecords(repoRoot, sessionId) {
       }
     });
     if (retained.length === lines.length) continue;
-    const temporaryPath = `${logPath}.${process.pid}.tmp`;
-    await writeFile(temporaryPath, retained.length ? `${retained.join('\n')}\n` : '', {mode: 0o600});
-    await rename(temporaryPath, logPath);
+    await writeAtomic(logPath, retained.length ? `${retained.join('\n')}\n` : '', 0o600);
   }
 }
 
@@ -3347,6 +3534,94 @@ export async function readShotPlan(repoRoot, sessionId, root = '', slot = '') {
   const inventory = await readSetReferences(repoRoot, sessionId, resolved);
   const durationPolicy = await activeVideoDurationPolicy(repoRoot);
   return shotPlanPayload(workingDir, resolved, slot, context, inventory, reuseContext, durationPolicy);
+}
+
+/** Explicitly extract and review the current accepted predecessor clip ending locally. */
+export async function prepareRenderedEndingForShot(repoRoot, input = {}, isBusy = () => false) {
+  const body = isPlainObject(input) ? input : {};
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+  const record = sessionRecord(await readSessionsPayload(repoRoot), sessionId);
+  if (!record) return null;
+  const workingDir = sessionWorkingDir(repoRoot, sessionId, record);
+  return withProjectWriteLock(workingDir, async () => {
+    if (isBusy()) throw conflictError('Wait for active and queued requests to finish before preparing a rendered ending');
+    const root = await resolveRenderRoot(repoRoot, workingDir, body.root);
+    const slot = String(body.slot ?? '');
+    const plan = await readShotPlan(repoRoot, sessionId, root, slot);
+    if (!plan) return null;
+    if (plan.revision !== body.revision) throw conflictError('Shot plan changed; refresh before preparing the rendered ending');
+    if (!plan.reusePreviousLastFrame || plan.previousSlot !== body.previousSlot) {
+      throw conflictError('Playback predecessor or reuse setting changed; refresh before preparing the rendered ending');
+    }
+    if (plan.previousClipSha256 !== body.previousClipSha256) throw conflictError('The predecessor clip changed; refresh before preparing the rendered ending');
+    if (!plan.previousClipAvailable || !plan.previousClipAccepted) throw conflictError(plan.renderedEndingReason);
+    const sourceState = await renderedEndingState(workingDir, root, slot, plan.previousSlot, true, createFilmReadContext());
+    if (sourceState.status === 'missing_clip' || sourceState.status === 'unreviewed_clip') {
+      throw conflictError(sourceState.reason);
+    }
+    const discovery = await collectAcceptanceState(workingDir, root);
+    const predecessor = discovery.shots.find((shot) => shot.shot === plan.previousSlot);
+    const clipRelative = predecessor?.clips.find((item) => path.basename(item) === 'video.mp4');
+    if (!clipRelative) throw conflictError(`The predecessor ${plan.previousSlot} clip is no longer available`);
+    const clipPath = path.resolve(workingDir, clipRelative);
+    await assertSafeRegularFile(workingDir, clipPath);
+    const sourceRefs = predecessor?.keyframes ?? [];
+    const firstFrame = sourceRefs.find((item) => path.basename(item) === 'first_frame.png');
+    const lastFrame = sourceRefs.find((item) => path.basename(item) === 'last_frame.png');
+    const extracted = await prepareRenderedEnding({
+      videoPath: clipPath,
+      firstFrame: firstFrame ? path.join(workingDir, firstFrame) : null,
+      lastFrame: lastFrame ? path.join(workingDir, lastFrame) : null,
+    });
+    if (extracted.path !== `${clipPath}.rendered-ending.png`) {
+      throw acceptanceError('The rendered-ending helper returned an unsafe cache path');
+    }
+    await assertSafeRegularFile(workingDir, extracted.path);
+    if (isBusy()) throw conflictError('A request started or was queued during rendered-ending preparation; no target changes were made');
+    const currentPlan = await readShotPlan(repoRoot, sessionId, root, slot);
+    const afterHash = await sha256File(clipPath);
+    if (!currentPlan || currentPlan.revision !== body.revision || currentPlan.previousClipSha256 !== body.previousClipSha256
+      || afterHash !== body.previousClipSha256 || extracted.clip_sha256 !== body.previousClipSha256) {
+      throw conflictError('The predecessor clip or shot plan changed during extraction; no target changes were made');
+    }
+    if (currentPlan.previousClipAccepted !== true) throw conflictError('The predecessor clip is no longer accepted');
+    const imageBytes = await readFile(extracted.path);
+    if (createHash('sha256').update(imageBytes).digest('hex') !== extracted.sha256) {
+      throw conflictError('The extracted rendered ending failed its image integrity check');
+    }
+    const location = shotLocation(workingDir, root, slot);
+    const currentDiscovery = await collectAcceptanceState(workingDir, root);
+    const target = currentDiscovery.shots.find((shot) => shot.shot === slot);
+    const firstExisting = target?.keyframes.find((item) => path.basename(item) === 'first_frame.png');
+    const manifest = await readRenderManifest(repoRoot, workingDir);
+    const config = await readAgentConfig(repoRoot);
+    const activeImageModel = manifest?.image_model || config.sections.image?.model || '';
+    const imageRelative = firstExisting ?? `${path.relative(workingDir, location.shotDir)}/${safePathComponent(activeImageModel)}/first_frame.png`;
+    const firstPath = path.resolve(workingDir, imageRelative);
+    if (!isPathInside(workingDir, firstPath)) throw acceptanceError('The target first-frame path is unsafe');
+    const selectorPath = path.join(location.shotDir, 'first_frame_selector_output.json');
+    const provenance = {
+      kind: 'rendered_clip_end',
+      shot_idx: Number(shotLocation(workingDir, root, plan.previousSlot).local),
+      slot: plan.previousSlot,
+      path: relativeArtifactPath(workingDir, extracted.path),
+      sha256: extracted.sha256, clip_path: clipRelative,
+      clip_sha256: body.previousClipSha256, normalization: extracted.normalization,
+      normalization_inputs: extracted.normalization_inputs, frame_type: 'rendered_end', mode: 'reuse',
+    };
+    const nextSelector = {continuity_source: provenance};
+    const store = await readAcceptanceFile(workingDir);
+    for (const stage of ['keyframes', 'clips']) removeAcceptance(store, root, slot, stage);
+    removeAcceptance(store, root, null, 'final_video');
+    const acceptancePath = path.join(workingDir, ACCEPTANCE_FILENAME);
+    await withMutationTransaction(async (transaction) => {
+      await ensureSafeParentDirectory(workingDir, path.dirname(firstPath), transaction);
+      await transaction.write(firstPath, imageBytes);
+      await transaction.write(selectorPath, `${JSON.stringify(nextSelector, null, 2)}\n`);
+      await transaction.write(acceptancePath, `${JSON.stringify(store, null, 2)}\n`);
+    });
+    return readShotPlan(repoRoot, sessionId, root, slot);
+  });
 }
 
 /** Rewrite one shot's plan: guidance, frame descriptions, and visible characters. */
@@ -4223,9 +4498,15 @@ async function shotPlanPayload(workingDir, root, slot, context = createFilmReadC
     ? description.reuse_previous_last_frame : null;
   const reusePreviousLastFrame = previousSlot !== null && (storedChoice
     ?? (continuityEnabled && playback.cameraBySlot.get(String(slot)) === playback.cameraBySlot.get(previousSlot)));
-  const previousLastFrameAvailable = previousSlot
-    ? await shotLastFrameAvailable(workingDir, root, previousSlot, context)
-    : false;
+  const renderedEndingMode = reusePreviousLastFrame ? 'reuse'
+    : previousSlot !== null && storedChoice === null && continuityEnabled ? 'reframe' : null;
+  const ending = await renderedEndingState(workingDir, root, String(slot), previousSlot, renderedEndingMode !== null, context, renderedEndingMode);
+  const previousClipAvailable = ending.previousClipAvailable;
+  const previousClipAccepted = ending.previousClipAccepted;
+  const previousClipSha256 = ending.previousClipSha256;
+  const renderedEndingStatus = ending.status;
+  const renderedEndingReason = ending.reason;
+  const targetFirstSha256 = ending.targetFirstSha256;
   const {characters, briefs} = await scenePlanMetadata(workingDir, location, context);
   const shotBrief = await context.json(path.join(shotDir, 'brief.json')).catch(() => null);
   const brief = typeof shotBrief?.visual_desc === 'string'
@@ -4240,7 +4521,10 @@ async function shotPlanPayload(workingDir, root, slot, context = createFilmReadC
   const setShot = setInventory?.shots.find((shot) => shot.slot === String(slot));
   const durationOverrideSeconds = Number.isSafeInteger(description.duration_seconds) && description.duration_seconds > 0
     ? description.duration_seconds : null;
-  const revision = createHash('sha256').update(JSON.stringify([root, String(slot), description, durationPolicy])).digest('hex');
+  const revision = createHash('sha256').update(JSON.stringify([
+    root, String(slot), description, durationPolicy, previousSlot, renderedEndingMode, previousClipSha256, ending.normalizationInputs,
+    targetFirstSha256, renderedEndingStatus,
+  ])).digest('hex');
   return {
     slot: String(slot), root, revision,
     brief,
@@ -4253,28 +4537,137 @@ async function shotPlanPayload(workingDir, root, slot, context = createFilmReadC
     durationPolicy,
     reusePreviousLastFrame,
     previousSlot,
-    previousLastFrameAvailable,
+    previousClipAvailable,
+    previousClipAccepted,
+    previousClipSha256,
+    renderedEndingStatus,
+    renderedEndingReason,
     sets: (setInventory?.sets ?? []).map(({id, name, state}) => ({id, name, accepted: state === 'accepted'})),
     setIds: setShot?.setIds ?? [],
     setRevision: setInventory?.revision ?? '',
   };
 }
 
-async function shotLastFrameAvailable(workingDir, root, slot, context) {
-  const location = shotLocation(workingDir, root, slot);
-  if (!isPathInside(workingDir, location.shotDir)) return false;
-  let current = workingDir;
-  for (const part of path.relative(workingDir, location.shotDir).split(path.sep)) {
-    current = path.join(current, part);
-    let info;
-    try { info = await lstat(current); }
-    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-    if (!info.isDirectory() || info.isSymbolicLink()) return false;
-  }
-  const artifacts = [];
-  await collectAcceptanceFiles(workingDir, location.shotDir, (name) => name === 'last_frame.png', artifacts, context);
-  return artifacts.length > 0;
+async function hasRenderedEndingProvenance(workingDir, root, shot) {
+  const first = shot.keyframes.find((relative) => path.basename(relative) === 'first_frame.png');
+  if (!first) return false;
+  const selector = await readJsonOptional(path.join(shotLocation(workingDir, root, shot.shot).shotDir, 'first_frame_selector_output.json')).catch(() => null);
+  return selector?.continuity_source?.kind === 'rendered_clip_end';
 }
+
+async function renderedEndingInputHashes(workingDir, source, context) {
+  const inputs = {};
+  for (const frame of ['first_frame', 'last_frame']) {
+    const relative = source.keyframes.find((item) => path.basename(item) === `${frame}.png`);
+    inputs[`${frame}_sha256`] = relative ? await context.hash(path.resolve(workingDir, relative)) : null;
+  }
+  return inputs;
+}
+
+async function renderedEndingState(workingDir, root, slot, previousSlot, enabled, context, mode = 'reuse') {
+  const result = {
+    previousClipAvailable: false, previousClipAccepted: false, previousClipSha256: null,
+    status: enabled ? 'not_prepared' : 'off', reason: !enabled ? ''
+      : mode === 'reframe' ? 'Generate and review a new camera view using the accepted predecessor clip’s rendered ending.'
+      : 'Prepare the accepted predecessor clip ending before generating this shot.',
+    targetFirstSha256: null, clipPath: null, clipRecord: null, normalizationInputs: null,
+  };
+  if (!previousSlot) {
+    if (enabled) {
+      result.status = 'missing_clip';
+      result.reason = 'This shot has no predecessor in the current playback order.';
+    }
+    return result;
+  }
+  const discovery = await collectAcceptanceState(workingDir, root, context);
+  const source = discovery.shots.find((shot) => shot.shot === previousSlot);
+  if (source) result.normalizationInputs = await renderedEndingInputHashes(workingDir, source, context);
+  if (!source?.clips.length) {
+    if (enabled) {
+      result.status = 'missing_clip';
+      result.reason = `The predecessor ${previousSlot} has no rendered clip.`;
+    }
+    return result;
+  }
+  const clipPath = source.clips.find((relative) => path.basename(relative) === 'video.mp4');
+  if (!clipPath) {
+    if (enabled) {
+      result.status = 'missing_clip';
+      result.reason = `The predecessor ${previousSlot} has no current rendered clip.`;
+    }
+    return result;
+  }
+  const absoluteClip = path.resolve(workingDir, clipPath);
+  if (!isPathInside(workingDir, absoluteClip) || !(await isRegularFile(absoluteClip, context))) {
+    if (enabled) {
+      result.status = 'missing_clip';
+      result.reason = `The predecessor ${previousSlot} clip is unavailable or unsafe.`;
+    }
+    return result;
+  }
+  result.previousClipAvailable = true;
+  result.previousClipSha256 = await context.hash(absoluteClip);
+  result.clipPath = absoluteClip;
+  const store = await readAcceptanceFile(workingDir, context);
+  result.clipRecord = store[root]?.shots?.[previousSlot]?.clips;
+  result.previousClipAccepted = await slotState(workingDir, result.clipRecord, source.clips, context) === 'accepted';
+  if (!enabled) return result;
+  const target = discovery.shots.find((shot) => shot.shot === slot);
+  const imagePath = target?.keyframes.find((relative) => path.basename(relative) === 'first_frame.png');
+  const selectorPath = imagePath ? path.join(shotLocation(workingDir, root, slot).shotDir, 'first_frame_selector_output.json') : null;
+  if (imagePath) {
+    const absolute = path.resolve(workingDir, imagePath);
+    if (isPathInside(workingDir, absolute) && await isRegularFile(absolute, context)) result.targetFirstSha256 = await context.hash(absolute);
+  }
+  const provenance = selectorPath ? await context.json(selectorPath).catch(() => null) : null;
+  const sourceRecord = provenance?.continuity_source;
+  if (!sourceRecord) {
+    if (!result.previousClipAccepted) {
+      result.status = 'unreviewed_clip';
+      result.reason = `Accept the rendered clip for predecessor ${previousSlot} before preparing its ending.`;
+    }
+    return result;
+  }
+  if (!result.previousClipAccepted) {
+    result.status = sourceRecord.kind === 'rendered_clip_end' ? 'stale' : 'unreviewed_clip';
+    result.reason = sourceRecord.kind === 'rendered_clip_end'
+      ? 'The source clip is no longer accepted; prepare the ending again after review.'
+      : `Accept the rendered clip for predecessor ${previousSlot} before preparing its ending.`;
+    return result;
+  }
+  if (sourceRecord.kind !== 'rendered_clip_end') {
+    result.status = 'legacy_planned';
+    result.reason = 'This first frame uses legacy planned-still provenance; explicitly prepare the rendered ending before new clip generation.';
+    return result;
+  }
+  const expectedEndingPath = `${clipPath}.rendered-ending.png`;
+  const absoluteEndingPath = path.resolve(workingDir, expectedEndingPath);
+  const derivedHash = isPathInside(workingDir, absoluteEndingPath) && await isRegularFile(absoluteEndingPath, context)
+    ? await context.hash(absoluteEndingPath) : null;
+  const normalizationInputs = sourceRecord.normalization_inputs;
+  const refsMatch = normalizationInputs?.first_frame_sha256 === result.normalizationInputs?.first_frame_sha256
+    && normalizationInputs?.last_frame_sha256 === result.normalizationInputs?.last_frame_sha256;
+  const sourceHashMatches = sourceRecord.clip_sha256 === result.previousClipSha256
+    && sourceRecord.clip_path === clipPath
+    && sourceRecord.slot === previousSlot
+    && sourceRecord.shot_idx === Number(shotLocation(workingDir, root, previousSlot).local)
+    && sourceRecord.normalization === 'rendered-end-v1'
+    && sourceRecord.frame_type === 'rendered_end'
+    && sourceRecord.mode === mode
+    && refsMatch;
+  const imageMatches = (mode === 'reframe' ? Boolean(result.targetFirstSha256) : sourceRecord.sha256 === result.targetFirstSha256)
+    && sourceRecord.sha256 === derivedHash
+    && sourceRecord.path === expectedEndingPath;
+  if (!sourceHashMatches || !imageMatches) {
+    result.status = 'stale';
+    result.reason = 'The rendered predecessor clip or copied first-frame provenance changed; prepare the ending again.';
+    return result;
+  }
+  result.status = 'current';
+  result.reason = `Using the current accepted rendered ending from ${previousSlot}.`;
+  return result;
+}
+
 
 function scenePlanMetadata(workingDir, location, context) {
   if (!context.scenes.has(location.container)) {

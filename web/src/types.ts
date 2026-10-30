@@ -210,7 +210,11 @@ export type ShotPlan = {
   setRevision: string;
   reusePreviousLastFrame: boolean;
   previousSlot: string | null;
-  previousLastFrameAvailable: boolean;
+  previousClipAvailable: boolean;
+  previousClipAccepted: boolean;
+  previousClipSha256: string | null;
+  renderedEndingStatus: 'off' | 'missing_clip' | 'unreviewed_clip' | 'not_prepared' | 'legacy_planned' | 'current' | 'stale';
+  renderedEndingReason: string;
 };
 
 export type PlanFrame = {
@@ -342,6 +346,27 @@ export type ProjectUpdateResponse = {
   regenerationStarted?: boolean;
 };
 
+export type AssemblyLightingReport = {
+  status: 'corrected' | 'unchanged' | 'needs_review';
+  reason: string;
+  gains: [number, number, number];
+  previous_slot: string | null;
+  [evidence: string]: unknown;
+};
+
+export type AssemblyCorrectionReport = {
+  version: number;
+  canvas: {width: number; height: number; fps: number};
+  crop_zoom: number;
+  clips: Array<{
+    slot: string;
+    status: 'corrected' | 'unchanged' | 'needs_review';
+    reason: string;
+    duration_seconds: number;
+    lighting?: AssemblyLightingReport;
+  }>;
+};
+
 export type ConfigSection = {
   model_provider?: string;
   model: string;
@@ -350,6 +375,7 @@ export type ConfigSection = {
   api_key: string;
   has_api_key: boolean;
   configured_api_key_providers?: string[];
+  api_key_suffixes?: Record<string, string>;
   api_key_updates?: Record<string, string>;
   provider?: string;
   resolution?: string;

@@ -730,6 +730,26 @@ class ViMaxAdapters:
                     self.session_index.update_stage(session_id, "error", set_acceptance["error"])
                     _write_render_status(working_dir, status="error", payload={**set_acceptance, "session_id": session_id})
                     return ToolResult("vimax_render_video", False, set_acceptance["error"], set_acceptance)
+                rendered_ending_refusal = await _rendered_ending_preflight_refusal(
+                    working_dir,
+                    render_mode,
+                    stop_after,
+                    image_generator,
+                    only_shots,
+                    redo,
+                )
+                if rendered_ending_refusal is not None:
+                    self.session_index.update_stage(session_id, "error", rendered_ending_refusal["error"])
+                    _write_render_status(
+                        working_dir, status="error",
+                        payload={**rendered_ending_refusal, "session_id": session_id},
+                    )
+                    return ToolResult(
+                        "vimax_render_video",
+                        False,
+                        rendered_ending_refusal["error"],
+                        rendered_ending_refusal,
+                    )
 
             model_change = _enforce_render_sequence(
                 working_dir,
@@ -751,9 +771,12 @@ class ViMaxAdapters:
             })
             revision_notes = _revision_notes_for(working_dir, render_mode, redo)
             if redo:
-                keyframe_redraws = [slot for slot, stage in redo["slots"].items() if stage == "keyframes"]
-                if keyframe_redraws:
-                    _invalidate_continuity_dependents(working_dir, render_mode, keyframe_redraws)
+                ending_changes = [
+                    slot for slot, stage in redo["slots"].items()
+                    if stage in {"keyframes", "clips"}
+                ]
+                if ending_changes:
+                    _invalidate_continuity_dependents(working_dir, render_mode, ending_changes)
                 removed = _clear_redo_targets(working_dir, render_mode, redo["slots"])
                 _mark_slots_redone(working_dir, render_mode, redo["slots"], revision_notes)
             if runtime:
@@ -2125,16 +2148,250 @@ def _continuity_playback_order(root_dir: Path) -> list[str]:
     return order
 
 
+def _continuity_camera_by_slot(root_dir: Path) -> dict[str, tuple[str, str]]:
+    """Map active playback slots to their scene/camera identity."""
+    scene_dirs = sorted(
+        (shots_dir.parent for shots_dir in root_dir.glob("scene_*/shots")),
+        key=lambda scene: _shot_sort_key(scene.name.split("_", 1)[1]),
+    )
+    containers = (
+        [(scene.name, scene / "camera_tree.json") for scene in scene_dirs]
+        if scene_dirs else [("", root_dir / "camera_tree.json")]
+    )
+    result = {}
+    for scene, tree_path in containers:
+        try:
+            cameras = json.loads(tree_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(cameras, list):
+            continue
+        for camera in cameras:
+            if not isinstance(camera, dict) or not isinstance(camera.get("active_shot_idxs"), list):
+                continue
+            for shot_idx in camera["active_shot_idxs"]:
+                slot = f"{scene}/{shot_idx}" if scene else str(shot_idx)
+                result[slot] = (scene, str(camera.get("idx", "")))
+    return result
+
+
+def _continuity_target_mode(working_dir: Path, root: str, order: list[str], position: int, cameras) -> str | None:
+    if position <= 0:
+        return None
+    target = order[position]
+    parts = target.split("/")
+    shot_dir = (
+        working_dir / root / parts[0] / "shots" / parts[1]
+        if parts[0].startswith("scene_") else working_dir / root / "shots" / parts[0]
+    )
+    try:
+        description = json.loads((shot_dir / "shot_description.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        description = {}
+    reuse = description.get("reuse_previous_last_frame") if isinstance(description, dict) else None
+    if reuse is False:
+        return None
+    if reuse is True:
+        return "reuse"
+    try:
+        settings = json.loads((working_dir / FRAME_CONTINUITY_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    global_chain = isinstance(settings, dict) and settings.get("mode") == "chained_keyframes"
+    if not global_chain:
+        return None
+    previous = order[position - 1]
+    same_camera = cameras.get(previous) == cameras.get(target) and cameras.get(previous, (None,))[0] == cameras.get(target, (None,))[0]
+    return "reuse" if same_camera else "reframe"
+
+
+async def _rendered_ending_preflight_refusal(
+    working_dir: Path,
+    root: str,
+    phase: str,
+    image_generator: Any,
+    only_shots: list[int | str] | None,
+    redo: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Reject a chain before a media provider call unless its accepted clip handoff is current."""
+    if phase not in {"stills", "video"} or not _continuity_enabled(working_dir, root):
+        return None
+    from utils.video_assembly import RENDERED_ENDING_NORMALIZATION, prepare_rendered_ending
+
+    root_dir = working_dir / root
+    order = _continuity_playback_order(root_dir)
+    if len(order) < 2:
+        return None
+    cameras = _continuity_camera_by_slot(root_dir)
+    scope = {str(slot) for slot in only_shots} if only_shots is not None else None
+    redo_slots = (redo or {}).get("slots") or {}
+    acceptance = _read_acceptance(working_dir)
+    root_acceptance = acceptance.get(root) if isinstance(acceptance.get(root), dict) else {}
+    shot_records = root_acceptance.get("shots") if isinstance(root_acceptance.get("shots"), dict) else {}
+    image_slug = safe_path_component(str(getattr(image_generator, "model", "") or "unknown-image-model"))
+    for position, target_slot in enumerate(order):
+        if scope is not None and target_slot not in scope:
+            continue
+        target_dir_parts = target_slot.split("/")
+        target_dir = (
+            root_dir / target_dir_parts[0] / "shots" / target_dir_parts[1]
+            if target_dir_parts[0].startswith("scene_")
+            else root_dir / "shots" / target_dir_parts[0]
+        )
+        historical_clip = (
+            phase == "video"
+            and bool(_shot_stage_paths(target_dir, "clips"))
+            and target_slot not in redo_slots
+        )
+        mode = _continuity_target_mode(working_dir, root, order, position, cameras)
+        if mode is None:
+            continue
+        source_slot = order[position - 1]
+        source_parts = source_slot.split("/")
+        source_dir = (
+            root_dir / source_parts[0] / "shots" / source_parts[1]
+            if source_parts[0].startswith("scene_")
+            else root_dir / "shots" / source_parts[0]
+        )
+        source_record = shot_records.get(source_slot, {}) if isinstance(shot_records, dict) else {}
+        clip_record = source_record.get("clips") if isinstance(source_record, dict) else None
+        if (
+            not isinstance(clip_record, dict)
+            or not clip_record.get("accepted_at")
+            or clip_record.get("invalidated_at")
+            or clip_record.get("rejected_at")
+            or not _lock_matches(working_dir, clip_record)
+        ):
+            _invalidate_continuity_dependents(working_dir, root, [source_slot])
+            if historical_clip:
+                continue
+            return {
+                "error_type": "rendered_ending_source_unavailable",
+                "retryable": False,
+                "render_mode": root,
+                "slot": target_slot,
+                "previous_slot": source_slot,
+                "error": (
+                    f"Cannot prepare the rendered ending for {target_slot}: predecessor clip {source_slot} "
+                    "is missing, changed, or not accepted. Render and accept that predecessor clip first; "
+                    "no hidden predecessor generation was attempted."
+                ),
+            }
+        source_clips = [
+            (working_dir / str(item.get("path") or "")).resolve()
+            for item in clip_record.get("artifacts", [])
+            if isinstance(item, dict)
+            and str(item.get("path") or "").endswith("/video.mp4")
+        ]
+        clip_path = next(
+            (path for path in source_clips if path.is_file() and path.is_relative_to(source_dir.resolve())),
+            None,
+        )
+        if clip_path is None:
+            _invalidate_continuity_dependents(working_dir, root, [source_slot])
+            if historical_clip:
+                continue
+            return {
+                "error_type": "rendered_ending_source_unavailable",
+                "retryable": False,
+                "render_mode": root,
+                "slot": target_slot,
+                "previous_slot": source_slot,
+                "error": f"Accepted predecessor clip {source_slot} has no current video.mp4 artifact.",
+            }
+        source_image_dir = source_dir / image_slug
+        first_anchor = source_image_dir / "first_frame.png"
+        last_anchor = source_image_dir / "last_frame.png"
+        try:
+            ending = await asyncio.to_thread(
+                prepare_rendered_ending,
+                str(clip_path),
+                first_frame=str(first_anchor) if first_anchor.is_file() else None,
+                last_frame=str(last_anchor) if last_anchor.is_file() else None,
+                width=1280,
+                height=720,
+            )
+        except Exception as exc:
+            _invalidate_continuity_dependents(working_dir, root, [source_slot])
+            if historical_clip:
+                continue
+            return {
+                "error_type": "rendered_ending_source_unavailable",
+                "retryable": False,
+                "render_mode": root,
+                "slot": target_slot,
+                "previous_slot": source_slot,
+                "error": f"Cannot decode the accepted predecessor clip {source_slot}: {exc}",
+            }
+        if ending.get("normalization") != RENDERED_ENDING_NORMALIZATION:
+            _invalidate_continuity_dependents(working_dir, root, [source_slot])
+            if historical_clip:
+                continue
+            return {
+                "error_type": "rendered_ending_source_unavailable",
+                "retryable": False,
+                "render_mode": root,
+                "slot": target_slot,
+                "previous_slot": source_slot,
+                "error": (
+                    f"Predecessor clip {source_slot} produced unsupported rendered-ending normalization "
+                    f"{ending.get('normalization')!r}."
+                ),
+            }
+        first_path = target_dir / image_slug / "first_frame.png"
+        selector_path = target_dir / "first_frame_selector_output.json"
+        try:
+            provenance = json.loads(selector_path.read_text(encoding="utf-8")).get("continuity_source")
+            first_hash = hashlib.sha256(first_path.read_bytes()).hexdigest()
+        except (OSError, ValueError, AttributeError):
+            provenance = None
+            first_hash = None
+        project_relative = lambda path: Path(path).resolve().relative_to(working_dir.resolve()).as_posix()
+        expected = {
+            "kind": "rendered_clip_end",
+            "shot_idx": int(source_parts[-1]),
+            "slot": source_slot,
+            "path": project_relative(ending["path"]),
+            "sha256": ending["sha256"],
+            "clip_path": project_relative(ending["clip_path"]),
+            "clip_sha256": ending["clip_sha256"],
+            "normalization": ending["normalization"],
+            "normalization_inputs": ending["normalization_inputs"],
+            "frame_type": "rendered_end",
+            "mode": mode,
+        }
+        if not first_path.is_file() or provenance != expected or (mode == "reuse" and first_hash != ending["sha256"]):
+            if isinstance(provenance, dict) and provenance.get("kind") == "rendered_clip_end" and provenance != expected:
+                _invalidate_continuity_dependents(working_dir, root, [source_slot])
+            if historical_clip:
+                continue
+            message = (
+                "The first frame still has legacy planned-still provenance."
+                if isinstance(provenance, dict) and provenance.get("frame_type") == "last_frame"
+                else "The current rendered ending has not been prepared for this first frame."
+            )
+            return {
+                "error_type": "rendered_ending_preparation_required",
+                "retryable": False,
+                "render_mode": root,
+                "slot": target_slot,
+                "previous_slot": source_slot,
+                "previous_clip_sha256": ending["clip_sha256"],
+                "error": (
+                    f"Cannot generate {target_slot}: {message} Explicitly prepare the rendered ending from "
+                    f"accepted predecessor clip {source_slot} and review the resulting first frame before "
+                    "rendering."
+                ),
+            }
+    return None
+
+
 def _invalidate_continuity_dependents(
     working_dir: Path,
     root: str,
     changed_slots: list[str] | tuple[str, ...] | set[str] | dict[str, Any] | str | int,
 ) -> list[str]:
-    """Invalidate accepted review records for direct playback successors.
-
-    ``changed_slots`` names keyframe-bearing slots whose ending has changed. Playback
-    order comes exclusively from the active camera trees, never from shot numbers.
-    """
+    """Invalidate direct actual-ending dependents after a predecessor source changes."""
     if not _continuity_enabled(working_dir, root):
         return []
     if isinstance(changed_slots, dict):
@@ -2143,12 +2400,31 @@ def _invalidate_continuity_dependents(
         changed = {str(changed_slots)}
     else:
         changed = {str(slot) for slot in changed_slots}
-    order = _continuity_playback_order(working_dir / root)
+    root_dir = working_dir / root
+    order = _continuity_playback_order(root_dir)
+    cameras = _continuity_camera_by_slot(root_dir)
     dependents = []
-    for index, slot in enumerate(order):
-        if slot in changed:
-            if index + 1 < len(order) and order[index + 1] not in changed:
-                dependents.append(order[index + 1])
+    for index, source_slot in enumerate(order[:-1]):
+        if source_slot not in changed:
+            continue
+        target_slot = order[index + 1]
+        if target_slot in changed:
+            continue
+        mode = _continuity_target_mode(working_dir, root, order, index + 1, cameras)
+        target_parts = target_slot.split("/")
+        target_dir = (
+            root_dir / target_parts[0] / "shots" / target_parts[1]
+            if target_parts[0].startswith("scene_")
+            else root_dir / "shots" / target_parts[0]
+        )
+        try:
+            provenance = json.loads(
+                (target_dir / "first_frame_selector_output.json").read_text(encoding="utf-8")
+            ).get("continuity_source")
+        except (OSError, ValueError, AttributeError):
+            provenance = None
+        if mode is not None and isinstance(provenance, dict) and provenance.get("kind") == "rendered_clip_end":
+            dependents.append(target_slot)
 
     path = _acceptance_path(working_dir)
     store = _read_acceptance(working_dir)
@@ -2161,9 +2437,8 @@ def _invalidate_continuity_dependents(
         position = order.index(slot)
         source = order[position - 1] if position else ""
         reason = (
-            f"Shot {source} has a changed ending; re-review this shot's keyframes and clip "
+            f"Rendered ending from shot {source} changed; re-review this shot's keyframes and clip "
             "to confirm the continuous handoff."
-            if source else "An earlier keyframe ending changed; re-review this shot's keyframes and clip."
         )
         for stage in ("keyframes", "clips"):
             record = shot_store.get(stage)
@@ -2179,7 +2454,7 @@ def _invalidate_continuity_dependents(
         root_store["final_video"] = {
             **final_record,
             "invalidated_at": now,
-            "invalidation_reason": "A keyframe ending changed in the continuous film; rebuild and review the final assembly.",
+            "invalidation_reason": "A predecessor clip or ending changed in the continuous film; rebuild and review the final assembly.",
         }
         changed_any = True
 

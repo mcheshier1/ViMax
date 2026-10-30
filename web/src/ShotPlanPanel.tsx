@@ -1,6 +1,6 @@
 import {forwardRef, useEffect, useImperativeHandle, useRef, useState} from 'react';
 import {AlertTriangle, MapPin, Save, User} from 'lucide-react';
-import {updateShotPlan} from './api';
+import {prepareRenderedEnding, updateShotPlan} from './api';
 import {characterChips, planDirty, slotName, toggleCharacter} from './timeline';
 import type {AcceptanceStage, PlanFrame, ShotPlan} from './types';
 import {validateShotDuration} from '../video-durations.mjs';
@@ -107,8 +107,10 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     notes: {}, revision: 0,
   });
   const [error, setError] = useState('');
+  const [continuityNotice, setContinuityNotice] = useState('');
   const [storageFailed, setStorageFailed] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [preparingEnding, setPreparingEnding] = useState(false);
   const [editing, setEditing] = useState(() => Boolean(Object.keys(readDraft(key)?.notes || {}).length));
   const feedbackRef = useRef<HTMLTextAreaElement>(null);
   const focusFeedback = useRef(false);
@@ -257,6 +259,35 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
       if (mounted.current) setSaving(false);
     }
   }
+  async function prepareEnding() {
+    const owner = current.current;
+    const source = owner.plan;
+    if (!source || owner.disabled || operation.current || dirty || !source.reusePreviousLastFrame
+      || !source.previousSlot || !source.previousClipAvailable || !source.previousClipAccepted || !source.previousClipSha256) return;
+    if (!window.confirm(`Replace ${slotName('keyframes', slot)}’s first frame with ${slotName('clips', source.previousSlot)}’s actual rendered ending? This is local and free. Its frames, clip and final-film approvals will need review again. Existing last-frame and video files are kept; no generation starts.`)) return;
+    operation.current = true;
+    setSaving(true);
+    setError('');
+    setContinuityNotice('');
+    setPreparingEnding(true);
+    try {
+      const prepared = await prepareRenderedEnding({
+        sessionId, root, slot, previousSlot: source.previousSlot,
+        previousClipSha256: source.previousClipSha256, revision: source.revision,
+      });
+      if (!mounted.current || current.current.key !== owner.key) return;
+      commit({plan: fields(prepared), base: fields(prepared), notes: {}, revision: draftRef.current.revision + 1}, prepared);
+      await onChanged();
+      if (mounted.current && current.current.key === owner.key) setContinuityNotice('Actual rendered ending prepared. Review and accept this shot’s frames before generating its clip. No generation was started.');
+    } catch (reason) {
+      if (mounted.current && current.current.key === owner.key) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      operation.current = false;
+      if (mounted.current) setSaving(false);
+      if (mounted.current) setPreparingEnding(false);
+    }
+  }
+
   useImperativeHandle(ref, () => ({
     dirty: () => Boolean(readDraft(key)),
     save: () => save('all'),
@@ -294,7 +325,10 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
         visible={part === 'firstFrame' ? draft.plan.ffVis : draft.plan.lfVis} disabled={disabled} saving={saving}
         sets={plan.sets} setIds={draft.plan.setIds ?? plan.setIds} savedSetIds={plan.setIds}
         continuity={part === 'firstFrame' && typeof plan.previousSlot === 'string' ? {
-          previousSlot: plan.previousSlot, available: plan.previousLastFrameAvailable,
+          previousSlot: plan.previousSlot, available: plan.previousClipAvailable, accepted: plan.previousClipAccepted,
+          status: plan.renderedEndingStatus, reason: plan.renderedEndingReason,
+          referenceView: !plan.reusePreviousLastFrame && plan.renderedEndingStatus !== 'off',
+          prepareDisabled: dirty || plan.renderedEndingStatus === 'current', preparing: preparingEnding, onPrepare: () => void prepareEnding(),
           checked: draft.plan.reusePreviousLastFrame ?? plan.reusePreviousLastFrame,
           onChange: (reusePreviousLastFrame) => edit({reusePreviousLastFrame, previousSlot: plan.previousSlot}),
         } : undefined}
@@ -328,6 +362,7 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
     <p className="plan-hint">{dirty ? 'Local draft kept for this project' : 'Saved'} · never saves on blur. Feedback marks this take “Needs changes”; regeneration requires a separate scope, model and cost decision.</p>
     {Object.keys(draft.notes).some((key) => key !== stage) && <p className="film-warning">There is also unsaved feedback in the other preview stage. Open that stage to save or discard it before generating.</p>}
     {storageFailed && <p className="plan-error" role="alert">Browser storage is unavailable. Your draft is kept in this tab only; save before reloading.</p>}
+    {continuityNotice && <p className="plan-hint" role="status">{continuityNotice}</p>}
     {error && <p className="plan-error" role="alert">{error}</p>}
   </section>;
 });
@@ -335,7 +370,7 @@ export const ShotPlanPanel = forwardRef<ShotPlanHandle, {
 function FramePlan({label, frame, characters, sets, setIds, savedSetIds, description, visible, disabled, saving, continuity, onDescription, onToggle, onToggleSet, onCancel}: {
   label: string; frame: PlanFrame; characters: {idx: number; name: string}[]; sets: ShotPlan['sets']; setIds: string[]; savedSetIds: string[]; description: string; visible: number[]; disabled: boolean; saving: boolean;
   onDescription: (value: string) => void; onToggle: (idx: number, on: boolean) => void; onToggleSet: (id: string, on: boolean) => void; onCancel: () => void;
-  continuity?: {previousSlot: string; available: boolean; checked: boolean; onChange: (checked: boolean) => void};
+  continuity?: {previousSlot: string; available: boolean; accepted: boolean; checked: boolean; referenceView: boolean; status: ShotPlan['renderedEndingStatus']; reason: string; prepareDisabled: boolean; preparing: boolean; onPrepare: () => void; onChange: (checked: boolean) => void};
 }) {
   const changed = description !== frame.description || visible.length !== frame.visible.length || visible.some((idx) => !frame.visible.includes(idx))
     || setIds.length !== savedSetIds.length || setIds.some((id) => !savedSetIds.includes(id));
@@ -349,10 +384,15 @@ function FramePlan({label, frame, characters, sets, setIds, savedSetIds, descrip
     </header>
     {continuity && <div className="plan-frame-continuity">
       <label><input type="checkbox" checked={continuity.checked} disabled={disabled || saving} onChange={(event) => continuity.onChange(event.target.checked)} />
-        <span>Use previous shot’s last frame as this shot’s first frame</span>
+        <span>Use previous shot’s rendered ending as this shot’s first frame</span>
       </label>
-      <p className="plan-hint">Source: {slotName('keyframes', continuity.previousSlot)}. When enabled, generation copies that image exactly; the first-frame description does not alter the copied image.</p>
-      {continuity.checked && !continuity.available && <p className="plan-hint">The previous shot’s last frame is missing. Generate and review it before generating this shot with continuity enabled.</p>}
+      <p className="plan-hint">Source: {slotName('clips', continuity.previousSlot)}’s rendered video, not its planned last-frame still. When enabled, the normalized final displayed frame is copied exactly; the first-frame description does not change that image.</p>
+      {(continuity.checked || continuity.status !== 'off') && <p className="plan-hint">{continuity.reason}</p>}
+      {!continuity.checked && continuity.referenceView && <p className="plan-hint">Project continuity uses the rendered ending as a reference for a new camera view. Enable the checkbox to copy that ending exactly instead.</p>}
+      {continuity.checked && !continuity.available && <p className="film-warning">Render the previous shot’s clip first. A planned last-frame still is not a rendered ending.</p>}
+      {continuity.checked && continuity.available && !continuity.accepted && <p className="film-warning">Review and accept the previous shot’s current clip before using its ending.</p>}
+      {continuity.checked && <button className="timeline-action" disabled={disabled || saving || continuity.prepareDisabled || !continuity.available || !continuity.accepted} onClick={continuity.onPrepare}>{continuity.preparing ? 'Preparing rendered ending…' : 'Prepare from rendered ending · local, free'}</button>}
+      {continuity.checked && continuity.prepareDisabled && continuity.status !== 'current' && <p className="plan-hint">Save or discard local edits before preparing the first frame.</p>}
     </div>}
     <div className="plan-characters">
       {characterChips(characters, visible).map((character) => <button key={character.idx} className={`plan-character${character.on ? ' is-on' : ''}`} aria-pressed={character.on} disabled={disabled || !editing} onClick={() => onToggle(character.idx, !character.on)}><User size={11} />{character.name}</button>)}

@@ -2,7 +2,7 @@ import {useCallback, useEffect, useRef, useState} from 'react';
 import {readFilmProgress, readFilmSnapshot} from './api';
 import {renderActivity} from './timeline';
 import {hasSessionFilmDrafts, reconcileFilmDrafts} from './ShotPlanPanel';
-import type {Artifact, ContinuityPayload, JsonValue, RemovedShot, RenderAcceptance, SetReferenceInventory, ShotPlan} from './types';
+import type {Artifact, AssemblyCorrectionReport, ContinuityPayload, JsonValue, RemovedShot, RenderAcceptance, SetReferenceInventory, ShotPlan} from './types';
 
 export type FilmSnapshot = {
   acceptance: RenderAcceptance;
@@ -11,6 +11,7 @@ export type FilmSnapshot = {
   continuity: ContinuityPayload;
   artifacts: Artifact[];
   sets?: SetReferenceInventory;
+  assembly?: AssemblyCorrectionReport | null;
 };
 
 export type FilmProgress = {

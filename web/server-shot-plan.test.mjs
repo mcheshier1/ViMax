@@ -1,10 +1,12 @@
+import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {existsSync} from 'node:fs';
 import {mkdtemp, mkdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {createShot, readRemovedShots, readSetReferences, readShotPlan, readShotPlans, readRenderAcceptance, readContinuityReview, removeShot, restoreShot, updateRenderAcceptance, updateSetReference, updateShotPlan} from './server-lib.mjs';
+import {createShot, readRemovedShots, readSetReferences, readShotPlan, readShotPlans, readRenderAcceptance, readContinuityReview, removeShot, restoreShot, updateRenderAcceptance, updateSetReference, updateShotPlan, prepareRenderedEndingForShot} from './server-lib.mjs';
 import {getShotRestartPlan, restartShot} from './server-lib.mjs';
 
 const storageTestControl = vi.hoisted(() => ({failAcceptanceWrite: false}));
@@ -194,20 +196,22 @@ describe('shot plans', () => {
     let snapshot = await readShotPlans(root, SESSION_ID, ROOT);
     const bySlot = (plans, slot) => plans.find((plan) => plan.slot === slot);
     expect(bySlot(snapshot.plans, '4')).toMatchObject({
-      previousSlot: null, reusePreviousLastFrame: false, previousLastFrameAvailable: false,
+      previousSlot: null, reusePreviousLastFrame: false, previousClipAvailable: false, previousClipAccepted: false,
+      previousClipSha256: null, renderedEndingStatus: 'off',
     });
     expect(bySlot(snapshot.plans, '7')).toMatchObject({
-      previousSlot: '4', reusePreviousLastFrame: true, previousLastFrameAvailable: true,
+      previousSlot: '4', reusePreviousLastFrame: true, previousClipAvailable: true, previousClipAccepted: true,
+      renderedEndingStatus: 'not_prepared',
     });
     expect(bySlot(snapshot.plans, '2')).toMatchObject({
-      previousSlot: '7', reusePreviousLastFrame: false, previousLastFrameAvailable: true,
+      previousSlot: '7', reusePreviousLastFrame: false, previousClipAvailable: true,
     });
     await writeFile(descriptionPath('7'), JSON.stringify({...sameCamera, reuse_previous_last_frame: false}));
     expect((await readShotPlan(root, SESSION_ID, ROOT, '7')).reusePreviousLastFrame).toBe(false);
     delete sameCamera.reuse_previous_last_frame;
     await writeFile(descriptionPath('7'), JSON.stringify(sameCamera));
     await rm(path.join(working, ROOT, 'shots', '4', 'qwen_qwen-image-3', 'last_frame.png'));
-    expect((await readShotPlan(root, SESSION_ID, ROOT, '7')).previousLastFrameAvailable).toBe(false);
+    expect((await readShotPlan(root, SESSION_ID, ROOT, '7')).previousClipAvailable).toBe(true);
 
     await rm(path.join(working, 'frame_continuity.json'));
     const legacy = await readShotPlan(root, SESSION_ID, ROOT, '7');
@@ -216,13 +220,133 @@ describe('shot plans', () => {
     await writeFile(descriptionPath('2'), JSON.stringify({...explicit, reuse_previous_last_frame: true}));
     const detail = await readShotPlan(root, SESSION_ID, ROOT, '2');
     snapshot = await readShotPlans(root, SESSION_ID, ROOT);
-    expect(detail).toMatchObject({previousSlot: '7', reusePreviousLastFrame: true, previousLastFrameAvailable: true});
+    expect(detail).toMatchObject({previousSlot: '7', reusePreviousLastFrame: true, previousClipAvailable: true, previousClipAccepted: true, renderedEndingStatus: 'not_prepared'});
     expect(bySlot(snapshot.plans, '2')).toMatchObject({
       previousSlot: detail.previousSlot,
       reusePreviousLastFrame: detail.reusePreviousLastFrame,
-      previousLastFrameAvailable: detail.previousLastFrameAvailable,
+      previousClipAvailable: detail.previousClipAvailable,
     });
   });
+
+  it('tracks replacement and deletion of the accepted predecessor clip in the plan', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const sourceClip = path.join(working, ROOT, 'shots', '4', 'kwaivgi_kling-video-o1', 'video.mp4');
+    const original = await readFile(sourceClip);
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '7')).toMatchObject({
+      previousClipAvailable: true, previousClipAccepted: true, renderedEndingStatus: 'not_prepared',
+    });
+
+    await writeFile(sourceClip, Buffer.concat([original, Buffer.from('-replacement')]));
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '7')).toMatchObject({
+      previousClipAvailable: true, previousClipAccepted: false, renderedEndingStatus: 'unreviewed_clip',
+    });
+    expect(timelineSlot(await readRenderAcceptance(root, SESSION_ID, ROOT), 'clips', '4').state).toBe('stale');
+
+    await rm(sourceClip);
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '7')).toMatchObject({
+      previousClipAvailable: false, previousClipAccepted: false, previousClipSha256: null, renderedEndingStatus: 'missing_clip',
+    });
+  });
+
+  it('prepares the actual predecessor clip ending locally and waits for target review', async () => {
+    const {root, working} = await fixture();
+    await withContinuityFilm(working);
+    const sourceDir = path.join(working, ROOT, 'shots', '4', 'kwaivgi_kling-video-o1');
+    const sourceClip = path.join(sourceDir, 'video.mp4');
+    execFileSync('ffmpeg', [
+      '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'color=c=red:s=64x48:r=2:d=1',
+      '-f', 'lavfi', '-i', 'color=c=blue:s=64x48:r=2:d=1',
+      '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[out]', '-map', '[out]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', sourceClip,
+    ], {stdio: 'ignore'});
+    const plannedLast = path.join(sourceDir, '..', 'qwen_qwen-image-3', 'last_frame.png');
+    execFileSync('ffmpeg', [
+      '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
+      '-i', 'color=c=green:s=128x96', '-frames:v', '1', '-update', '1', plannedLast,
+    ], {stdio: 'ignore'});
+    const targetSelectorPath = path.join(working, ROOT, 'shots', '7', 'first_frame_selector_output.json');
+    await writeFile(targetSelectorPath, JSON.stringify({
+      sent_prompt: 'obsolete paid image prompt',
+      reference_image_path_and_text_pairs: [['old-reference.png', 'old reference']],
+    }));
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, shot: '4', stage: 'clips', accepted: true});
+    const plan = await readShotPlan(root, SESSION_ID, ROOT, '7');
+    const oldTargetLast = await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'last_frame.png'));
+    const clipBefore = await readFile(sourceClip);
+    const result = await prepareRenderedEndingForShot(root, {
+      sessionId: SESSION_ID, root: ROOT, slot: '7', previousSlot: '4',
+      previousClipSha256: plan.previousClipSha256, revision: plan.revision,
+    });
+
+    expect(result.renderedEndingStatus).toBe('current');
+    const selector = JSON.parse(await readFile(targetSelectorPath, 'utf8'));
+    const source = selector.continuity_source;
+    expect(source).toMatchObject({
+      kind: 'rendered_clip_end', slot: '4', shot_idx: 4, frame_type: 'rendered_end', mode: 'reuse',
+    });
+    expect(selector).not.toHaveProperty('sent_prompt');
+    expect(selector).not.toHaveProperty('reference_image_path_and_text_pairs');
+    expect(source.path).toBe(`${ROOT}/shots/4/kwaivgi_kling-video-o1/video.mp4.rendered-ending.png`);
+    const derived = path.join(working, source.path);
+    const targetFirst = await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'first_frame.png'));
+    expect(targetFirst).toEqual(await readFile(derived));
+    expect(targetFirst).not.toEqual(await readFile(plannedLast));
+    expect(await readFile(path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'last_frame.png'))).toEqual(oldTargetLast);
+    expect(await readFile(sourceClip)).toEqual(clipBefore);
+    expect(timelineSlot(await readRenderAcceptance(root, SESSION_ID, ROOT), 'keyframes', '7').state).toBe('rendered');
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, shot: '7', stage: 'keyframes', accepted: true});
+    expect(timelineSlot(await readRenderAcceptance(root, SESSION_ID, ROOT), 'keyframes', '7').state).toBe('accepted');
+    const repoRoot = fileURLToPath(new URL('../', import.meta.url));
+    const python = path.join(repoRoot, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+    const nativeGate = execFileSync(python, ['-c', `
+import asyncio, json, sys
+from pathlib import Path
+from types import SimpleNamespace
+from agent_runtime.vimax_adapters import _rendered_ending_preflight_refusal
+result = asyncio.run(_rendered_ending_preflight_refusal(
+    Path(sys.argv[1]), "script2video", "video",
+    SimpleNamespace(model="qwen/qwen-image-3"), ["7"], {"slots": {"7": {"stage": "clips"}}},
+))
+print(json.dumps(result))
+`, working], {cwd: repoRoot, encoding: 'utf8'});
+    expect(JSON.parse(nativeGate)).toBeNull();
+
+    // Camera-cut views derive from the ending without requiring byte-identical first frames.
+    await writeFile(path.join(working, ROOT, 'camera_tree.json'), JSON.stringify([
+      {idx: 0, active_shot_idxs: [4]}, {idx: 1, active_shot_idxs: [7]}, {idx: 2, active_shot_idxs: [2, 0]},
+    ]));
+    await writeFile(targetSelectorPath, JSON.stringify({continuity_source: {...source, mode: 'reframe'}}));
+    const targetFirstPath = path.join(working, ROOT, 'shots', '7', 'qwen_qwen-image-3', 'first_frame.png');
+    const reframedFirst = await readFile(plannedLast);
+    await writeFile(targetFirstPath, reframedFirst);
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '7')).toMatchObject({
+      reusePreviousLastFrame: false, renderedEndingStatus: 'current',
+    });
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, shot: '7', stage: 'keyframes', accepted: true});
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, shot: '7', stage: 'clips', accepted: true});
+    expect(timelineSlot(await readRenderAcceptance(root, SESSION_ID, ROOT), 'clips', '7').state).toBe('accepted');
+
+    // A valid MP4 free box changes source identity without changing the reviewed target pixels.
+    await writeFile(sourceClip, Buffer.concat([clipBefore, Buffer.from([0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65])]));
+    const changed = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(changed, 'keyframes', '7').state).toBe('stale');
+    expect(timelineSlot(changed, 'clips', '7').state).toBe('stale');
+    for (const stage of ['keyframes', 'clips']) {
+      await expect(updateRenderAcceptance(root, {
+        sessionId: SESSION_ID, root: ROOT, shot: '7', stage, accepted: true,
+      })).rejects.toMatchObject({statusCode: 400});
+    }
+    expect(await readFile(targetFirstPath)).toEqual(reframedFirst);
+
+    await updateShotPlan(root, {sessionId: SESSION_ID, root: ROOT, slot: '7', reusePreviousLastFrame: false, previousSlot: '4'});
+    expect(await readShotPlan(root, SESSION_ID, ROOT, '7')).toMatchObject({
+      reusePreviousLastFrame: false, renderedEndingStatus: 'off',
+    });
+    await updateRenderAcceptance(root, {sessionId: SESSION_ID, root: ROOT, shot: '7', stage: 'keyframes', accepted: true});
+    expect(timelineSlot(await readRenderAcceptance(root, SESSION_ID, ROOT), 'keyframes', '7').state).toBe('accepted');
+  }, 30000);
 
   it('persists a boolean choice only against the predecessor the editor reviewed', async () => {
     const {root, working} = await fixture();
@@ -512,10 +636,11 @@ describe('continuous keyframe approvals', () => {
     expect(await readFile(path.join(working, ROOT, 'shots', '7', 'kwaivgi_kling-video-o1', 'video.mp4'), 'utf8'))
       .toBe('clip-7');
 
-    acceptance = await updateRenderAcceptance(root, {
+    await expect(updateRenderAcceptance(root, {
       sessionId: SESSION_ID, root: ROOT, stage: 'keyframes', shot: '7', accepted: true,
-    });
-    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('accepted');
+    })).rejects.toMatchObject({statusCode: 400});
+    acceptance = await readRenderAcceptance(root, SESSION_ID, ROOT);
+    expect(timelineSlot(acceptance, 'keyframes', '7').state).toBe('stale');
     expect(timelineSlot(acceptance, 'clips', '7').state).toBe('stale');
     expect(timelineSlot(acceptance, 'keyframes', '2').state).toBe('accepted');
   });

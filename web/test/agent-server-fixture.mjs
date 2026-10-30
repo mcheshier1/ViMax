@@ -18,6 +18,9 @@ export async function startAgentServer() {
     }
     await mkdir(path.join(root, 'configs'));
     await copyFile(path.join(webRoot, '..', 'configs', 'video-duration-models.json'), path.join(root, 'configs', 'video-duration-models.json'));
+    await mkdir(path.join(root, 'utils'));
+    await copyFile(path.join(webRoot, '..', 'utils', 'video_assembly.py'), path.join(root, 'utils', 'video_assembly.py'));
+    await symlink(path.join(webRoot, '..', '.venv'), path.join(root, '.venv'), 'dir');
     await symlink(path.join(webRoot, 'node_modules'), path.join(web, 'node_modules'), 'dir');
     await symlink(path.join(webRoot, 'dist'), path.join(web, 'dist'), 'dir');
     await mkdir(path.join(root, '.vimax'));

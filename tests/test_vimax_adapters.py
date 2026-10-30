@@ -1268,6 +1268,66 @@ class RedoRenderTests(unittest.IsolatedAsyncioTestCase):
         _approve_set_references(working, "script2video", ["0", "1"])
         return working, index
 
+    async def test_confirmed_video_command_uses_live_keyframe_approval_without_llm_refusal(self):
+        from unittest.mock import Mock
+        from agent_runtime.loop import AgentLoop
+        from agent_runtime.prompts import PromptBuilder
+        from agent_runtime.tools import ToolRegistry
+        from agent_runtime.tool_executor import ToolExecutor
+        from agent_runtime.vimax_adapters import build_vimax_adapter_specs
+
+        class LocalVideoPipeline(RecordingScriptPipeline):
+            async def __call__(self, **kwargs):
+                output = self.working_dir / "shots" / "0" / "local-video" / "video.mp4"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"local video output")
+                kwargs["progress"]("video_clip_done", "Local video ready", {"shot_idx": 0})
+                return RenderOutcome(phase=kwargs["stop_after"], style=kwargs["style"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working, index = self._session(tmp)
+            registry = ToolRegistry(build_vimax_adapter_specs(tmp, index))
+            llm = Mock()
+            llm.stream.side_effect = AssertionError("Confirmed generation must not ask the coordinator LLM")
+            loop = AgentLoop(index, PromptBuilder(Path(tmp) / "prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            command = "/render " + json.dumps({
+                "render_mode": "script2video", "redo_shots": ["0"], "stop_after": "video", "allow_unreviewed_redo": True,
+            })
+            frames = [working / "script2video" / "shots" / "0" / "qwen_qwen-image-3" / name
+                      for name in ("first_frame.png", "last_frame.png")]
+            output = working / "script2video" / "shots" / "0" / "local-video" / "video.mp4"
+            with patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
+                 patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
+                 patch("pipelines.script2video_pipeline.Script2VideoPipeline", LocalVideoPipeline):
+                before_approval = [event async for event in loop.stream_events(command)]
+                denied = next(event for event in before_approval if event["type"] == "tool_result")["tool_result"]
+                self.assertFalse(denied["ok"])
+                self.assertEqual(denied["metadata"]["error_type"], "acceptance_required")
+                self.assertFalse(output.exists())
+
+                store_path = working / "render_acceptance.json"
+                store = json.loads(store_path.read_text(encoding="utf-8"))
+                approved = {"accepted_at": "reviewed", "artifacts": [_lock(working, str(frame.relative_to(working))) for frame in frames]}
+                store["script2video"].setdefault("shots", {})["0"] = {"keyframes": approved}
+                store_path.write_text(json.dumps(store), encoding="utf-8")
+                original_frames = [frame.read_bytes() for frame in frames]
+                after_approval = [event async for event in loop.stream_events(command)]
+                rendered = next(event for event in after_approval if event["type"] == "tool_result")["tool_result"]
+                self.assertTrue(rendered["ok"], rendered["content"])
+                self.assertEqual(output.read_bytes(), b"local video output")
+                self.assertEqual([frame.read_bytes() for frame in frames], original_frames)
+                self.assertEqual(json.loads(store_path.read_text())["script2video"]["shots"]["0"]["keyframes"], approved)
+
+                frames[-1].write_bytes(b"changed frame")
+                after_change = [event async for event in loop.stream_events(command)]
+                stale = next(event for event in after_change if event["type"] == "tool_result")["tool_result"]
+                self.assertFalse(stale["ok"])
+                self.assertEqual(stale["metadata"]["error_type"], "acceptance_required")
+                self.assertEqual(stale["metadata"]["unaccepted"], [{"slot": "0", "state": "stale"}])
+                self.assertEqual(output.read_bytes(), b"local video output")
+            llm.stream.assert_not_called()
+
     async def test_render_tool_generates_all_requested_candidate_images(self):
         class CandidateImages:
             model = "local-candidate-model"

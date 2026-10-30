@@ -1,4 +1,4 @@
-import {mkdtemp, mkdir, readFile, rename, stat, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, rename, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
@@ -11,7 +11,6 @@ const png = (payload) => Buffer.concat([
 const roots = [];
 
 afterEach(async () => {
-  const {rm} = await import('node:fs/promises');
   await Promise.all(roots.splice(0).map((root) => rm(root, {recursive: true, force: true})));
 });
 
@@ -277,8 +276,29 @@ describe('web bridge state', () => {
     expect(artifacts.filter((artifact) => artifact.portrait?.accepted)).toEqual([]);
   });
 
-  it('deletes project state, artifacts, and matching log records', async () => {
+  it('deletes recorded and canonical project directories, including uploads, while preserving another project', async () => {
     const root = await fixture();
+    const canonical = path.join(root, '.working_dir', 'session-1');
+    const recorded = path.join(root, '.working_dir', 'recorded-session-1');
+    const other = path.join(root, '.working_dir', 'session-2');
+    await mkdir(path.join(recorded, 'uploads'), {recursive: true});
+    await mkdir(path.join(canonical, 'uploads'), {recursive: true});
+    await mkdir(path.join(other, 'uploads'), {recursive: true});
+    await writeFile(path.join(recorded, 'uploads', 'story.txt'), 'recorded project upload');
+    await writeFile(path.join(canonical, 'uploads', 'cover.png'), 'canonical project upload');
+    await writeFile(path.join(other, 'uploads', 'keep.txt'), 'another project');
+
+    const statePath = path.join(root, '.vimax', 'sessions.json');
+    const payload = JSON.parse(await readFile(statePath, 'utf8'));
+    payload.sessions['session-1'].working_dir = '.working_dir/recorded-session-1';
+    payload.sessions['session-2'] = {
+      session_id: 'session-2',
+      project_name: 'Keep this project',
+      working_dir: '.working_dir/session-2',
+      updated_at: '2026-07-18T10:00:00',
+    };
+    await writeFile(statePath, JSON.stringify(payload));
+
     const logPath = path.join(root, '.vimax', 'logs', 'loop_history.jsonl');
     await writeFile(logPath, [
       JSON.stringify({session_id: 'session-1', raw_user_input: 'Delete me'}),
@@ -287,9 +307,81 @@ describe('web bridge state', () => {
     ].join('\n'));
 
     const state = await deleteSession(root, 'session-1');
-    expect(state).toEqual({activeSessionId: '', sessions: []});
-    await expect(stat(path.join(root, '.working_dir', 'session-1'))).rejects.toThrow();
+    expect(state.activeSessionId).toBe('session-2');
+    expect(state.sessions.map((session) => session.sessionId)).toEqual(['session-2']);
+    await expect(stat(canonical)).rejects.toThrow();
+    await expect(stat(recorded)).rejects.toThrow();
+    await expect(stat(path.join(other, 'uploads', 'keep.txt'))).resolves.toBeDefined();
     expect(await readFile(logPath, 'utf8')).toContain('session-2');
     expect(await readFile(logPath, 'utf8')).not.toContain('session-1');
+  });
+
+  it('rejects shared and escaping recorded directories before changing project state', async () => {
+    const root = await fixture();
+    const statePath = path.join(root, '.vimax', 'sessions.json');
+    const original = JSON.parse(await readFile(statePath, 'utf8'));
+    original.sessions['session-2'] = {
+      session_id: 'session-2',
+      project_name: 'Keep this project',
+      working_dir: '.working_dir/recorded-session-2',
+      updated_at: '2026-07-18T10:00:00',
+    };
+    const otherProject = path.join(root, '.working_dir', 'session-2');
+    await mkdir(otherProject);
+    const otherMarker = path.join(otherProject, 'keep.txt');
+    await writeFile(otherMarker, 'preserve');
+    const otherRecorded = path.join(root, '.working_dir', 'recorded-session-2');
+    await mkdir(otherRecorded);
+    const otherRecordedMarker = path.join(otherRecorded, 'keep.txt');
+    await writeFile(otherRecordedMarker, 'preserve');
+    const marker = path.join(root, '.working_dir', 'unrelated.txt');
+    await writeFile(marker, 'preserve');
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'vimax-delete-outside-'));
+    roots.push(outside);
+    const outsideMarker = path.join(outside, 'keep.txt');
+    await writeFile(outsideMarker, 'preserve');
+
+    for (const workingDir of ['.working_dir', '.working_dir/session-2', outside]) {
+      const payload = JSON.parse(JSON.stringify(original));
+      payload.sessions['session-1'].working_dir = workingDir;
+      await writeFile(statePath, JSON.stringify(payload));
+      await expect(deleteSession(root, 'session-1')).rejects.toMatchObject({statusCode: 400});
+      expect(await readFile(statePath, 'utf8')).toContain('"session-1"');
+      await expect(stat(path.join(root, '.working_dir', 'session-1'))).resolves.toBeDefined();
+      expect(await readFile(marker, 'utf8')).toBe('preserve');
+      expect(await readFile(otherMarker, 'utf8')).toBe('preserve');
+      expect(await readFile(otherRecordedMarker, 'utf8')).toBe('preserve');
+      expect(await readFile(outsideMarker, 'utf8')).toBe('preserve');
+    }
+  });
+
+  it('rejects symlinked project storage without touching the linked directory', async () => {
+    const root = await fixture();
+    const sessionRoot = path.join(root, '.working_dir', 'session-1');
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'vimax-delete-symlink-'));
+    roots.push(outside);
+    const marker = path.join(outside, 'keep.txt');
+    await writeFile(marker, 'preserve');
+    await rm(sessionRoot, {recursive: true});
+    await symlink(outside, sessionRoot);
+
+    await expect(deleteSession(root, 'session-1')).rejects.toMatchObject({statusCode: 400});
+    expect(await readFile(marker, 'utf8')).toBe('preserve');
+    expect(await readSessionState(root)).toMatchObject({activeSessionId: 'session-1'});
+  });
+
+  it('tolerates missing project directories and refuses a live project writer lock', async () => {
+    const missingRoot = await fixture();
+    await rm(path.join(missingRoot, '.working_dir', 'session-1'), {recursive: true});
+    await expect(deleteSession(missingRoot, 'session-1')).resolves.toMatchObject({activeSessionId: '', sessions: []});
+
+    const busyRoot = await fixture();
+    const sessionRoot = path.join(busyRoot, '.working_dir', 'session-1');
+    const lock = path.join(sessionRoot, '.timeline-write-lock');
+    await mkdir(lock);
+    await writeFile(path.join(lock, 'owner.json'), JSON.stringify({pid: process.pid, token: 'test-owner'}));
+    await expect(deleteSession(busyRoot, 'session-1')).rejects.toMatchObject({code: 'PROJECT_BUSY', statusCode: 409});
+    await expect(stat(sessionRoot)).resolves.toBeDefined();
+    expect(await readSessionState(busyRoot)).toMatchObject({activeSessionId: 'session-1'});
   });
 });

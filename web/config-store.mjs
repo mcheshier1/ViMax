@@ -234,6 +234,9 @@ function publicConfig(payload, effectiveSeconds, effectiveResolution) {
     result.api_key = '';
     result.has_api_key = Boolean(Object.hasOwn(apiKeys, selectedIdentity) && apiKeys[selectedIdentity].trim());
     result.configured_api_key_providers = Object.keys(apiKeys);
+    result.api_key_suffixes = Object.fromEntries(Object.entries(apiKeys)
+      .filter(([, key]) => key.length > 4)
+      .map(([identity, key]) => [identity, key.slice(-4)]));
     sections[section] = result;
     if (section === 'image') result.effective_resolution = effectiveResolution;
     if (section === 'image' && !result.editing_model) result.editing_model = 'black-forest-labs/flux-3-image-klein';

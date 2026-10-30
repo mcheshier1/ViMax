@@ -34,7 +34,8 @@ function savedPlan(slot: string): ShotPlan {
     motionDescription: fields.motionDesc, sets: [], setIds: fields.setIds, setRevision: 'saved',
     revision: 'saved', durationSeconds: 8, durationOverrideSeconds: null,
     durationPolicy: {provider: 'agnes', model: 'agnes-video-2.5', configured: true, defaultSeconds: 8, minSeconds: 4, maxSeconds: 12, allowedSeconds: [4, 5, 6, 7, 8, 9, 10, 11, 12]},
-    reusePreviousLastFrame: false, previousSlot: slot === '0' ? null : '0', previousLastFrameAvailable: false};
+    reusePreviousLastFrame: false, previousSlot: slot === '0' ? null : '0', previousClipAvailable: false,
+    previousClipAccepted: false, previousClipSha256: null, renderedEndingStatus: 'off', renderedEndingReason: ''};
 }
 
 function savedFeedback(stage: AcceptanceStage['stage'], slot: string | null, reason: string): AcceptanceStage {

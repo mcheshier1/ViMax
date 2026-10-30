@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import logging
@@ -14,6 +15,7 @@ from utils.provider_presets import resolve_chat_model_config
 from utils.text import safe_path_component
 from pathlib import Path
 from utils.video import concatenate_video_files
+from utils.video_assembly import ASSEMBLY_VERSION
 
 from .render_contract import DEFAULT_RENDER_PHASE, ModelScopedArtifacts, RenderOutcome, normalize_phase
 from pipelines.set_references import generate_set_references, validate_set_candidate_count
@@ -27,6 +29,13 @@ def _file_signature(path: str) -> Dict[str, int]:
     stat = os.stat(path)
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
+
+def _file_hash(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as media:
+        for chunk in iter(lambda: media.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Idea2VideoPipeline(ModelScopedArtifacts):
@@ -384,13 +393,14 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
 
         final_video_path = os.path.join(self.working_dir, "final_video.mp4")
         assembly_metadata_path = final_video_path + ".inputs.json"
+        correction_path = final_video_path + ".correction.json"
         if (
             not scene_scripts
             or complete_scenes != len(scene_scripts)
             or len(all_video_paths) != len(scene_scripts)
             or not all(all_video_paths)
         ):
-            for path in (final_video_path, assembly_metadata_path):
+            for path in (final_video_path, assembly_metadata_path, correction_path):
                 if os.path.isfile(path):
                     os.remove(path)
             _emit_scene_progress(
@@ -402,12 +412,13 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
             return self.render_outcome("video", style, final_video_path="")
 
         assembly_inputs = {
-            "version": 1,
+            "version": ASSEMBLY_VERSION,
             "scene_films": [
                 {
                     "scene_idx": idx,
                     "path": os.path.relpath(path, self.working_dir),
                     **_file_signature(path),
+                    "sha256": _file_hash(path),
                 }
                 for idx, path in enumerate(all_video_paths)
             ],
@@ -417,22 +428,52 @@ class Idea2VideoPipeline(ModelScopedArtifacts):
             try:
                 with open(assembly_metadata_path, "r", encoding="utf-8") as metadata_file:
                     cache_matches = json.load(metadata_file) == assembly_inputs
-            except (OSError, ValueError, TypeError):
-                pass
-        if os.path.isfile(final_video_path) and not cache_matches:
-            os.remove(final_video_path)
-        if not cache_matches and os.path.isfile(assembly_metadata_path):
-            os.remove(assembly_metadata_path)
+                if cache_matches:
+                    with open(correction_path, "r", encoding="utf-8") as report_file:
+                        correction_cache = json.load(report_file)
+                    cache_matches = (
+                        correction_cache.get("outputHash") == _file_hash(final_video_path)
+                        and isinstance(correction_cache.get("correction"), dict)
+                    )
+            except (OSError, ValueError, TypeError, AttributeError):
+                cache_matches = False
 
-        if os.path.isfile(final_video_path):
-            _pipeline_print(quiet, f"🚀 Reusing final film; ordered scene inputs are unchanged.")
+        if os.path.isfile(final_video_path) and cache_matches:
+            correction_report = correction_cache["correction"]
+            statuses = [item.get("status", "needs_review") for item in correction_report.get("clips", [])]
+            summary = {status: statuses.count(status) for status in ("corrected", "unchanged", "needs_review")}
+            _pipeline_print(
+                quiet,
+                f"🚀 Reusing final film; {summary['corrected']} corrected, {summary['unchanged']} unchanged, {summary['needs_review']} need review.",
+            )
+            if progress is not None:
+                progress(
+                    "final_video_exists",
+                    "Final film and correction diagnostics are unchanged",
+                    {"correction_summary": summary, "correction_report": correction_report},
+                )
             return self.render_outcome("video", style, final_video_path=final_video_path)
 
-        _pipeline_print(quiet, f"🎬 Starting concatenating videos...")
+        _pipeline_print(quiet, "🎬 Starting scene aggregation...")
         concatenate_video_files(all_video_paths, final_video_path)
-        with open(assembly_metadata_path, "w", encoding="utf-8") as metadata_file:
-            json.dump(assembly_inputs, metadata_file, ensure_ascii=False, indent=2)
-        _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
+        temporary = assembly_metadata_path + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8") as metadata_file:
+                json.dump(assembly_inputs, metadata_file, ensure_ascii=False, indent=2)
+            os.replace(temporary, assembly_metadata_path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        with open(correction_path, "r", encoding="utf-8") as report_file:
+            correction_report = json.load(report_file).get("correction", {})
+        statuses = [item.get("status", "needs_review") for item in correction_report.get("clips", [])]
+        summary = {status: statuses.count(status) for status in ("corrected", "unchanged", "needs_review")}
+        _pipeline_print(
+            quiet,
+            f"☑️ Aggregated scenes; {summary['corrected']} corrected, {summary['unchanged']} unchanged, {summary['needs_review']} need review.",
+        )
+        if progress is not None:
+            progress("concat_done", "Scene films aggregated with correction diagnostics", {"correction_summary": summary, "correction_report": correction_report})
         return self.render_outcome("video", style, final_video_path=final_video_path)
 
 

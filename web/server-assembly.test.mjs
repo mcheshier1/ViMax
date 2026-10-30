@@ -4,12 +4,17 @@ import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
-import {assembleFilm, readRenderAcceptance, updateRenderAcceptance} from './server-lib.mjs';
+import {assembleFilm, readFilmSnapshot, readRenderAcceptance, updateRenderAcceptance} from './server-lib.mjs';
 
 const roots = [];
 const sessionId = 'assembly-project';
 const renderRoot = 'script2video';
 const stage = (acceptance, name) => acceptance.stages.find((item) => item.stage === name);
+const execFile = promisify(execFileCallback);
+
+async function writeClip(file, color = 'red', size = '96x54') {
+  await execFile('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', `color=c=${color}:s=${size}:r=30:d=0.4`, '-threads', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', file]);
+}
 
 afterEach(async () => {
   delete process.env.VIMAX_FFMPEG_CMD;
@@ -28,21 +33,18 @@ async function fixture() {
   await writeFile(path.join(repo, '.vimax', 'sessions.json'), JSON.stringify({sessions: {[sessionId]: {
     session_id: sessionId, working_dir: `.working_dir/${sessionId}`, updated_at: '2026-08-01T00:00:00',
   }}}));
-  await writeFile(path.join(working, 'render_manifest.json'), JSON.stringify({render_mode: renderRoot, video_model: 'kwaivgi/kling-video-o1'}));
+  await writeFile(path.join(working, 'render_manifest.json'), JSON.stringify({render_mode: renderRoot, image_model: 'reference-model', video_model: 'kwaivgi/kling-video-o1'}));
   await writeFile(path.join(rootDir, 'camera_tree.json'), JSON.stringify([{idx: 0, active_shot_idxs: [1, 0]}]));
   for (const shot of ['0', '1']) {
     const directory = path.join(rootDir, 'shots', shot, 'kwaivgi_kling-video-o1');
     await mkdir(directory, {recursive: true});
     await writeFile(path.join(rootDir, 'shots', shot, 'shot_description.json'), '{}');
-    await writeFile(path.join(directory, 'video.mp4'), `clip-${shot}`);
+    await writeClip(path.join(directory, 'video.mp4'), shot === '0' ? 'red' : 'blue');
   }
   const ffmpeg = path.join(repo, 'fake-ffmpeg');
-  const ffprobe = path.join(repo, 'fake-ffprobe');
-  await writeFile(ffmpeg, '#!/bin/sh\nif [ "$VIMAX_ASSEMBLY_FAIL" = "1" ]; then exit 9; fi\nfor output do :; done\nprintf assembled > "$output"\n');
-  await writeFile(ffprobe, '#!/bin/sh\nprintf \'{"streams":[{"codec_type":"video","duration":"1"}],"format":{"duration":"1"}}\\n\'\n');
-  await Promise.all([ffmpeg, ffprobe].map((file) => import('node:fs/promises').then(({chmod}) => chmod(file, 0o755))));
+  await writeFile(ffmpeg, '#!/bin/sh\nif [ "$VIMAX_ASSEMBLY_FAIL" = "1" ]; then exit 9; fi\nexec ffmpeg "$@"\n');
+  await import('node:fs/promises').then(({chmod}) => chmod(ffmpeg, 0o755));
   process.env.VIMAX_FFMPEG_CMD = ffmpeg;
-  process.env.VIMAX_FFPROBE_CMD = ffprobe;
   const acceptClip = (shot) => updateRenderAcceptance(repo, {sessionId, root: renderRoot, stage: 'clips', shot, accepted: true});
   return {repo, working, rootDir, acceptClip};
 }
@@ -67,13 +69,14 @@ describe('film assembly', () => {
     await acceptClip('0');
     await acceptClip('1');
     const assembled = await assembleFilm(repo, {sessionId, root: renderRoot});
-    expect(assembled).toEqual({path: `${renderRoot}/final_video.mp4`, reused: false, shotCount: 2});
+    expect(assembled).toMatchObject({path: `${renderRoot}/final_video.mp4`, reused: false, shotCount: 2});
+    expect((await readFilmSnapshot(repo, sessionId, renderRoot)).assembly).toEqual(assembled.correction);
     expect(await assembleFilm(repo, {sessionId, root: renderRoot})).toMatchObject({reused: true, shotCount: 2});
 
     await updateRenderAcceptance(repo, {sessionId, root: renderRoot, stage: 'final_video', accepted: true});
     const finalPath = path.join(rootDir, 'final_video.mp4');
     const previousBytes = await readFile(finalPath);
-    await writeFile(path.join(working, renderRoot, 'shots', '0', 'kwaivgi_kling-video-o1', 'video.mp4'), 'new accepted clip bytes');
+    await writeClip(path.join(working, renderRoot, 'shots', '0', 'kwaivgi_kling-video-o1', 'video.mp4'), 'green');
     await acceptClip('0');
     process.env.VIMAX_ASSEMBLY_FAIL = '1';
     await expect(assembleFilm(repo, {sessionId, root: renderRoot})).rejects.toBeTruthy();
@@ -83,7 +86,9 @@ describe('film assembly', () => {
     await assembleFilm(repo, {sessionId, root: renderRoot});
     expect(stage(await readRenderAcceptance(repo, sessionId, renderRoot), 'final_video').slots[0].state).toBe('stale');
     expect(stage(await readRenderAcceptance(repo, sessionId, renderRoot), 'clips').slots.map((slot) => slot.state)).toEqual(['accepted', 'accepted']);
-  });
+    await writeFile(finalPath, 'replaced outside assembly');
+    expect((await readFilmSnapshot(repo, sessionId, renderRoot)).assembly).toBeNull();
+  }, 60_000);
 
   it('restores the previous final and approval if publishing metadata fails', async () => {
     const {repo, working, rootDir, acceptClip} = await fixture();
@@ -93,7 +98,7 @@ describe('film assembly', () => {
     await updateRenderAcceptance(repo, {sessionId, root: renderRoot, stage: 'final_video', accepted: true});
     const finalPath = path.join(rootDir, 'final_video.mp4');
     const priorFinal = await readFile(finalPath);
-    await writeFile(path.join(rootDir, 'shots', '0', 'kwaivgi_kling-video-o1', 'video.mp4'), 'new accepted input');
+    await writeClip(path.join(rootDir, 'shots', '0', 'kwaivgi_kling-video-o1', 'video.mp4'), 'green');
     await acceptClip('0');
     const priorApproval = await readFile(path.join(working, 'render_acceptance.json'));
     await rm(`${finalPath}.assembly.json`);
@@ -101,7 +106,27 @@ describe('film assembly', () => {
     await expect(assembleFilm(repo, {sessionId, root: renderRoot})).rejects.toThrow();
     expect(await readFile(finalPath)).toEqual(priorFinal);
     expect(await readFile(path.join(working, 'render_acceptance.json'))).toEqual(priorApproval);
-  });
+  }, 60_000);
+
+  it('rebuilds when a keyframe changes without changing or reapproving the source clips', async () => {
+    const {repo, rootDir, acceptClip} = await fixture();
+    await acceptClip('0');
+    await acceptClip('1');
+    const referenceDir = path.join(rootDir, 'shots', '0', 'reference-model');
+    await mkdir(referenceDir);
+    const firstFrame = path.join(referenceDir, 'first_frame.png');
+    const writeReference = (color) => execFile('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', `color=c=${color}:s=96x54`, '-frames:v', '1', '-threads', '1', firstFrame]);
+    await writeReference('red');
+    const sourcePath = path.join(rootDir, 'shots', '0', 'kwaivgi_kling-video-o1', 'video.mp4');
+    const source = await readFile(sourcePath);
+    await assembleFilm(repo, {sessionId, root: renderRoot});
+    expect(await assembleFilm(repo, {sessionId, root: renderRoot})).toMatchObject({reused: true});
+    await writeReference('blue');
+    expect(await assembleFilm(repo, {sessionId, root: renderRoot})).toMatchObject({reused: false});
+    expect(await readFile(sourcePath)).toEqual(source);
+    expect(stage(await readRenderAcceptance(repo, sessionId, renderRoot), 'clips').slots.every((slot) => slot.state === 'accepted')).toBe(true);
+  }, 60_000);
+
 
   it('preserves playback order and audio across different sizes and a silent clip', async () => {
     const {repo, working, rootDir, acceptClip} = await fixture();

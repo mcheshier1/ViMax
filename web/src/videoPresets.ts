@@ -42,6 +42,7 @@ export function isHeygenVideoModel(model: string | undefined): boolean {
 }
 
 export function videoModelSelection(provider: string, model: string, resolution: string, duration: string) {
+  if (provider === 'agnes' && model === 'agnes-video-2.5-flash') return {resolution: '720p', clip_seconds: duration};
   if (isHeygenVideoModel(model)) {
     const seconds = Number(duration);
     const normalizedSeconds = Number.isInteger(seconds) && seconds >= 5 && seconds <= 15 ? seconds : 8;
@@ -66,7 +67,8 @@ export function videoModelSelection(provider: string, model: string, resolution:
   return {resolution, clip_seconds: duration};
 }
 
-export function validHeygenVideoSettings(model: string | undefined, resolution: string | undefined, duration: string | undefined): boolean {
+export function validVideoSettings(provider: string | undefined, model: string | undefined, resolution: string | undefined, duration: string | undefined): boolean {
+  if (provider === 'agnes' && (String(resolution).toLowerCase() === '1k' || model === 'agnes-video-2.5-flash' && String(resolution).toLowerCase() !== '720p')) return false;
   if (!isHeygenVideoModel(model)) return true;
   const seconds = Number(duration);
   return (resolution === '480p' || resolution === '768p') && Number.isInteger(seconds) && seconds >= 5 && seconds <= 15;

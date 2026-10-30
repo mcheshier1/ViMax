@@ -1,17 +1,19 @@
-"""Regression tests for rate-limiter lock behavior, media resource cleanup,
-packaging metadata, config templates, and test-suite isolation."""
+"""Regression tests for rate-limiter lock behavior, media assembly, packaging, and suite isolation."""
 
 import asyncio
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 from contextlib import suppress
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import yaml
 
+import numpy as np
+from moviepy import ImageClip, VideoFileClip
+from PIL import Image, ImageDraw
 from utils.rate_limiter import RateLimiter
 from utils.video import concatenate_video_files
 
@@ -44,29 +46,26 @@ class TestRateLimiterLocking(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(loop.time() - start, 0.08)
 
 
-class TestVideoConcatenationCleanup(unittest.TestCase):
-    def test_concatenate_closes_all_clips_even_on_failure(self):
-        clips = [MagicMock(), MagicMock()]
-        final = MagicMock()
-        with patch("utils.video.VideoFileClip", side_effect=clips), \
-             patch("utils.video.concatenate_videoclips", return_value=final):
-            concatenate_video_files(["a.mp4", "b.mp4"], "out.mp4")
-        final.write_videofile.assert_called_once()
-        final.close.assert_called_once()
-        for clip in clips:
-            clip.close.assert_called_once()
+class TestVideoAssemblyContract(unittest.TestCase):
+    def test_mixed_dimensions_keep_pixels_centered_on_a_fixed_canvas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = []
+            for index, (size, color) in enumerate([((64, 36), "red"), ((60, 40), "blue")]):
+                image = Image.new("RGB", size, color)
+                ImageDraw.Draw(image).rectangle((12, 10, 19, 17), fill="white")
+                source = str(Path(tmp, f"{index}.mp4"))
+                with ImageClip(np.asarray(image)).with_duration(0.5) as clip:
+                    clip.write_videofile(source, fps=12, codec="libx264", audio=False, threads=1, logger=None)
+                sources.append(source)
+            output = str(Path(tmp, "joined.mp4"))
+            concatenate_video_files(sources, output)
+            with VideoFileClip(output) as film:
+                self.assertEqual(tuple(film.size), (64, 40))
+                self.assertAlmostEqual(film.duration, 1, places=1)
+                red, blue = film.get_frame(0.25), film.get_frame(0.75)
+                np.testing.assert_allclose(red[20, 32], (255, 0, 0), atol=18)
+                np.testing.assert_allclose(blue[20, 32], (0, 0, 255), atol=18)
 
-        # And when writing fails, the ffmpeg readers must still be released.
-        clips = [MagicMock(), MagicMock()]
-        final = MagicMock()
-        final.write_videofile.side_effect = OSError("disk full")
-        with patch("utils.video.VideoFileClip", side_effect=clips), \
-             patch("utils.video.concatenate_videoclips", return_value=final):
-            with self.assertRaises(OSError):
-                concatenate_video_files(["a.mp4", "b.mp4"], "out.mp4")
-        final.close.assert_called_once()
-        for clip in clips:
-            clip.close.assert_called_once()
 
 
 class TestPackagingMetadata(unittest.TestCase):

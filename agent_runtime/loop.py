@@ -10,7 +10,7 @@ from time import perf_counter
 from typing import Any, AsyncIterator
 
 from .context_compactor import ContextCompactor, CompactionResult
-from .llm import OpenAICompatibleLLM, StreamComplete, StreamTextDelta
+from .llm import AssistantMessage, OpenAICompatibleLLM, StreamComplete, StreamTextDelta
 from .models import ToolCall, ToolResult, TurnControl
 from .prompts import PromptBuilder
 from .session_index import SessionIndex
@@ -62,6 +62,27 @@ def _drop_oldest_tool_round(in_turn: list[dict[str, Any]]) -> bool:
         return False
     del in_turn[: starts[-1]]
     return True
+
+
+async def _confirmed_render_stream(call: ToolCall | None, error: str, result: ToolResult | None):
+    """Dispatch one confirmed render, then report only its authoritative result."""
+    if error:
+        text = error
+    elif result is None and call is not None:
+        yield StreamComplete(AssistantMessage(tool_calls=[call], finish_reason="tool_calls"))
+        return
+    elif result is not None and not result.ok:
+        text = f"Render request did not complete: {result.content}"
+    elif result is not None:
+        phase = str(result.metadata.get("phase") or "Render")
+        text = f"{phase.capitalize()} render request finished. Review the outputs in Film."
+        missing = result.metadata.get("missing")
+        if missing:
+            text += f" Some outputs are still missing: {json.dumps(missing, ensure_ascii=False)}."
+    else:
+        raise RuntimeError("Confirmed render has neither a tool call nor a result")
+    yield StreamTextDelta(text)
+    yield StreamComplete(AssistantMessage(text=text, finish_reason="stop"))
 
 
 class AgentLoop:
@@ -177,6 +198,28 @@ class AgentLoop:
             if snapshot is not None:
                 yield {"type": "session", "turn_id": control.turn_id, "session": snapshot}
             return
+        command = user_input.strip().split(maxsplit=1)
+        confirmed_render = bool(command and command[0] == "/render")
+        render_call = None
+        render_error = ""
+        if confirmed_render:
+            try:
+                arguments = json.loads(command[1]) if len(command) == 2 else None
+                allowed = {"render_mode", "redo_shots", "stop_after", "allow_unreviewed_redo"}
+                if not isinstance(arguments, dict) or set(arguments) - allowed:
+                    raise ValueError("Use /render with a JSON object containing only render_mode, redo_shots, stop_after, and optionally allow_unreviewed_redo.")
+                if arguments.get("render_mode") not in {"script2video", "idea2video", "novel2video"}:
+                    raise ValueError("A confirmed render must name its render_mode.")
+                if arguments.get("stop_after") not in {"stills", "video"}:
+                    raise ValueError("A confirmed render must stop after stills or video.")
+                shots = arguments.get("redo_shots")
+                if not isinstance(shots, list) or not shots or not all(isinstance(slot, str) and slot.strip() for slot in shots) or len(set(shots)) != len(shots):
+                    raise ValueError("A confirmed render must name a nonempty, unique list of shot slot keys.")
+                if "allow_unreviewed_redo" in arguments and not isinstance(arguments["allow_unreviewed_redo"], bool):
+                    raise ValueError("allow_unreviewed_redo must be a boolean.")
+                render_call = ToolCall(name="vimax_render_video", arguments=arguments)
+            except (ValueError, TypeError) as exc:
+                render_error = f"Render request was not submitted: {exc}"
         yield {"type": "status", "turn_id": control.turn_id, "phase": "preparing_context", "message": "Preparing context"}
         catalog_started = perf_counter()
         tool_schemas = self.tool_registry.list_function_tools()
@@ -226,7 +269,7 @@ class AgentLoop:
             target = self.context_compactor.compact_target_tokens()
             return target > 0 and base_tokens + (in_turn_tokens if extra else 0) >= target
 
-        if over_budget():
+        if not confirmed_render and over_budget():
             yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
             await self.compact_history(reason="token-pressure", turn_id=control.turn_id)
             history_compacted = True
@@ -252,7 +295,7 @@ class AgentLoop:
             # duration of a turn, so re-summarizing it on every sample cannot
             # shrink the request; once history is compacted, the residual pressure
             # is the in-turn tool transcript, which is trimmed round by round.
-            if over_budget(in_turn):
+            if not confirmed_render and over_budget(in_turn):
                 if not history_compacted and over_budget():
                     yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context before sampling"}
                     await self.compact_history(reason="token-pressure", turn_id=control.turn_id)
@@ -270,24 +313,26 @@ class AgentLoop:
                     in_turn_tokens = sum(in_turn_token_counts)
                     yield {"type": "status", "turn_id": control.turn_id, "phase": "trim", "message": "Dropped the oldest in-turn tool round to stay inside the model context window"}
             runtime_messages: list[dict[str, Any]] = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": user_input}, *in_turn]
-            yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
+            yield {"type": "status", "turn_id": control.turn_id, "phase": "dispatching_render" if confirmed_render else "sampling_assistant", "message": "Processing confirmed render" if confirmed_render else "Sampling assistant"}
             sample_id = f"{control.turn_id}-sample-{sample_round}"
             sample_round += 1
             sample_text: list[str] = []
             sample_seq = 0
             sample_started = perf_counter()
-            request_tokens_estimate = system_estimate + history_estimate + user_estimate + in_turn_tokens + schema_tokens
+            request_tokens_estimate = 0 if confirmed_render else system_estimate + history_estimate + user_estimate + in_turn_tokens + schema_tokens
             estimates = {"system_tokens_estimate": system_estimate, "history_tokens_estimate": history_estimate, "current_tokens_estimate": user_estimate + in_turn_tokens, "tool_tokens_estimate": schema_tokens}
-            trace = self.prompt_builder.trace(parts)
-            trace["total_estimated_tokens"] = request_tokens_estimate
-            trace["totals"]["total_tokens"] = request_tokens_estimate
-            trace["request_estimates"] = estimates
-            yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": trace}
-            self._metric({"kind": "request", "turn_id": control.turn_id, "sample_id": sample_id, "input_tokens_estimate": request_tokens_estimate, **estimates})
+            if not confirmed_render:
+                trace = self.prompt_builder.trace(parts)
+                trace["total_estimated_tokens"] = request_tokens_estimate
+                trace["totals"]["total_tokens"] = request_tokens_estimate
+                trace["request_estimates"] = estimates
+                yield {"type": "prompt_trace", "turn_id": control.turn_id, "prompt_trace": trace}
+                self._metric({"kind": "request", "turn_id": control.turn_id, "sample_id": sample_id, "input_tokens_estimate": request_tokens_estimate, **estimates})
             sample_record: StreamComplete | None = None
             yield {"type": "assistant_start", "turn_id": control.turn_id, "sample_id": sample_id, "round": sample_round - 1}
             try:
-                async with aclosing(self.llm.stream(runtime_messages, tools=tool_schemas)) as stream:
+                source = _confirmed_render_stream(render_call, render_error, all_tool_results[-1] if all_tool_results else None) if confirmed_render else self.llm.stream(runtime_messages, tools=tool_schemas)
+                async with aclosing(source) as stream:
                     async for item in stream:
                         if isinstance(item, StreamTextDelta):
                             sample_seq += 1

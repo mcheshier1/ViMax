@@ -40,7 +40,7 @@ import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
 import type {AgentConfig, AgentEvent, BrowserAgentMetricsPayload, ChatState, ConfigSection, Message, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, SessionSummary, WorkspaceUpload} from './types';
 import {createDeltaBatcher, type DeltaBatcher} from './streaming';
 import {IMAGE_PROVIDER_PRESETS, compatibleImageResolution, defaultImageResolution, imageProviderFromBaseUrl, imageProviderPreset, imageResolutionTiers} from './imagePresets';
-import {isHeygenVideoModel, validHeygenVideoSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
+import {isHeygenVideoModel, validVideoSettings as validVideoModelSettings, VIDEO_PROVIDER_PRESETS, videoModelSelection, videoProviderPreset} from './videoPresets';
 import {credentialProvider} from '../provider-credentials.mjs';
 import {validateShotDuration, videoDurationPolicy} from '../video-durations.mjs';
 import {AssetCreationDialog, type AssetCreationRequest} from './AssetCreationDialog';
@@ -103,6 +103,7 @@ export default function App() {
   const [creatingProject, setCreatingProject] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<SessionSummary>();
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   const [assetCreationRequest, setAssetCreationRequest] = useState<{sessionId: string; request: AssetCreationRequest}>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -321,6 +322,11 @@ export default function App() {
     if (event.type === 'sessions_changed') {
       deltaBatcher.current?.flush();
       setSessions(event.sessions || []);
+      const currentId = selectedSessionIdRef.current;
+      if (currentId && !(event.sessions || []).some((session) => session.sessionId === currentId)) {
+        selectSession(event.activeSessionId || event.sessions?.[0]?.sessionId || '');
+        setUtility((current) => current === 'project' ? null : current);
+      }
       return;
     }
     if (event.type === 'agent_queue') {
@@ -462,13 +468,13 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (event.key !== 'Escape' || pendingDelete) return;
       if (utility) setUtility(null);
       else setDrawer(null);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [utility]);
+  }, [utility, pendingDelete]);
 
   useEffect(() => {
     const onDraftChange = (event: Event) => {
@@ -677,11 +683,17 @@ export default function App() {
     }
   }
 
+  function openDeleteProject(session: SessionSummary) {
+    setDeleteError('');
+    setPendingDelete(session);
+  }
+
   async function confirmDelete() {
-    if (!pendingDelete || deleting) return;
+    if (!pendingDelete || deleting || projectCreationBlocked) return;
     const sessionId = pendingDelete.sessionId;
     setDeleting(true);
     setLoadError('');
+    setDeleteError('');
     try {
       const state = await deleteSession(sessionId);
       setSessions(state.sessions);
@@ -690,13 +702,17 @@ export default function App() {
       queueSnapshots.current.delete(sessionId);
       snapshotRecoveryRequests.current.delete(sessionId);
       busySessions.current.delete(sessionId);
+      dirtyFilmSessions.current.delete(sessionId);
+      setChats((current) => { const next = {...current}; delete next[sessionId]; return next; });
+      setDrafts((current) => { const next = {...current}; delete next[sessionId]; return next; });
+      setUploads((current) => { const next = {...current}; delete next[sessionId]; return next; });
       if (selectedSessionIdRef.current === sessionId) {
         selectSession(state.activeSessionId || state.sessions[0]?.sessionId || '');
         setUtility(null);
       }
       if (agentSessionRef.current === sessionId) agentRunningRef.current = false;
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
+      setDeleteError(error instanceof Error ? error.message : String(error));
     } finally {
       setDeleting(false);
     }
@@ -717,11 +733,12 @@ export default function App() {
       <header className="workbench-topbar">
         <strong className="workbench-brand">ViMax</strong>
         <div className="workbench-project-switcher">
-          <select value={selectedSessionId} onChange={(event) => changeProject(event.target.value)} aria-label="Project" disabled={creatingProject}>
+          <select value={selectedSessionId} onChange={(event) => changeProject(event.target.value)} aria-label="Project" disabled={creatingProject || deleting}>
             {!selectedSessionId && <option value="">Select a project</option>}
             {sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{sessionTitle(session)}</option>)}
           </select>
           <button className="icon-button" onClick={openNewProjectDialog} aria-label="New project" title="New project"><Plus size={17} /></button>
+          <button className="icon-button project-delete-button" onClick={() => selectedSession && openDeleteProject(selectedSession)} disabled={!selectedSession || deleting || creatingProject} aria-label="Delete project" title="Delete project"><Trash2 size={16} /></button>
         </div>
         <nav className="workbench-destinations" aria-label="Project views">
           <button className={workspaceView === 'film' ? 'is-active' : ''} aria-current={workspaceView === 'film' ? 'page' : undefined} onClick={() => changeDestination('film')}><Film size={16} />Film</button>
@@ -825,7 +842,7 @@ export default function App() {
       </div>
       {utility && <div className="workbench-utility-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setUtility(null)}>
         <section className="workbench-utility-panel" role="dialog" aria-modal="true" aria-label={utility === 'project' ? 'Project details' : 'Settings'}>
-          <div className="workbench-utility-heading"><strong>{utility === 'project' ? 'Project details' : 'Settings'}</strong>{utility === 'project' && selectedSession && <button className="workbench-delete" onClick={() => setPendingDelete(selectedSession)}><Trash2 size={14} />Delete project</button>}<button className="icon-button" onClick={() => setUtility(null)} aria-label="Close utility"><X size={18} /></button></div>
+          <div className="workbench-utility-heading"><strong>{utility === 'project' ? 'Project details' : 'Settings'}</strong>{utility === 'project' && selectedSession && <button className="workbench-delete" disabled={deleting} onClick={() => openDeleteProject(selectedSession)}><Trash2 size={14} />Delete project</button>}<button className="icon-button" onClick={() => setUtility(null)} aria-label="Close utility"><X size={18} /></button></div>
           {utility === 'project' ? <ProjectView key={selectedSessionId} sessionId={selectedSessionId} onChanged={() => {
             void refreshSessions().catch((error) => setLoadError(String(error)));
             void film.refresh().catch((error) => setLoadError(String(error)));
@@ -833,7 +850,7 @@ export default function App() {
           }} /> : <SettingsView agentBusy={projectCreationBlocked} onSaved={film.refresh} />}
         </section>
       </div>}
-      <DeleteProjectDialog session={pendingDelete} deleting={deleting} onCancel={() => !deleting && setPendingDelete(undefined)} onConfirm={() => void confirmDelete()} />
+      <DeleteProjectDialog session={pendingDelete} deleting={deleting} blocked={projectCreationBlocked} error={deleteError} onCancel={() => !deleting && setPendingDelete(undefined)} onConfirm={() => void confirmDelete()} />
       {assetCreationRequest && assetCreationRequest.sessionId === selectedSessionId && selectedSession && <AssetCreationDialog key={assetCreationRequest.sessionId} sessionId={selectedSessionId} projectName={sessionTitle(selectedSession)} root={film.data?.acceptance.root || ''} artifacts={artifacts} characters={film.data?.acceptance.characters || []} request={assetCreationRequest.request} onClose={() => setAssetCreationRequest(undefined)} onRefresh={async (sessionId) => {
         if (selectedSessionIdRef.current !== sessionId) throw new Error('The selected project changed before refreshing assets.');
         await filmRef.current.refresh();
@@ -1135,7 +1152,7 @@ function SettingsView({agentBusy, onSaved}: {agentBusy: boolean; onSaved: () => 
     && (configuredMaximum === undefined || Number.isInteger(configuredMaximum) && configuredMaximum >= defaultSeconds
       && (!knownDurationPolicy?.allowedSeconds || knownDurationPolicy.allowedSeconds.includes(configuredMaximum))
       && durationPolicy !== undefined && !validateShotDuration(defaultSeconds, durationPolicy));
-  const validVideoSettings = validDuration && (videoSettings?.provider === 'openrouter' ? validHeygenVideoSettings(videoSettings.model, videoSettings.resolution, String(defaultSeconds)) : true);
+  const validVideoSettings = validDuration && validVideoModelSettings(videoSettings?.provider, videoSettings?.model, videoSettings?.resolution, String(defaultSeconds));
   const credentialsSupported = Boolean(config && CONFIG_SECTIONS.every(({key}) => Array.isArray(config.sections[key].configured_api_key_providers)));
   if (loading) return <div className="settings-loading">Loading configuration…</div>;
   if (!config) return <div className="settings-loading is-error">{status || 'Configuration unavailable'}</div>;
@@ -1187,10 +1204,11 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
   imageResolutionSupported: boolean;
 }) {
   const heygen = definition.key === 'video' && value.provider === 'openrouter' && isHeygenVideoModel(value.model);
+  const savedKeySuffix = value.api_key_suffixes?.[credentialProvider(value)];
   const duration = value.clip_seconds || value.effective_clip_seconds || '8';
   const modelDurationPolicy = videoDurationPolicy({...value, shot_duration_limits: {}});
   const durationLimit = value.shot_duration_limits?.[`${value.provider || 'openrouter'}:${value.model}`];
-  const resolutionOptions = heygen ? ['480p', '768p'] : value.provider === 'agnes' ? ['720p', '1080p', '1K', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p'];
+  const resolutionOptions = heygen ? ['480p', '768p'] : value.provider === 'agnes' ? value.model === 'agnes-video-2.5-flash' ? ['720p'] : ['720p', '1080p', '2K'] : value.provider === 'ltx' ? ['720p', '1080p', '1440p', '4k'] : ['480p', '720p', '1080p'];
   const imageProvider = definition.key === 'image' ? imageProviderFromBaseUrl(value.base_url) : undefined;
   const openrouterImage = imageProvider === 'openrouter';
   const agnesImage = imageProvider === 'agnes';
@@ -1299,7 +1317,7 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
               {modelDurationPolicy.allowedSeconds.map((seconds: number) => <option key={seconds} value={seconds}>{seconds}s</option>)}
             </select> : <input aria-label="Maximum shot duration for this model (seconds)" type="number" min={1} step={1} value={durationLimit ?? ''} placeholder="Configure to enable shot overrides" onChange={(event) => onChange('shot_duration_limits', event.target.value)} />}</label>
             <p className="config-field-wide">Save a maximum for {value.model || 'the selected model'} to enable individual shot lengths in Film. Limits are remembered separately for each provider/model. {modelDurationPolicy.allowedSeconds ? `Supported durations: ${modelDurationPolicy.allowedSeconds.join(', ')} seconds.` : 'For custom models, verify supported durations with the provider before configuring a maximum.'} Existing clips are not regenerated.</p>
-            {!validVideoSettings && <p className="film-warning config-field-wide">Choose a supported default shot duration and a model maximum at least as long as the default. HeyGen also requires a supported resolution.</p>}
+            {!validVideoSettings && <p className="film-warning config-field-wide">Choose a supported resolution and default duration, with a model maximum at least as long as the default. Agnes Flash requires 720p; square 1K is incompatible with this 16:9 workflow.</p>}
             {heygen && <p className="film-warning config-field-wide">HeyGen conditions the clip on the first frame only; the final pose is not constrained. Native audio is provided by the model and cannot be toggled via OpenRouter.</p>}
             {value.provider !== 'agnes' && value.provider !== 'yunwu' && !heygen && (
               <label><span>Generate audio</span>
@@ -1311,7 +1329,7 @@ function ConfigSectionEditor({definition, value, onChange, validVideoSettings, d
           </>
         )}
         <label className="config-field-wide">
-          <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? 'Configured' : 'Not configured'}</i></span>
+          <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? `Configured${savedKeySuffix ? ` · …${savedKeySuffix}` : ''}` : 'Not configured'}</i></span>
           <input type="password" value={value.api_key} onChange={(event) => onChange('api_key', event.target.value)} placeholder={value.has_api_key ? 'Leave blank to keep current key' : 'Enter API key'} autoComplete="off" />
           <small>Saved keys are remembered per provider.</small>
         </label>
@@ -1543,9 +1561,11 @@ function StyleInvalidationDialog({open, prompt, saving, onCancel, onConfirm}: {
   );
 }
 
-function DeleteProjectDialog({session, deleting, onCancel, onConfirm}: {
+function DeleteProjectDialog({session, deleting, blocked, error, onCancel, onConfirm}: {
   session?: SessionSummary;
   deleting: boolean;
+  blocked: boolean;
+  error: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -1565,11 +1585,13 @@ function DeleteProjectDialog({session, deleting, onCancel, onConfirm}: {
         <span className="dialog-icon"><Trash2 size={18} /></span>
         <div className="dialog-copy">
           <h2 id="delete-project-title">Delete project?</h2>
-          <p><strong>{sessionTitle(session)}</strong> and its generated files will be permanently removed.</p>
+          <p><strong>{sessionTitle(session)}</strong> will be removed from the project list. All its assets, including uploaded references, generated images, videos, and project files, will be permanently deleted from disk. This cannot be undone.</p>
+          {blocked && <p role="status">Wait for active and queued requests to finish before deleting a project. Your current generation will not be interrupted.</p>}
+          {error && <p className="inline-error" role="alert">{error}</p>}
         </div>
         <div className="dialog-actions">
           <button onClick={onCancel} disabled={deleting} autoFocus>Cancel</button>
-          <button className="danger" onClick={onConfirm} disabled={deleting}>{deleting ? 'Deleting…' : 'Delete'}</button>
+          <button className="danger" onClick={onConfirm} disabled={deleting || blocked}>{deleting ? 'Deleting…' : 'Delete permanently'}</button>
         </div>
       </section>
     </div>

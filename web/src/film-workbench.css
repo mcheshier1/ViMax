@@ -86,6 +86,9 @@
 .film-feedback { display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
 .film-structure { border-top: 1px solid var(--line); padding: 12px 14px; font-size: 12px; }
 .film-structure .film-feedback { margin: 14px 0 8px; }
+.film-assembly-report ul { margin: 12px 0 0; padding: 0; list-style: none; }
+.film-assembly-report li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0; border-top: 1px solid var(--line); }
+.film-assembly-report li > span { flex: 1; min-width: 180px; color: var(--muted); }
 .film-coverage { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 6px; }
 .film-coverage .reel-section-head { padding: 0; flex-wrap: wrap; border: 0; }
 .film-coverage .reel-toggle h2 { color: var(--ink); }

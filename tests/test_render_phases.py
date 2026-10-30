@@ -162,6 +162,10 @@ def _idea_pipeline(working_dir: str, scene_scripts: list[str]) -> Idea2VideoPipe
     pipeline.write_script_based_on_story = AsyncMock(return_value=scene_scripts)
     return pipeline
 
+def _write_correction_sidecar(output: str) -> None:
+    payload = {"outputHash": hashlib.sha256(Path(output).read_bytes()).hexdigest(), "correction": {"version": 3, "clips": []}}
+    Path(output + ".correction.json").write_text(json.dumps(payload), encoding="utf-8")
+
 
 class PhaseNormalizationTests(unittest.TestCase):
     def test_unknown_phase_is_rejected(self):
@@ -271,11 +275,12 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_video_phase_generates_clips(self):
         with tempfile.TemporaryDirectory() as tmp:
-            # Rebuilding the clip invalidates the old film; keep this focused test off MoviePy's encoder.
             pipeline, _, video_generator = _pipeline(tmp)
-            Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
-            with patch("pipelines.script2video_pipeline.VideoFileClip", return_value=MagicMock()), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=MagicMock()):
+            # Rebuilding a clip invalidates the previous final; stub local assembly in this focused test.
+            def assemble(clips, output, **kwargs):
+                Path(output).write_bytes(b"assembled film")
+                return {"version": 3, "canvas": {"width": 1280, "height": 720, "fps": 30}, "crop_zoom": 1.0, "clips": [{"slot": clip["slot"], "status": "unchanged", "reason": "test"} for clip in clips]}
+            with patch("pipelines.script2video_pipeline.assemble_video_files", side_effect=assemble):
                 outcome = await pipeline(
                     script="script",
                     user_requirement="req",
@@ -348,8 +353,7 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
                 Camera(idx=1, active_shot_idxs=[1], parent_shot_idx=0),
                 Camera(idx=2, active_shot_idxs=[2], parent_shot_idx=0),
             ])
-            # The new camera image is taken from the transition video; pre-made here so the
-            # stub's bytes never reach moviepy's decoder.
+            # Pre-create transition images so this test only covers frame scheduling.
             for camera_idx, shot_idx in ((1, 1), (2, 2)):
                 os.makedirs(pipeline.shot_video_dir(shot_idx), exist_ok=True)
                 Image.new("RGB", (16, 9), "red").save(
@@ -369,140 +373,126 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(video_generator.calls), 1)
 
 
-    def _prime_cached_shots(self, pipeline, shot_ids):
-        for shot_idx in shot_ids:
-            for path in (
-                pipeline.frame_path(shot_idx, "first_frame"),
-                pipeline.frame_path(shot_idx, "last_frame"),
-                pipeline.clip_path(shot_idx),
-            ):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                Path(path).write_bytes(b"cached")
 
-    async def test_assembly_uses_camera_order_for_a_middle_inserted_shot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shots = [_shot(0), _shot(1), _shot(2)]
-            pipeline, _, _ = _pipeline(tmp, shots=shots)
-            pipeline.construct_camera_tree = AsyncMock(return_value=[
-                Camera(idx=0, active_shot_idxs=[0, 2, 1]),
-            ])
-            self._prime_cached_shots(pipeline, [0, 1, 2])
-            clip_order = []
-            writes = []
+    def _prime_playable_shots(self, pipeline, colors):
+        from moviepy import ColorClip
 
-            def open_clip(path):
-                clip_order.append(int(Path(path).parent.parent.name))
-                return path
-
-            class JoinedFilm:
-                def write_videofile(self, path, **kwargs):
-                    writes.append(path)
-                    Path(path).write_bytes(b"assembled")
-
-            with patch("pipelines.script2video_pipeline.VideoFileClip", side_effect=open_clip), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=JoinedFilm()):
-                outcome = await pipeline(
-                    script="script",
-                    user_requirement="req",
-                    style="cinematic",
-                    characters=[_character()],
-                    character_portraits_registry={},
-                    stop_after="video",
-                )
-                film_mtime = Path(outcome.final_video_path).stat().st_mtime_ns
-                repeat = await pipeline(
-                    script="script",
-                    user_requirement="req",
-                    style="cinematic",
-                    characters=[_character()],
-                    character_portraits_registry={},
-                    stop_after="video",
+        for shot_idx, color in enumerate(colors):
+            for frame_type in ("first_frame", "last_frame"):
+                frame_path = pipeline.frame_path(shot_idx, frame_type)
+                os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+                Image.new("RGB", (1280, 720), color).save(frame_path)
+            clip_path = pipeline.clip_path(shot_idx)
+            os.makedirs(os.path.dirname(clip_path), exist_ok=True)
+            with ColorClip((64, 36), color=color, duration=0.5) as clip:
+                clip.write_videofile(
+                    clip_path, fps=12, codec="libx264", audio=False, threads=1, logger=None,
                 )
 
-            self.assertEqual(clip_order, [0, 2, 1])
-            self.assertEqual(writes, [outcome.final_video_path])
-            self.assertEqual(repeat.final_video_path, outcome.final_video_path)
-            self.assertEqual(Path(repeat.final_video_path).read_bytes(), b"assembled")
-            self.assertEqual(Path(repeat.final_video_path).stat().st_mtime_ns, film_mtime)
+    async def test_legacy_assembly_rebuilds_from_cached_shots_without_regeneration(self):
+        from moviepy import VideoFileClip
 
-    async def test_changed_camera_order_reassembles_cached_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, images, videos = _pipeline(tmp, shots=[_shot(0), _shot(1)])
+            self._prime_playable_shots(pipeline, [(255, 0, 0), (0, 0, 255)])
+            source_bytes = {path: Path(path).read_bytes() for path in (
+                pipeline.clip_path(0), pipeline.clip_path(1),
+                pipeline.frame_path(0, "first_frame"), pipeline.frame_path(0, "last_frame"),
+                pipeline.frame_path(1, "first_frame"), pipeline.frame_path(1, "last_frame"),
+            )}
+            final_path = Path(pipeline.working_dir, "final_video.mp4")
+            final_path.write_bytes(b"legacy film")
+            Path(str(final_path) + ".inputs.json").write_text(json.dumps({"version": 2}))
+
+            outcome = await pipeline(
+                script="script", user_requirement="req", style="cinematic",
+                characters=[], character_portraits_registry={}, stop_after="video",
+            )
+
+            self.assertEqual(outcome.final_video_path, str(final_path))
+            with VideoFileClip(outcome.final_video_path) as film:
+                self.assertEqual(tuple(film.size), (1280, 720))
+                self.assertAlmostEqual(film.duration, 1, places=1)
+                self.assertGreater(film.get_frame(0.25)[360, 640, 0], 220)
+                self.assertGreater(film.get_frame(0.75)[360, 640, 2], 220)
+            report = json.loads(Path(str(final_path) + ".correction.json").read_text())
+            self.assertEqual(report["outputHash"], hashlib.sha256(final_path.read_bytes()).hexdigest())
+            self.assertEqual([clip["slot"] for clip in report["correction"]["clips"]], ["0", "1"])
+            self.assertEqual(source_bytes, {path: Path(path).read_bytes() for path in source_bytes})
+            self.assertEqual(images.calls, [])
+            self.assertEqual(videos.calls, [])
+
+    async def test_assembly_failure_preserves_prior_final(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline, _, _ = _pipeline(tmp, shots=[_shot(0)])
+            self._prime_playable_shots(pipeline, [(255, 0, 0)])
+            final_path = Path(pipeline.working_dir, "final_video.mp4")
+            final_path.write_bytes(b"previous complete film")
+            missing_ffmpeg = Path(tmp, "missing-ffmpeg")
+            with patch.dict(os.environ, {"VIMAX_FFMPEG_CMD": str(missing_ffmpeg)}):
+                with self.assertRaises(FileNotFoundError):
+                    await pipeline(
+                        script="script", user_requirement="req", style="cinematic",
+                        characters=[], character_portraits_registry={}, stop_after="video",
+                    )
+            self.assertEqual(final_path.read_bytes(), b"previous complete film")
+
+    async def test_native_assembly_preserves_playback_order_cache_and_removal(self):
+        from moviepy import VideoFileClip
+
         with tempfile.TemporaryDirectory() as tmp:
             shots = [_shot(0), _shot(1), _shot(2)]
-            pipeline, _, _ = _pipeline(tmp, shots=shots)
+            pipeline, images, videos = _pipeline(tmp, shots=shots)
+            source_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+            self._prime_playable_shots(pipeline, source_colors)
+            source_paths = [
+                *(pipeline.clip_path(idx) for idx in range(3)),
+                *(pipeline.frame_path(idx, frame_type) for idx in range(3) for frame_type in ("first_frame", "last_frame")),
+            ]
+            source_bytes = {path: Path(path).read_bytes() for path in source_paths}
             active_order = [0, 2, 1]
 
             async def camera_tree(**kwargs):
                 return [Camera(idx=0, active_shot_idxs=list(active_order))]
 
             pipeline.construct_camera_tree = camera_tree
-            self._prime_cached_shots(pipeline, [0, 1, 2])
-            clip_order = []
-            writes = []
 
-            def open_clip(path):
-                clip_order.append(int(Path(path).parent.parent.name))
-                return path
-
-            class JoinedFilm:
-                def write_videofile(self, path, **kwargs):
-                    writes.append(path)
-                    Path(path).write_bytes(f"assembly {len(writes)}".encode())
-
-            with patch("pipelines.script2video_pipeline.VideoFileClip", side_effect=open_clip), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=JoinedFilm()):
-                first = await pipeline(
+            async def render_and_assert(expected_colors):
+                outcome = await pipeline(
                     script="script", user_requirement="req", style="cinematic",
-                    characters=[_character()], character_portraits_registry={}, stop_after="video",
+                    characters=[], character_portraits_registry={}, stop_after="video",
                 )
-                active_order[:] = [0, 1, 2]
-                second = await pipeline(
-                    script="script", user_requirement="req", style="cinematic",
-                    characters=[_character()], character_portraits_registry={}, stop_after="video",
-                )
+                with VideoFileClip(outcome.final_video_path) as film:
+                    self.assertEqual(tuple(film.size), (1280, 720))
+                    self.assertAlmostEqual(film.duration, len(expected_colors) * 0.5, places=1)
+                    for index, channel in enumerate(expected_colors):
+                        frame = film.get_frame(index * 0.5 + 0.25)[360, 640]
+                        self.assertGreater(frame[channel], 220)
+                        self.assertLess(max(frame[other] for other in range(3) if other != channel), 30)
+                report = json.loads(Path(outcome.final_video_path + ".correction.json").read_text())
+                self.assertEqual(report["outputHash"], hashlib.sha256(Path(outcome.final_video_path).read_bytes()).hexdigest())
+                self.assertEqual([int(item["slot"]) for item in report["correction"]["clips"]], active_order)
+                return outcome
 
-            self.assertEqual(clip_order, [0, 2, 1, 0, 1, 2])
-            self.assertEqual(writes, [first.final_video_path, second.final_video_path])
-            self.assertEqual(Path(second.final_video_path).read_bytes(), b"assembly 2")
+            first = await render_and_assert([0, 2, 1])
+            first_mtime = Path(first.final_video_path).stat().st_mtime_ns
+            repeated = await render_and_assert([0, 2, 1])
+            self.assertEqual(Path(repeated.final_video_path).stat().st_mtime_ns, first_mtime)
+            changed_keyframe = pipeline.frame_path(0, "first_frame")
+            Image.new("RGB", (1280, 720), (128, 0, 0)).save(changed_keyframe)
+            source_bytes[changed_keyframe] = Path(changed_keyframe).read_bytes()
+            changed_anchor = await render_and_assert([0, 2, 1])
+            self.assertNotEqual(Path(changed_anchor.final_video_path).stat().st_mtime_ns, first_mtime)
+            active_order[:] = [0, 1, 2]
+            second = await render_and_assert([0, 1, 2])
+            active_order[:] = [0, 2]
+            third = await render_and_assert([0, 2])
 
-    async def test_removed_active_shot_rebuilds_cached_film(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shots = [_shot(0), _shot(1), _shot(2)]
-            pipeline, _, _ = _pipeline(tmp, shots=shots)
-            active_order = [0, 1, 2]
-
-            async def camera_tree(**kwargs):
-                return [Camera(idx=0, active_shot_idxs=list(active_order))]
-
-            pipeline.construct_camera_tree = camera_tree
-            self._prime_cached_shots(pipeline, [0, 1, 2])
-            clip_order = []
-            writes = []
-
-            def open_clip(path):
-                clip_order.append(int(Path(path).parent.parent.name))
-                return path
-
-            class JoinedFilm:
-                def write_videofile(self, path, **kwargs):
-                    writes.append(path)
-                    Path(path).write_bytes(f"assembly {len(writes)}".encode())
-
-            with patch("pipelines.script2video_pipeline.VideoFileClip", side_effect=open_clip), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=JoinedFilm()):
-                first = await pipeline(
-                    script="script", user_requirement="req", style="cinematic",
-                    characters=[_character()], character_portraits_registry={}, stop_after="video",
-                )
-                active_order[:] = [0, 2]
-                second = await pipeline(
-                    script="script", user_requirement="req", style="cinematic",
-                    characters=[_character()], character_portraits_registry={}, stop_after="video",
-                )
-
-            self.assertEqual(clip_order, [0, 1, 2, 0, 2])
-            self.assertEqual(writes, [first.final_video_path, second.final_video_path])
-            self.assertEqual(Path(second.final_video_path).read_bytes(), b"assembly 2")
-
+            self.assertEqual(first.final_video_path, second.final_video_path)
+            self.assertEqual(second.final_video_path, third.final_video_path)
+            self.assertEqual(source_bytes, {path: Path(path).read_bytes() for path in source_paths})
+            self.assertEqual(images.calls, [])
+            self.assertEqual(videos.calls, [])
     async def test_empty_active_sequence_does_not_assemble_a_film(self):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline, _, _ = _pipeline(tmp)
@@ -510,52 +500,14 @@ class RenderPhaseGateTests(unittest.IsolatedAsyncioTestCase):
             stale_film = Path(pipeline.working_dir) / "final_video.mp4"
             stale_film.write_bytes(b"old film")
 
-            with patch("pipelines.script2video_pipeline.concatenate_videoclips") as concatenate:
-                outcome = await pipeline(
-                    script="script",
-                    user_requirement="req",
-                    style="cinematic",
-                    characters=[_character()],
-                    stop_after="video",
-                )
+            outcome = await pipeline(
+                script="script", user_requirement="req", style="cinematic",
+                characters=[_character()], stop_after="video",
+            )
 
             self.assertEqual(outcome.final_video_path, "")
             self.assertFalse(stale_film.exists())
-            concatenate.assert_not_called()
 
-    async def test_sparse_removal_reassembles_without_the_removed_shot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shots = [_shot(0), _shot(1), _shot(2)]
-            pipeline, _, _ = _pipeline(tmp, shots=shots)
-            pipeline.construct_camera_tree = AsyncMock(return_value=[
-                Camera(idx=0, active_shot_idxs=[0, 2]),
-            ])
-            self._prime_cached_shots(pipeline, [0, 1, 2])
-            film_path = Path(pipeline.working_dir) / "final_video.mp4"
-            film_path.write_bytes(b"film containing removed shot 1")
-            clip_order = []
-
-            def open_clip(path):
-                clip_order.append(int(Path(path).parent.parent.name))
-                return path
-
-            class JoinedFilm:
-                def write_videofile(self, path, **kwargs):
-                    Path(path).write_bytes(b"film without removed shot 1")
-
-            with patch("pipelines.script2video_pipeline.VideoFileClip", side_effect=open_clip), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=JoinedFilm()):
-                outcome = await pipeline(
-                    script="script",
-                    user_requirement="req",
-                    style="cinematic",
-                    characters=[_character()],
-                    character_portraits_registry={},
-                    stop_after="video",
-                )
-
-            self.assertEqual(clip_order, [0, 2])
-            self.assertEqual(Path(outcome.final_video_path).read_bytes(), b"film without removed shot 1")
 
 class ClipLengthTests(unittest.TestCase):
     """A default change must not sweep paid clips with unrelated per-shot lengths."""
@@ -673,8 +625,10 @@ class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
             video_generator.supports_last_frame = supports_last_frame
-            with patch("pipelines.script2video_pipeline.VideoFileClip", return_value=MagicMock()), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=MagicMock()):
+            def assemble(clips, output, **kwargs):
+                Path(output).write_bytes(b"assembled")
+                return {"version": 3, "canvas": {"width": 1280, "height": 720, "fps": 30}, "crop_zoom": 1.0, "clips": [{"slot": clip["slot"], "status": "unchanged", "reason": "test"} for clip in clips]}
+            with patch("pipelines.script2video_pipeline.assemble_video_files", side_effect=assemble):
                 await pipeline(
                     script="script",
                     user_requirement="req",
@@ -690,8 +644,10 @@ class ClipBracketingTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline, _, video_generator = _pipeline(tmp)
             Path(pipeline.working_dir, "final_video.mp4").write_bytes(b"stale film")
-            with patch("pipelines.script2video_pipeline.VideoFileClip", return_value=MagicMock()), \
-                 patch("pipelines.script2video_pipeline.concatenate_videoclips", return_value=MagicMock()):
+            def assemble(clips, output, **kwargs):
+                Path(output).write_bytes(b"assembled")
+                return {"version": 3, "canvas": {"width": 1280, "height": 720, "fps": 30}, "crop_zoom": 1.0, "clips": [{"slot": clip["slot"], "status": "unchanged", "reason": "test"} for clip in clips]}
+            with patch("pipelines.script2video_pipeline.assemble_video_files", side_effect=assemble):
                 await pipeline(
                     script="script",
                     user_requirement="req",
@@ -872,6 +828,7 @@ class IdeaSceneSchedulingTests(unittest.IsolatedAsyncioTestCase):
             def concatenate(paths, output):
                 concat_inputs.append(list(paths))
                 Path(output).write_bytes(b"joined scenes")
+                _write_correction_sidecar(output)
 
             with patch("pipelines.idea2video_pipeline.Script2VideoPipeline", ScenePipeline), \
                  patch("pipelines.idea2video_pipeline.concatenate_video_files", side_effect=concatenate):
@@ -928,6 +885,7 @@ class IdeaSceneSchedulingTests(unittest.IsolatedAsyncioTestCase):
             def concatenate(paths, output):
                 joined_inputs.append([Path(path).read_bytes() for path in paths])
                 Path(output).write_bytes(f"joined {len(joined_inputs)}".encode())
+                _write_correction_sidecar(output)
 
             with patch("pipelines.idea2video_pipeline.Script2VideoPipeline", ScenePipeline), \
                  patch("pipelines.idea2video_pipeline.concatenate_video_files", side_effect=concatenate):

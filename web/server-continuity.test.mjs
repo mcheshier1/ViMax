@@ -454,7 +454,7 @@ describe('idea scene timeline storage', () => {
     expect(listed.plans.map(({slot, previousSlot}) => [slot, previousSlot])).toEqual([
       ['scene_0/4', null], ['scene_0/2', 'scene_0/4'], ['scene_1/2', 'scene_0/2'],
     ]);
-    expect(listed.plans.find((plan) => plan.slot === 'scene_1/2').previousLastFrameAvailable).toBe(false);
+    expect(listed.plans.find((plan) => plan.slot === 'scene_1/2').renderedEndingStatus).toBe('off');
     expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_0/2')).characters.map((character) => character.name)).toEqual(['Scene Zero']);
     expect((await readShotPlan(root, SESSION_ID, 'idea2video', 'scene_1/2')).characters.map((character) => character.name)).toEqual(['Scene One']);
 

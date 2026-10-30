@@ -30,7 +30,11 @@ const plans: ShotPlan[] = [
     setRevision: '',
     reusePreviousLastFrame: false,
     previousSlot: '3',
-    previousLastFrameAvailable: false,
+    previousClipAvailable: false,
+    previousClipAccepted: false,
+    previousClipSha256: null,
+    renderedEndingStatus: 'off',
+    renderedEndingReason: '',
   },
 ];
 

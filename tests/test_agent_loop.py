@@ -68,6 +68,33 @@ class CompactionAwareLLM(CapturingLLM):
 
 
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_render_rejects_invalid_or_unbounded_commands_without_tools_or_llm(self):
+        from unittest.mock import Mock
+
+        commands = [
+            "/render",
+            "/render not-json",
+            "/render []",
+            '/render {"render_mode":"script2video","stop_after":"video","redo_shots":[]}',
+            '/render {"render_mode":"script2video","stop_after":"video","redo_shots":["7","7"]}',
+            '/render {"render_mode":"script2video","stop_after":"video","redo_shots":["7"],"allow_unlocked":true}',
+            '/render {"render_mode":"script2video","stop_after":"portraits","redo_shots":["7"]}',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            registry = ToolRegistry([])
+            llm = Mock()
+            llm.stream.side_effect = AssertionError("Malformed render command must not reach the LLM")
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            for command in commands:
+                with self.subTest(command=command):
+                    events = [event async for event in loop.stream_events(command)]
+                    self.assertFalse(any(event["type"] == "tool_start" for event in events))
+                    done = next(event for event in events if event["type"] == "done")
+                    self.assertEqual(done["tool_results"], [])
+                    self.assertIn("not submitted", done["assistant"])
+            llm.stream.assert_not_called()
+
     async def test_no_tool_call_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)

@@ -64,6 +64,23 @@ async function writeLegacyProvider(root, category) {
 
 
 describe('agent config store', () => {
+  it('exposes only four-character suffixes per provider, never complete short keys', async () => {
+    const root = await fixture();
+    await writeConfig(root, {video: {
+      provider: 'agnes',
+      base_url: 'https://apihub.agnes-ai.com/v1',
+      api_keys: {agnes: 'agnes-private-AB12', openrouter: 'openrouter-private-CD34', custom: 'tiny'},
+    }});
+    const config = await readAgentConfig(root);
+    expect(config.sections.video.api_key_suffixes).toEqual({agnes: 'AB12', openrouter: 'CD34'});
+    for (const secret of ['agnes-private-AB12', 'openrouter-private-CD34', 'tiny']) {
+      expect(JSON.stringify(config)).not.toContain(secret);
+    }
+    const saved = await saveAgentConfig(root, {sections: {video: {api_key: 'replacement-private-EF56'}}});
+    expect(saved.sections.video.api_key_suffixes).toEqual({agnes: 'EF56', openrouter: 'CD34'});
+    expect(JSON.stringify(saved)).not.toContain('replacement-private-EF56');
+  });
+
   it('reads the clip length from the config, which outranks the environment', async () => {
     const root = await fixture();
     await writeFile(path.join(root, 'configs', 'agent.local.yaml'), ['video:', '  model: some/video-model', '  clip_seconds: 8', ''].join('\n'));
@@ -193,6 +210,7 @@ describe('agent config store', () => {
         api_key: '',
         has_api_key: true,
         configured_api_key_providers: ['openrouter'],
+        api_key_suffixes: {openrouter: 'cret'},
       });
 
       const switchedToAgnes = await saveAgentConfig(root, {

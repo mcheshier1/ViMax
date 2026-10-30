@@ -45,6 +45,8 @@
   border-radius: 6px;
   cursor: pointer;
 }
+.project-delete-button { color: var(--red); }
+.project-delete-button:hover:not(:disabled) { background: color-mix(in srgb, var(--red) 8%, transparent); }
 .workbench-destinations { display: flex; align-self: stretch; align-items: center; gap: 4px; }
 .workbench-destinations button,
 .workbench-utility-button,

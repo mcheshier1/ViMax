@@ -7,7 +7,7 @@ import logging
 import asyncio
 import time
 from typing import Any, Callable, Optional, Dict, List, Tuple, Literal, Type, TypeVar
-from moviepy import VideoFileClip, concatenate_videoclips
+from utils.video_assembly import ASSEMBLY_VERSION, RENDERED_ENDING_NORMALIZATION, assemble_video_files, prepare_rendered_ending
 from PIL import Image
 from agents import *
 import yaml
@@ -70,6 +70,13 @@ def _file_signature(path: str) -> Dict[str, int]:
     stat = os.stat(path)
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
+def _file_hash(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as media:
+        for chunk in iter(lambda: media.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 
 def _emit_text_plan_progress(progress, stage: str, message: str, metadata: Dict[str, Any] | None = None) -> None:
@@ -131,8 +138,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         self.video_budget: Dict[str, str] = {}
         self._playback_predecessors: Dict[int, Dict[str, Any]] = {}
         self._global_chained_keyframes = False
-        self._fresh_frame_types: Dict[int, set[str]] = {}
-        self._continuity_scope: set[str] = set()
+        self._rendered_ending_sources: Dict[int, Dict[str, Any]] = {}
     def _claim_video(self, what: str) -> bool:
         """Claim the single paid-video allowance shared by an outer render."""
         if self.video_budget.get("claimed_by"):
@@ -362,10 +368,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         validate_set_candidate_count(set_candidate_count, stop_after)
         self.video_budget = video_budget if video_budget is not None else {}
         self._deferred_frame_shots = set()
-        self._fresh_frame_types = {}
-        self._continuity_scope = {str(slot) for slot in continuity_scope or []}
-        if continuity_scope is None and only_shots is not None:
-            self._continuity_scope.update(self._source_slot(int(idx)) for idx in only_shots)
         # A redo names shots, and a run works on those shots: the stills of the others are left
         # for their own turn rather than drawn because a phase run was the easier way to ask.
         only_set = {int(idx) for idx in only_shots} if only_shots is not None else None
@@ -395,14 +397,13 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             for character in characters:
                 self.character_portrait_events[character.idx] = asyncio.Event()
 
-        character_portraits_registry = await self.generate_character_portraits(
-            characters=characters,
-            character_portraits_registry=character_portraits_registry,
-            style=style,
-            progress=progress,
-        )
-
         if stop_after == "portraits":
+            character_portraits_registry = await self.generate_character_portraits(
+                characters=characters,
+                character_portraits_registry=character_portraits_registry,
+                style=style,
+                progress=progress,
+            )
             stills = self.portrait_stills(character_portraits_registry)
             _emit_render_progress(
                 progress,
@@ -444,37 +445,41 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
         ordered_playback = self._ordered_active_shots(camera_tree, shot_descriptions)
         self._playback_predecessors = self._build_playback_predecessors(camera_tree, shot_descriptions)
-        if only_shots is None:
-            self._continuity_scope.update(self._source_slot(shot.idx) for shot in ordered_playback)
         global_chained_keyframes = chained_keyframes or (
             self._frame_continuity_config().get("mode") == "chained_keyframes"
         )
         self._global_chained_keyframes = global_chained_keyframes
+        frame_work = {
+            shot.idx for shot in ordered_playback
+            if only_set is None or shot.idx in only_set
+        }
+        if stop_after == "video":
+            frame_work = {
+                shot_idx for shot_idx in frame_work
+                if not os.path.isfile(self.clip_path(shot_idx)) or self._is_redrawn(shot_idx)
+            }
+        frame_work_ordered = [shot.idx for shot in ordered_playback if shot.idx in frame_work]
+        await self._preflight_rendered_endings(
+            ordered_playback,
+            camera_tree,
+            only_shots=frame_work_ordered,
+            global_chained=global_chained_keyframes,
+        )
+        character_portraits_registry = await self.generate_character_portraits(
+            characters=characters,
+            character_portraits_registry=character_portraits_registry,
+            style=style,
+            progress=progress,
+        )
         if not global_chained_keyframes:
             for shot in ordered_playback:
                 if (
-                    (only_set is None or shot.idx in only_set)
+                    shot.idx in frame_work
                     and self._is_redrawn(shot.idx)
                     and shot.idx in self.frame_events
                 ):
                     self.frame_events[shot.idx]["first_frame"].clear()
                     self.frame_events[shot.idx]["last_frame"].clear()
-        if not self.frame_bracketing:
-            for shot in ordered_playback:
-                if shot.reuse_previous_last_frame is not True or shot.idx not in self._playback_predecessors:
-                    continue
-                if only_set is not None and shot.idx not in only_set:
-                    continue
-                source = self._playback_predecessors[shot.idx]
-                if not os.path.isfile(source["path"]) or (
-                    source["slot"] == self._source_slot(source["idx"])
-                    and self._is_redrawn(source["idx"])
-                    and (only_set is None or source["idx"] in only_set)
-                ):
-                    raise RuntimeError(
-                        f"Cannot reuse shot {shot.idx}: predecessor shot {source['slot']} needs a last frame, "
-                        "but the selected video provider does not generate ending keyframes."
-                    )
 
         priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
         if global_chained_keyframes:
@@ -483,16 +488,17 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 shot_descriptions=shot_descriptions,
                 characters=characters,
                 character_portraits_registry=character_portraits_registry,
-                only_shots=only_shots,
+                only_shots=frame_work_ordered,
+                reuse_approved_stills=stop_after == "video",
                 progress=progress,
             )
             tasks = []
         else:
             # Read provider limits before the legacy selector assembles references.
             prepare = getattr(self.image_generator, "prepare", None)
-            if prepare is not None:
+            if prepare is not None and frame_work:
                 await prepare()
-            self._preflight_pending_frame_sets(camera_tree, shot_descriptions, only_shots)
+            self._preflight_pending_frame_sets(camera_tree, shot_descriptions, frame_work_ordered)
             tasks = [
                 self.generate_frames_for_single_camera(
                     camera=camera,
@@ -501,10 +507,10 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                     character_portraits_registry=character_portraits_registry,
                     priority_shot_idxs=priority_shot_idxs,
                     progress=progress,
-                    only_shots=only_shots,
+                    only_shots=frame_work_ordered,
                 )
                 for camera in sorted(camera_tree, key=lambda item: item.idx)
-                if only_set is None or only_set & set(camera.active_shot_idxs)
+                if frame_work & set(camera.active_shot_idxs)
             ]
 
         if stop_after == "stills":
@@ -529,7 +535,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         assembly_metadata_path = final_video_path + ".inputs.json"
         active_order = [shot.idx for shot in ordered_shots]
         if not active_order:
-            for path in (final_video_path, assembly_metadata_path):
+            for path in (final_video_path, assembly_metadata_path, final_video_path + ".correction.json"):
                 if os.path.isfile(path):
                     os.remove(path)
             _emit_render_progress(progress, "concat_skipped", "There are no active shots to assemble", {"shot_count": 0})
@@ -568,10 +574,9 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             )
         clip_claimed = bool(eligible_clips) and self._claim_video(f"the clip of shot {eligible_clips[0].idx}")
         if clip_claimed:
-            if os.path.isfile(final_video_path):
-                os.remove(final_video_path)
-            if os.path.isfile(assembly_metadata_path):
-                os.remove(assembly_metadata_path)
+            for path in (final_video_path, assembly_metadata_path, final_video_path + ".correction.json"):
+                if os.path.isfile(path):
+                    os.remove(path)
             await self.generate_video_for_single_shot(shot_description=eligible_clips[0], progress=progress)
         deferred_clips = eligible_clips[1:] if clip_claimed else eligible_clips
         if deferred_clips:
@@ -588,7 +593,7 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             if not os.path.isfile(self.clip_path(shot_description.idx))
         ]
         if missing_clips:
-            for path in (final_video_path, assembly_metadata_path):
+            for path in (final_video_path, assembly_metadata_path, final_video_path + ".correction.json"):
                 if os.path.isfile(path):
                     os.remove(path)
             _emit_render_progress(
@@ -602,11 +607,25 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             )
             return self.render_outcome("video", style, final_video_path="")
 
+        correction_path = final_video_path + ".correction.json"
         assembly_inputs = {
-            "version": 1,
+            "version": ASSEMBLY_VERSION,
             "active_shot_idxs": active_order,
             "clips": [
-                {"shot_idx": shot.idx, **_file_signature(self.clip_path(shot.idx))}
+                {
+                    "shot_idx": shot.idx,
+                    **_file_signature(self.clip_path(shot.idx)),
+                    "first_frame_sha256": (
+                        _file_hash(self.frame_path(shot.idx, "first_frame"))
+                        if os.path.isfile(self.frame_path(shot.idx, "first_frame"))
+                        else None
+                    ),
+                    "last_frame_sha256": (
+                        _file_hash(self.frame_path(shot.idx, "last_frame"))
+                        if self.frame_bracketing and os.path.isfile(self.frame_path(shot.idx, "last_frame"))
+                        else None
+                    ),
+                }
                 for shot in ordered_shots
             ],
         }
@@ -615,29 +634,66 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             try:
                 with open(assembly_metadata_path, "r", encoding="utf-8") as metadata_file:
                     cache_matches = json.load(metadata_file) == assembly_inputs
-            except (OSError, ValueError, TypeError):
-                pass
-        if os.path.isfile(final_video_path) and not cache_matches:
-            os.remove(final_video_path)
-        if not cache_matches and os.path.isfile(assembly_metadata_path):
-            os.remove(assembly_metadata_path)
+                if cache_matches:
+                    with open(correction_path, "r", encoding="utf-8") as report_file:
+                        correction_cache = json.load(report_file)
+                    cache_matches = (
+                        correction_cache.get("outputHash") == _file_hash(final_video_path)
+                        and isinstance(correction_cache.get("correction"), dict)
+                    )
+            except (OSError, ValueError, TypeError, AttributeError):
+                cache_matches = False
 
-        if os.path.isfile(final_video_path):
-            print(f"🚀 Skipped concatenating videos, cached inputs are unchanged.")
-            _emit_render_progress(progress, "final_video_exists", "Final video already exists for the active inputs", {"path": final_video_path})
+        if os.path.isfile(final_video_path) and not cache_matches:
+            _emit_render_progress(progress, "assembly_cache_invalidated", "Cached film predates the current correction engine or keyframes", {"path": final_video_path})
+
+        if os.path.isfile(final_video_path) and cache_matches:
+            correction_report = correction_cache["correction"]
+            statuses = [item.get("status", "needs_review") for item in correction_report.get("clips", [])]
+            summary = {status: statuses.count(status) for status in ("corrected", "unchanged", "needs_review")}
+            print("🚀 Skipped concatenating videos; cached inputs and keyframes are unchanged.")
+            _emit_render_progress(
+                progress,
+                "final_video_exists",
+                "Final video already exists for the active inputs",
+                {"path": final_video_path, "correction_summary": summary, "correction_report": correction_report},
+            )
         else:
-            print(f"🎬 Starting concatenating videos...")
-            _emit_render_progress(progress, "concat_start", "Concatenating video clips", {"shot_count": len(ordered_shots)})
-            video_clips = [
-                VideoFileClip(self.clip_path(shot_description.idx))
-                for shot_description in ordered_shots
+            print("🎬 Starting geometrically correcting and concatenating videos...")
+            _emit_render_progress(progress, "concat_start", "Correcting and concatenating video clips", {"shot_count": len(ordered_shots)})
+            clips = [
+                {
+                    "path": os.path.abspath(self.clip_path(shot.idx)),
+                    "first_frame": os.path.abspath(self.frame_path(shot.idx, "first_frame")) if os.path.isfile(self.frame_path(shot.idx, "first_frame")) else None,
+                    "last_frame": os.path.abspath(self.frame_path(shot.idx, "last_frame")) if self.frame_bracketing and os.path.isfile(self.frame_path(shot.idx, "last_frame")) else None,
+                    "slot": str(shot.idx),
+                }
+                for shot in ordered_shots
             ]
-            final_video = concatenate_videoclips(video_clips)
-            final_video.write_videofile(final_video_path, codec="libx264", preset="medium")
-            with open(assembly_metadata_path, "w", encoding="utf-8") as metadata_file:
-                json.dump(assembly_inputs, metadata_file, ensure_ascii=False, indent=2)
-            print(f"☑️ Concatenated videos, saved to {final_video_path}.")
-            _emit_render_progress(progress, "concat_done", "Final video concatenated", {"path": final_video_path})
+            correction_report = assemble_video_files(clips, final_video_path, width=1280, height=720, fps=30)
+            output_hash = _file_hash(final_video_path)
+            report_payload = {"outputHash": output_hash, "correction": correction_report}
+            for path, payload in (
+                (correction_path, report_payload),
+                (assembly_metadata_path, assembly_inputs),
+            ):
+                temporary = path + ".tmp"
+                try:
+                    with open(temporary, "w", encoding="utf-8") as report_file:
+                        json.dump(payload, report_file, ensure_ascii=False, indent=2)
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+            statuses = [item.get("status", "needs_review") for item in correction_report.get("clips", [])]
+            summary = {status: statuses.count(status) for status in ("corrected", "unchanged", "needs_review")}
+            print(f"☑️ Assembled corrected film; {summary['corrected']} corrected, {summary['unchanged']} unchanged, {summary['needs_review']} need review.")
+            _emit_render_progress(
+                progress,
+                "concat_done",
+                "Final video assembled with correction diagnostics",
+                {"path": final_video_path, "correction_summary": summary, "correction_report": correction_report},
+            )
 
         _emit_render_progress(progress, "render_done", "Script2video render complete", {"final_video_path": final_video_path, "phase": "video"})
         return self.render_outcome("video", style, final_video_path=final_video_path)
@@ -681,41 +737,74 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def _mark_frame_fresh(self, shot_idx: int, frame_type: str) -> None:
-        self._fresh_frame_types.setdefault(shot_idx, set()).add(frame_type)
 
     def _source_slot(self, shot_idx: int) -> str:
         return self._shot_slot(shot_idx)
 
+    def _continuity_provenance(
+        self,
+        source: Dict[str, Any],
+        rendered_ending: Dict[str, Any],
+        mode: str,
+    ) -> Dict[str, Any]:
+        return {
+            "kind": "rendered_clip_end",
+            "shot_idx": int(source["idx"]),
+            "slot": str(source["slot"]),
+            "path": Path(os.path.relpath(rendered_ending["path"], self._continuity_project_dir())).as_posix(),
+            "sha256": rendered_ending["sha256"],
+            "clip_path": Path(os.path.relpath(rendered_ending["clip_path"], self._continuity_project_dir())).as_posix(),
+            "clip_sha256": rendered_ending["clip_sha256"],
+            "normalization": rendered_ending["normalization"],
+            "normalization_inputs": rendered_ending["normalization_inputs"],
+            "frame_type": "rendered_end",
+            "mode": mode,
+        }
+
     def _record_continuity_source(
         self,
         shot_idx: int,
-        source_idx: int,
-        source_path: str,
+        source: Dict[str, Any],
+        rendered_ending: Dict[str, Any],
         mode: str,
-        source_slot: Optional[str] = None,
     ) -> None:
         selector_path = self.selector_output_path(shot_idx, "first_frame")
         selector = {
-            "reference_image_path_and_text_pairs": [[source_path, "Previous ending frame copied byte-for-byte."]],
+            "reference_image_path_and_text_pairs": [
+                [rendered_ending["path"], "Actual final displayed frame of the predecessor's rendered clip."]
+            ],
             "text_prompt": "",
             "sent_prompt": "",
-        }
-        source_project_path = Path(os.path.relpath(source_path, self._continuity_project_dir())).as_posix()
-        selector["continuity_source"] = {
-            "shot_idx": source_idx,
-            "slot": source_slot or self._source_slot(source_idx),
-            "path": source_project_path,
-            "frame_type": "last_frame",
-            "sha256": self._sha256_file(source_path),
-            "mode": mode,
+            "continuity_source": self._continuity_provenance(source, rendered_ending, mode),
         }
         os.makedirs(os.path.dirname(selector_path), exist_ok=True)
         with open(selector_path, "w", encoding="utf-8") as handle:
             json.dump(selector, handle, ensure_ascii=False, indent=4)
+    def _predecessor_clip_path(self, shot_dir: Path, slot: str) -> str:
+        """Find the reviewed/discovered predecessor clip, even under an older video model."""
+        root = canonical_render_root(self.working_dir)
+        acceptance_path = root.parent / "render_acceptance.json"
+        try:
+            acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            acceptance = {}
+        root_record = acceptance.get(root.name, {}) if isinstance(acceptance, dict) else {}
+        shots = root_record.get("shots", {}) if isinstance(root_record, dict) else {}
+        slot_record = shots.get(slot, {}) if isinstance(shots, dict) else {}
+        clip_record = slot_record.get("clips", {}) if isinstance(slot_record, dict) else {}
+        artifacts = clip_record.get("artifacts", []) if isinstance(clip_record, dict) else []
+        project_dir = Path(self._continuity_project_dir()).resolve()
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            candidate = (project_dir / str(artifact.get("path") or "")).resolve()
+            if candidate.name == "video.mp4" and candidate.is_file() and candidate.is_relative_to(shot_dir.resolve()):
+                return str(candidate)
+        candidates = sorted(shot_dir.glob("*/video.mp4"), key=lambda path: (path.parent.name != self.video_model_slug, path.as_posix()))
+        return str(candidates[0]) if candidates else str(shot_dir / self.video_model_slug / "video.mp4")
 
     def _external_playback_predecessor(self) -> Optional[Dict[str, Any]]:
-        """Return the last active shot in the preceding Idea scene, if any."""
+        """Return the last active rendered clip in the preceding Idea scene."""
         scene_dir = Path(self.working_dir).resolve()
         match = re.fullmatch(r"scene_(\d+)", scene_dir.name)
         if match is None:
@@ -747,20 +836,23 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             if not active:
                 continue
             source_idx = active[-1]
-            source_path = previous_scene / "shots" / str(source_idx) / self.image_model_slug / "last_frame.png"
+            source_dir = previous_scene / "shots" / str(source_idx)
             description = None
             try:
                 description = ShotDescription.model_validate(
-                    json.loads((previous_scene / "shots" / str(source_idx) / "shot_description.json").read_text(encoding="utf-8"))
+                    json.loads((source_dir / "shot_description.json").read_text(encoding="utf-8"))
                 )
             except (OSError, ValueError, TypeError):
                 pass
+            slot = f"{previous_scene.name}/{source_idx}"
             return {
                 "idx": source_idx,
-                "slot": f"{previous_scene.name}/{source_idx}",
-                "path": str(source_path),
+                "slot": slot,
+                "path": self._predecessor_clip_path(source_dir, slot),
+                "first_frame": str(source_dir / self.image_model_slug / "first_frame.png"),
+                "last_frame": str(source_dir / self.image_model_slug / "last_frame.png"),
                 "description": description,
-                "event": None,
+                "cross_scene": True,
             }
         return None
 
@@ -772,12 +864,15 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         ordered = self._ordered_active_shots(camera_tree, shot_descriptions)
         predecessors: Dict[int, Dict[str, Any]] = {}
         for previous, shot in zip(ordered, ordered[1:]):
+            slot = self._source_slot(previous.idx)
+            source_dir = Path(self.working_dir) / "shots" / str(previous.idx)
             predecessors[shot.idx] = {
                 "idx": previous.idx,
-                "slot": self._source_slot(previous.idx),
-                "path": self.frame_path(previous.idx, "last_frame"),
+                "slot": slot,
+                "path": self._predecessor_clip_path(source_dir, slot),
+                "first_frame": self.frame_path(previous.idx, "first_frame"),
+                "last_frame": self.frame_path(previous.idx, "last_frame"),
                 "description": previous,
-                "event": self.frame_events.get(previous.idx, {}).get("last_frame"),
             }
         if ordered:
             external = self._external_playback_predecessor()
@@ -785,33 +880,155 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 predecessors[ordered[0].idx] = external
         return predecessors
 
-    def _continuity_slot_invalidated(self, slot: str) -> bool:
-        render_root = canonical_render_root(self.working_dir)
-        approval_path = render_root.parent / "render_acceptance.json"
+    def _source_clip_approval_error(self, source: Dict[str, Any]) -> Optional[str]:
+        root = canonical_render_root(self.working_dir)
+        approval_path = root.parent / "render_acceptance.json"
+        if not approval_path.is_file():
+            return None
         try:
             acceptance = json.loads(approval_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return False
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Cannot read frame approvals from {approval_path}: {exc}") from exc
-        root_record = acceptance.get(render_root.name, {}) if isinstance(acceptance, dict) else {}
+        root_record = acceptance.get(root.name, {}) if isinstance(acceptance, dict) else {}
         shots = root_record.get("shots", {}) if isinstance(root_record, dict) else {}
-        record = shots.get(slot, {}) if isinstance(shots, dict) else {}
-        keyframes = record.get("keyframes", {}) if isinstance(record, dict) else {}
-        return isinstance(keyframes, dict) and bool(keyframes.get("invalidated_at"))
+        shot_record = shots.get(str(source["slot"]), {}) if isinstance(shots, dict) else {}
+        clip_record = shot_record.get("clips") if isinstance(shot_record, dict) else None
+        # Native pipelines can be used without a review store. When a tool-owned
+        # record exists, however, a rendered ending must come from its accepted clip.
+        if not isinstance(clip_record, dict):
+            return None
+        if not clip_record.get("accepted_at") or clip_record.get("invalidated_at") or clip_record.get("rejected_at"):
+            return f"predecessor clip {source['slot']} is not currently accepted"
+        artifacts = clip_record.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            return f"predecessor clip {source['slot']} has no accepted artifact lock"
+        project_dir = Path(self._continuity_project_dir()).resolve()
+        clip_path = Path(source["path"]).resolve()
+        found_source = False
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return f"predecessor clip {source['slot']} has an invalid accepted artifact lock"
+            path = (project_dir / str(artifact.get("path") or "")).resolve()
+            try:
+                content = path.read_bytes()
+            except OSError:
+                return f"predecessor clip {source['slot']} has a missing accepted artifact"
+            if len(content) != artifact.get("size") or hashlib.sha256(content).hexdigest() != artifact.get("sha256"):
+                return f"predecessor clip {source['slot']} has changed since acceptance"
+            found_source = found_source or path == clip_path
+        if not found_source:
+            return f"predecessor clip {source['slot']} is not covered by its accepted artifact lock"
+        return None
+
+    async def _prepare_rendered_ending(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        clip_path = str(source["path"])
+        if not os.path.isfile(clip_path):
+            raise RuntimeError(
+                f"Cannot use predecessor shot {source['slot']}: its rendered video clip is missing. "
+                "Render and accept that clip before preparing this handoff; no predecessor generation was attempted."
+            )
+        approval_error = self._source_clip_approval_error(source)
+        if approval_error:
+            raise RuntimeError(
+                f"Cannot use predecessor shot {source['slot']}: {approval_error}. "
+                "Review or regenerate that clip before preparing this handoff."
+            )
+        kwargs = {
+            "first_frame": source.get("first_frame") if os.path.isfile(str(source.get("first_frame") or "")) else None,
+            "last_frame": source.get("last_frame") if os.path.isfile(str(source.get("last_frame") or "")) else None,
+            "width": 1280,
+            "height": 720,
+        }
+        try:
+            ending = await asyncio.to_thread(prepare_rendered_ending, clip_path, **kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot prepare the rendered ending for predecessor shot {source['slot']} "
+                f"from {clip_path}: {exc}"
+            ) from exc
+        if ending.get("normalization") != RENDERED_ENDING_NORMALIZATION:
+            raise ValueError(
+                f"Unsupported rendered-ending normalization: {ending.get('normalization')!r}"
+            )
+        return ending
+
+    def _uses_rendered_ending(
+        self,
+        shot: ShotDescription,
+        source: Optional[Dict[str, Any]],
+        *,
+        global_chained: bool,
+        same_camera: bool,
+    ) -> Optional[str]:
+        if shot.reuse_previous_last_frame is False:
+            return None
+        if source is None:
+            return None
+        if global_chained:
+            reuse = shot.reuse_previous_last_frame
+            if reuse is None:
+                reuse = same_camera
+            return "reuse" if reuse else "reframe"
+        return "reuse" if shot.reuse_previous_last_frame is True else None
+
+    async def _preflight_rendered_endings(
+        self,
+        ordered: List[ShotDescription],
+        camera_tree: List[Camera],
+        *,
+        only_shots: Optional[List[int]],
+        global_chained: bool,
+    ) -> None:
+        wanted = set(only_shots or [])
+        if only_shots is not None and not wanted:
+            return
+        self._rendered_ending_sources = {}
+        for shot in ordered:
+            if only_shots is not None and shot.idx not in wanted:
+                continue
+            source = self._playback_predecessors.get(shot.idx)
+            source_description = source.get("description") if source else None
+            same_camera = (
+                source_description is not None
+                and not source.get("cross_scene")
+                and source_description.cam_idx == shot.cam_idx
+            )
+            mode = self._uses_rendered_ending(
+                shot, source, global_chained=global_chained, same_camera=same_camera
+            )
+            if mode is None:
+                continue
+            ending = await self._prepare_rendered_ending(source)
+            source["rendered_ending"] = ending
+            self._rendered_ending_sources[shot.idx] = ending
+            first_path = self.frame_path(shot.idx, "first_frame")
+            if not os.path.isfile(first_path) or self._is_redrawn(shot.idx):
+                continue
+            if self._continuity_cache_matches(shot.idx, source, mode):
+                continue
+            try:
+                with open(self.selector_output_path(shot.idx, "first_frame"), "r", encoding="utf-8") as handle:
+                    provenance = json.load(handle).get("continuity_source")
+            except (OSError, ValueError, AttributeError):
+                provenance = None
+            if isinstance(provenance, dict) and provenance.get("frame_type") == "last_frame":
+                detail = "It uses legacy planned-still provenance and cannot source a new clip."
+            else:
+                detail = "Its rendered-ending provenance is missing or stale."
+            raise RuntimeError(
+                f"Cannot render shot {shot.idx}: first frame does not match the current rendered ending "
+                f"from predecessor {source['slot']}. {detail} Explicitly prepare or redraw this shot's "
+                "first frame before generating a new clip."
+            )
     def _continuity_cache_matches(
         self,
         shot_idx: int,
         source: Dict[str, Any],
         mode: str,
-        source_hash: Optional[str] = None,
     ) -> bool:
-        source_idx = int(source["idx"])
-        source_slot = str(source["slot"])
-        source_path = str(source["path"])
-        expected_hash = source_hash or self._sha256_file(source_path)
+        ending = source.get("rendered_ending") or self._rendered_ending_sources.get(shot_idx)
         target_path = self.frame_path(shot_idx, "first_frame")
-        if not os.path.isfile(target_path):
+        if not isinstance(ending, dict) or not os.path.isfile(target_path):
             return False
         try:
             with open(self.selector_output_path(shot_idx, "first_frame"), "r", encoding="utf-8") as handle:
@@ -820,13 +1037,8 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             return False
         return (
             isinstance(provenance, dict)
-            and provenance.get("shot_idx") == source_idx
-            and provenance.get("slot") == source_slot
-            and provenance.get("path") == Path(os.path.relpath(source_path, self._continuity_project_dir())).as_posix()
-            and provenance.get("frame_type") == "last_frame"
-            and provenance.get("sha256") == expected_hash
-            and provenance.get("mode") == mode
-            and (mode != "reuse" or self._sha256_file(target_path) == expected_hash)
+            and provenance == self._continuity_provenance(source, ending, mode)
+            and (mode != "reuse" or self._sha256_file(target_path) == ending.get("sha256"))
         )
 
     def _require_cached_continuity(
@@ -836,35 +1048,14 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         mode: str,
         only_shots: Optional[set[int]] = None,
     ) -> None:
-        source_idx = int(source["idx"])
-        source_slot = str(source["slot"])
-        source_path = str(source["path"])
-        source_selected = source_slot in self._continuity_scope or (
-            only_shots is not None
-            and source_slot == self._source_slot(source_idx)
-            and source_idx in only_shots
-        )
-        if not os.path.isfile(source_path):
+        if not os.path.isfile(str(source.get("path") or "")):
             raise RuntimeError(
-                f"Cannot use excluded shot {shot_idx}: predecessor shot {source_slot} last frame is missing; "
-                "include the predecessor explicitly in the render scope."
-            )
-        source_invalidated = self._continuity_slot_invalidated(source_slot)
-        if source_invalidated and (
-            not source_selected
-            or (
-                source_slot == self._source_slot(source_idx)
-                and "last_frame" not in self._fresh_frame_types.get(source_idx, set())
-            )
-        ):
-            raise RuntimeError(
-                f"Cannot use excluded shot {shot_idx}: predecessor shot {source_slot} has invalidated keyframes; "
-                "include the predecessor explicitly in the render scope."
+                f"Cannot render shot {shot_idx}: predecessor shot {source['slot']} rendered video clip is missing."
             )
         if not self._continuity_cache_matches(shot_idx, source, mode):
             raise RuntimeError(
-                f"Excluded shot {shot_idx} has missing or stale predecessor continuity from {source_slot}; "
-                f"explicitly redraw shot {shot_idx} to replace it."
+                f"Excluded shot {shot_idx} has missing or stale rendered-ending continuity from {source['slot']}; "
+                "explicitly prepare or redraw its first frame before generating a new clip."
             )
     async def _reuse_previous_last_frame(
         self,
@@ -874,100 +1065,31 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         only_shots: Optional[set[int]] = None,
         progress=None,
     ) -> None:
-        source_idx = int(source["idx"])
-        source_slot = str(source["slot"])
-        source_path = str(source["path"])
-        source_selected = source_slot in self._continuity_scope or (
-            only_shots is not None
-            and source_slot == self._source_slot(source_idx)
-            and source_idx in only_shots
-        )
-        source_invalidated = self._continuity_slot_invalidated(source_slot)
-        source_redrawn = (
-            source_selected
-            and source_slot == self._source_slot(source_idx)
-            and self._is_redrawn(source_idx)
-        )
-        if source_invalidated and not self._global_chained_keyframes and (
-            not source_selected
-            or (
-                source_slot == self._source_slot(source_idx)
-                and not source_redrawn
-                and "last_frame" not in self._fresh_frame_types.get(source_idx, set())
-                and os.path.isfile(source_path)
-            )
-        ):
-            raise RuntimeError(
-                f"Cannot reuse shot {shot_idx}: predecessor shot {source_slot} has invalidated keyframes; "
-                "include that predecessor explicitly in the render scope."
-            )
-        event = source.get("event")
-        if not self.frame_bracketing and (source_redrawn or not os.path.isfile(source_path)):
-            raise RuntimeError(
-                f"Cannot reuse shot {shot_idx}: predecessor shot {source_slot} needs a last frame, "
-                "but the selected video provider does not generate ending keyframes."
-            )
-        if source_redrawn:
-            if event is None:
-                raise RuntimeError(
-                    f"Cannot render shot {shot_idx}: selected predecessor shot {source_slot} "
-                    "has no available last-frame event."
-                )
-            await event.wait()
-            if "last_frame" not in self._fresh_frame_types.get(source_idx, set()):
-                raise RuntimeError(
-                    f"Cannot reuse shot {shot_idx}: predecessor shot {source_slot} did not produce "
-                    "a fresh last frame in this render."
-                )
-        elif not os.path.isfile(source_path):
-            if not source_selected:
-                raise RuntimeError(
-                    f"Cannot render shot {shot_idx}: required predecessor shot {source_slot} "
-                    "last frame is missing; include that predecessor explicitly in the render scope."
-                )
-            if event is None:
-                raise RuntimeError(
-                    f"Cannot render shot {shot_idx}: selected predecessor shot {source_slot} "
-                    "has no available last frame."
-                )
-            await event.wait()
-        if not os.path.isfile(source_path):
-            raise RuntimeError(f"Cannot render shot {shot_idx}: predecessor shot {source_slot} last frame is missing.")
-        if (
-            source_invalidated
-            and source_slot == self._source_slot(source_idx)
-            and "last_frame" not in self._fresh_frame_types.get(source_idx, set())
-        ):
-            raise RuntimeError(
-                f"Cannot reuse shot {shot_idx}: predecessor shot {source_slot} has invalidated keyframes "
-                "and was not redrawn in this render."
-            )
-        if not source_redrawn and event is not None and os.path.isfile(source_path):
-            event.set()
-
+        ending = source.get("rendered_ending") or self._rendered_ending_sources.get(shot_idx)
+        if not isinstance(ending, dict):
+            ending = await self._prepare_rendered_ending(source)
+            source["rendered_ending"] = ending
+            self._rendered_ending_sources[shot_idx] = ending
         self._assert_frame_cache_usable(shot_idx)
-        source_hash = self._sha256_file(source_path)
         target_path = self.frame_path(shot_idx, "first_frame")
-        redrawn = self._is_redrawn(shot_idx)
-        if os.path.isfile(target_path) and not redrawn:
-            if not self._continuity_cache_matches(shot_idx, source, "reuse", source_hash):
+        if os.path.isfile(target_path) and not self._is_redrawn(shot_idx):
+            if not self._continuity_cache_matches(shot_idx, source, "reuse"):
                 raise RuntimeError(
-                    f"Existing first frame for shot {shot_idx} has missing or stale predecessor continuity "
-                    f"from {source_slot}; explicitly redraw shot {shot_idx} to replace it."
+                    f"Existing first frame for shot {shot_idx} has missing or stale rendered-ending provenance "
+                    f"from predecessor {source['slot']}; explicitly prepare or redraw it."
                 )
             self.frame_events[shot_idx]["first_frame"].set()
             return
 
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        shutil.copyfile(source_path, target_path)
-        self._mark_frame_fresh(shot_idx, "first_frame")
-        self._record_continuity_source(shot_idx, source_idx, source_path, "reuse", source_slot)
+        shutil.copyfile(ending["path"], target_path)
+        self._record_continuity_source(shot_idx, source, ending, "reuse")
         self.frame_events[shot_idx]["first_frame"].set()
         _emit_render_progress(
             progress,
             "frame_done",
-            f"Copied previous last frame for shot {shot_idx}",
-            {"shot_idx": shot_idx, "frame_type": "first_frame", "path": target_path, "source_slot": source_slot},
+            f"Copied rendered ending for shot {shot_idx}",
+            {"shot_idx": shot_idx, "frame_type": "first_frame", "path": target_path, "source_slot": source["slot"]},
         )
 
     async def generate_chained_frames(
@@ -979,14 +1101,9 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         character_portraits_registry: Dict[str, Dict[str, Dict[str, str]]],
         only_shots: Optional[List[int]] = None,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
+        reuse_approved_stills: bool = False,
     ) -> None:
-        """Generate keyframes sequentially in playback order, carrying each cut forward."""
-        if not await self._brackets_clips():
-            raise RuntimeError(
-                "Chained keyframes require a video provider that supports last-frame bracketing; "
-                "select a bracketing-capable provider or disable chained_keyframes."
-            )
-        self.frame_bracketing = True
+        """Generate chained keyframes in playback order from actual rendered clip endings."""
         self._global_chained_keyframes = True
         ordered = self._ordered_active_shots(camera_tree, shot_descriptions)
         self._playback_predecessors = self._build_playback_predecessors(camera_tree, shot_descriptions)
@@ -1006,17 +1123,12 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             unknown = wanted - by_idx.keys()
             if unknown:
                 raise RuntimeError(f"Unknown chained shot(s): {sorted(unknown)}")
-            # Saved endings are independent anchors. Only requested shots and their
-            # immediate input frames matter; no ancestor chain is replayed.
-            for position, shot in enumerate(ordered):
-                if shot.idx not in wanted or position == 0:
-                    continue
-                predecessor = ordered[position - 1]
-                if predecessor.idx not in wanted and not os.path.isfile(self.frame_path(predecessor.idx, "last_frame")):
-                    raise RuntimeError(
-                        f"Cannot render scoped shot {shot.idx}: required predecessor shot {predecessor.idx} "
-                        "last frame is missing; include that predecessor in only_shots."
-                    )
+        await self._preflight_rendered_endings(
+            ordered,
+            camera_tree,
+            only_shots=only_shots,
+            global_chained=True,
+        )
         for shot in ordered:
             for kind in ("first_frame", "last_frame"):
                 self.frame_events.setdefault(shot.idx, {}).setdefault(kind, asyncio.Event())
@@ -1026,8 +1138,8 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         if prepare is not None:
             await prepare()
 
-        first_shot = ordered[0]
         self._preflight_pending_frame_sets(camera_tree, shot_descriptions, only_shots, chained=True)
+        first_shot = ordered[0]
         if wanted is None or first_shot.idx in wanted:
             camera = camera_by_shot[first_shot.idx]
             root_camera = Camera(idx=camera.idx, active_shot_idxs=[first_shot.idx])
@@ -1041,83 +1153,82 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 only_shots=[first_shot.idx],
             )
 
-        for position, shot in enumerate(ordered[1:], start=1):
+        for shot in ordered[1:]:
             if wanted is not None and shot.idx not in wanted:
                 continue
-            previous = ordered[position - 1]
-            previous_last = self.frame_path(previous.idx, "last_frame")
-            if not os.path.isfile(previous_last):
-                if wanted is not None and previous.idx not in wanted:
-                    raise RuntimeError(
-                        f"Cannot render scoped shot {shot.idx}: required predecessor shot {previous.idx} "
-                        f"last frame is missing; include that predecessor in only_shots."
+            if reuse_approved_stills and self._reviewed_keyframes_match(shot.idx):
+                for kind in ("first_frame", "last_frame") if self.frame_bracketing else ("first_frame",):
+                    _emit_render_progress(
+                        progress, "frame_exists", f"Reusing reviewed {kind} for shot {shot.idx}",
+                        {"shot_idx": shot.idx, "frame_type": kind, "path": self.frame_path(shot.idx, kind)},
                     )
-                raise RuntimeError(f"Cannot render shot {shot.idx}: predecessor shot {previous.idx} last frame is missing.")
-            same_camera = camera_by_shot[shot.idx].idx == camera_by_shot[previous.idx].idx
-            expected_reuse = (
-                shot.reuse_previous_last_frame
-                if shot.reuse_previous_last_frame is not None
-                else same_camera
+                continue
+            source = self._playback_predecessors.get(shot.idx)
+            source_description = source.get("description") if source else None
+            camera = camera_by_shot[shot.idx]
+            source_camera = (
+                camera_by_shot.get(int(source["idx"]))
+                if source is not None and not source.get("cross_scene")
+                else None
             )
-            expected_mode = "reuse" if expected_reuse else "reframe"
-            expected_slot = self._source_slot(previous.idx)
-            expected_hash = self._sha256_file(previous_last)
-            expected_path = Path(os.path.relpath(previous_last, self._continuity_project_dir())).as_posix()
+            same_camera = source_camera is not None and source_camera.idx == camera.idx
+            mode = self._uses_rendered_ending(
+                shot, source, global_chained=True, same_camera=same_camera
+            )
+            if mode is None:
+                if shot.reuse_previous_last_frame is not False:
+                    raise RuntimeError(
+                        f"Cannot chain shot {shot.idx}: its playback predecessor is unavailable."
+                    )
+                await self.generate_frames_for_single_camera(
+                    camera=Camera(idx=camera.idx, active_shot_idxs=[shot.idx]),
+                    shot_descriptions=shot_descriptions,
+                    characters=characters,
+                    character_portraits_registry=character_portraits_registry,
+                    priority_shot_idxs=[],
+                    progress=progress,
+                    only_shots=[shot.idx],
+                )
+                continue
+            ending = source["rendered_ending"]
             first_path = self.frame_path(shot.idx, "first_frame")
             redrawn = self._is_redrawn(shot.idx)
-            try:
-                with open(self.selector_output_path(shot.idx, "first_frame"), "r", encoding="utf-8") as handle:
-                    continuity = json.load(handle).get("continuity_source")
-            except (OSError, ValueError, AttributeError):
-                continuity = None
-            valid_existing = (
-                os.path.isfile(first_path)
-                and isinstance(continuity, dict)
-                and continuity.get("shot_idx") == previous.idx
-                and (
-                    continuity.get("slot") == expected_slot
-                    or (continuity.get("slot") is None and not expected_slot.startswith("scene_"))
-                )
-                and (
-                    continuity.get("path") == expected_path
-                    or (continuity.get("path") is None and not expected_slot.startswith("scene_"))
-                )
-                and continuity.get("frame_type") == "last_frame"
-                and continuity.get("sha256") == expected_hash
-                and continuity.get("mode") == expected_mode
-                and (expected_mode != "reuse" or self._sha256_file(first_path) == expected_hash)
-            )
-            if os.path.isfile(first_path) and not redrawn and not valid_existing:
-                raise RuntimeError(
-                    f"Existing first frame for shot {shot.idx} has no matching continuity provenance from "
-                    f"predecessor shot {previous.idx}; explicitly redraw shot {shot.idx} to replace it."
-                )
             if redrawn:
-                for path in (first_path, self.frame_path(shot.idx, "last_frame"),
-                             self.selector_output_path(shot.idx, "first_frame"),
-                             self.selector_output_path(shot.idx, "last_frame")):
+                for path in (
+                    first_path,
+                    self.frame_path(shot.idx, "last_frame"),
+                    self.selector_output_path(shot.idx, "first_frame"),
+                    self.selector_output_path(shot.idx, "last_frame"),
+                ):
                     if os.path.isfile(path):
                         os.remove(path)
                 self.frame_events[shot.idx]["first_frame"].clear()
                 self.frame_events[shot.idx]["last_frame"].clear()
-
-            if not os.path.isfile(first_path):
-                os.makedirs(os.path.dirname(first_path), exist_ok=True)
-                if expected_mode == "reuse":
-                    shutil.copyfile(previous_last, first_path)
-                    self._record_continuity_source(
-                        shot.idx, previous.idx, previous_last, "reuse", expected_slot
-                    )
-                else:
+            if mode == "reuse":
+                await self._reuse_previous_last_frame(
+                    shot.idx, source, only_shots=wanted, progress=progress
+                )
+            else:
+                if not os.path.isfile(first_path):
                     await self._generate_chained_image(
-                        shot, previous, previous_last, characters, character_portraits_registry,
-                        progress, frame_type="first_frame",
+                        shot,
+                        source_description,
+                        ending["path"],
+                        characters,
+                        character_portraits_registry,
+                        progress,
+                        frame_type="first_frame",
+                        source_slot=str(source["slot"]),
+                        rendered_source=source,
                     )
-            self.frame_events[shot.idx]["first_frame"].set()
-            await self._generate_chained_image(
-                shot, shot, first_path, characters, character_portraits_registry,
-                progress, frame_type="last_frame",
-            )
+                self.frame_events[shot.idx]["first_frame"].set()
+            if self.frame_bracketing:
+                await self._generate_chained_image(
+                    shot, shot, first_path, characters, character_portraits_registry,
+                    progress, frame_type="last_frame",
+                )
+            else:
+                self.frame_events[shot.idx]["last_frame"].set()
 
     async def _generate_chained_image(
         self,
@@ -1130,10 +1241,14 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         *,
         frame_type: Literal["first_frame", "last_frame"],
         source_slot: Optional[str] = None,
+        rendered_source: Optional[Dict[str, Any]] = None,
     ) -> None:
-        source_type = "last_frame" if frame_type == "first_frame" else "first_frame"
+        source_type = "rendered_end" if rendered_source and frame_type == "first_frame" else (
+            "last_frame" if frame_type == "first_frame" else "first_frame"
+        )
+        source_idx = int(rendered_source["idx"]) if rendered_source and frame_type == "first_frame" else source_shot.idx
         source = {
-            "shot_idx": source_shot.idx,
+            "shot_idx": source_idx,
             "frame_type": source_type,
             "sha256": self._sha256_file(source_path),
         }
@@ -1141,23 +1256,35 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         expected_source_path = Path(os.path.relpath(source_path, self._continuity_project_dir())).as_posix()
         frame_path = self.frame_path(shot.idx, frame_type)
         invalidated = self._assert_frame_cache_usable(shot.idx)
-        if os.path.isfile(frame_path) and not self._is_redrawn(shot.idx) and not invalidated:
+        prepared_first_is_current = (
+            rendered_source is not None
+            and frame_type == "first_frame"
+            and self._continuity_cache_matches(shot.idx, rendered_source, "reframe")
+        )
+        if (
+            os.path.isfile(frame_path)
+            and not self._is_redrawn(shot.idx)
+            and (not invalidated or prepared_first_is_current)
+        ):
             selector = self.load_selector_output(shot.idx, frame_type) or {}
-            source_matches = selector.get("source_frame") == source
-            if frame_type == "first_frame":
-                provenance = selector.get("continuity_source")
-                source_matches = source_matches and (
-                    isinstance(provenance, dict)
-                    and (
-                        provenance.get("slot") == expected_source_slot
-                        or (provenance.get("slot") is None and not expected_source_slot.startswith("scene_"))
+            if rendered_source and frame_type == "first_frame":
+                source_matches = self._continuity_cache_matches(shot.idx, rendered_source, "reframe")
+            else:
+                source_matches = selector.get("source_frame") == source
+                if frame_type == "first_frame":
+                    provenance = selector.get("continuity_source")
+                    source_matches = source_matches and (
+                        isinstance(provenance, dict)
+                        and (
+                            provenance.get("slot") == expected_source_slot
+                            or (provenance.get("slot") is None and not expected_source_slot.startswith("scene_"))
+                        )
+                        and (
+                            provenance.get("path") == expected_source_path
+                            or (provenance.get("path") is None and not expected_source_slot.startswith("scene_"))
+                        )
+                        and provenance.get("mode") == "reframe"
                     )
-                    and (
-                        provenance.get("path") == expected_source_path
-                        or (provenance.get("path") is None and not expected_source_slot.startswith("scene_"))
-                    )
-                    and provenance.get("mode") == "reframe"
-                )
             if not source_matches:
                 raise RuntimeError(
                     f"Existing {frame_type} for shot {shot.idx} has stale source state; "
@@ -1211,12 +1338,16 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             "review_note": "",
         }
         if frame_type == "first_frame":
-            selector["continuity_source"] = {
-                **source,
-                "slot": expected_source_slot,
-                "path": expected_source_path,
-                "mode": "reframe",
-            }
+            selector["continuity_source"] = (
+                self._continuity_provenance(rendered_source, rendered_source["rendered_ending"], "reframe")
+                if rendered_source is not None
+                else {
+                    **source,
+                    "slot": expected_source_slot,
+                    "path": expected_source_path,
+                    "mode": "reframe",
+                }
+            )
         selector_path = self.selector_output_path(shot.idx, frame_type)
         os.makedirs(os.path.dirname(selector_path), exist_ok=True)
         with open(selector_path, "w", encoding="utf-8") as handle:
@@ -1230,7 +1361,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         )
         os.makedirs(os.path.dirname(frame_path), exist_ok=True)
         image.save(frame_path)
-        self._mark_frame_fresh(shot.idx, frame_type)
         self.frame_events[shot.idx][frame_type].set()
         _emit_render_progress(progress, "frame_done", f"Generated chained {frame_type} for shot {shot.idx}", {"shot_idx": shot.idx, "frame_type": frame_type, "path": frame_path})
 
@@ -1279,7 +1409,18 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         _emit_render_progress(progress, "camera_frames_start", f"Generating frames for camera {camera.idx}", {"camera_idx": camera.idx, "active_shot_idxs": camera.active_shot_idxs})
 
         first_predecessor = self._playback_predecessors.get(first_shot_idx)
-        if by_idx[first_shot_idx].reuse_previous_last_frame is True and first_predecessor is not None:
+        predecessor_description = first_predecessor.get("description") if first_predecessor else None
+        same_camera = (
+            predecessor_description is not None
+            and predecessor_description.cam_idx == by_idx[first_shot_idx].cam_idx
+        )
+        first_mode = self._uses_rendered_ending(
+            by_idx[first_shot_idx],
+            first_predecessor,
+            global_chained=self._global_chained_keyframes,
+            same_camera=same_camera,
+        )
+        if first_mode == "reuse":
             if wanted is not None and first_shot_idx not in wanted:
                 self._require_cached_continuity(first_shot_idx, first_predecessor, "reuse", wanted)
                 self.frame_events[first_shot_idx]["first_frame"].set()
@@ -1287,28 +1428,22 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 await self._reuse_previous_last_frame(
                     first_shot_idx, first_predecessor, only_shots=wanted, progress=progress
                 )
-        elif (
-            self._global_chained_keyframes
-            and by_idx[first_shot_idx].reuse_previous_last_frame is False
-            and first_predecessor is not None
-        ):
+        elif first_mode == "reframe":
             if wanted is not None and first_shot_idx not in wanted:
                 self._require_cached_continuity(first_shot_idx, first_predecessor, "reframe", wanted)
                 self.frame_events[first_shot_idx]["first_frame"].set()
             else:
-                source_slot = str(first_predecessor["slot"])
-                if not os.path.isfile(first_predecessor["path"]):
-                    raise RuntimeError(
-                        f"Cannot render shot {first_shot_idx}: predecessor shot {source_slot} "
-                        "last frame is missing; include that predecessor explicitly in the render scope."
-                    )
-                source_description = first_predecessor.get("description")
-                if source_description is None:
-                    raise RuntimeError(f"Cannot reframe shot {first_shot_idx}: predecessor shot {source_slot} description is missing.")
+                source_description = predecessor_description or by_idx[first_shot_idx]
                 await self._generate_chained_image(
-                    by_idx[first_shot_idx], source_description, first_predecessor["path"],
-                    characters, character_portraits_registry, progress, frame_type="first_frame",
-                    source_slot=source_slot,
+                    by_idx[first_shot_idx],
+                    source_description,
+                    first_predecessor["rendered_ending"]["path"],
+                    characters,
+                    character_portraits_registry,
+                    progress,
+                    frame_type="first_frame",
+                    source_slot=str(first_predecessor["slot"]),
+                    rendered_source=first_predecessor,
                 )
         elif os.path.exists(first_shot_ff_path) and not self._is_redrawn(first_shot_idx) and not first_invalidated:
             print(f"🚀 Skipped generating first_frame for shot {first_shot_idx}, already exists.")
@@ -1413,14 +1548,12 @@ class Script2VideoPipeline(ModelScopedArtifacts):
                 )
                 os.makedirs(os.path.dirname(first_shot_ff_path), exist_ok=True)
                 ff_image.save(first_shot_ff_path)
-                self._mark_frame_fresh(first_shot_idx, "first_frame")
                 self.frame_events[first_shot_idx]["first_frame"].set()
                 print(f"☑️ Generated first_frame for shot {first_shot_idx}, saved to {first_shot_ff_path}.")
                 _emit_render_progress(progress, "frame_done", f"Generated first frame for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame", "path": first_shot_ff_path})
             else:
                 os.makedirs(os.path.dirname(first_shot_ff_path), exist_ok=True)
                 shutil.copy(new_camera_image_path, first_shot_ff_path)
-                self._mark_frame_fresh(first_shot_idx, "first_frame")
                 self.frame_events[first_shot_idx]["first_frame"].set()
                 print(f"☑️ Generated first_frame for shot {first_shot_idx}, saved to {first_shot_ff_path}.")
                 _emit_render_progress(progress, "frame_done", f"Generated first frame for shot {first_shot_idx}", {"camera_idx": camera.idx, "shot_idx": first_shot_idx, "frame_type": "first_frame", "path": first_shot_ff_path})
@@ -1455,16 +1588,19 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             predecessor_idx = camera.active_shot_idxs[position - 1]
             source_type = "last_frame" if self.frame_bracketing else "first_frame"
             source_path = self.frame_path(predecessor_idx, source_type)
-            if wanted is not None and predecessor_idx not in wanted and not os.path.isfile(source_path):
+            reuse_source = self._playback_predecessors.get(shot_idx)
+            use_rendered_ending = (
+                by_idx[shot_idx].reuse_previous_last_frame is True and reuse_source is not None
+            )
+            if not use_rendered_ending and wanted is not None and predecessor_idx not in wanted and not os.path.isfile(source_path):
                 raise RuntimeError(
                     f"Cannot render scoped shot {shot_idx}: required predecessor shot {predecessor_idx} "
                     f"{source_type} is missing; include that predecessor in only_shots."
                 )
-            source_event = self.frame_events[predecessor_idx][source_type]
-            if os.path.isfile(source_path):
+            source_event = None if use_rendered_ending else self.frame_events[predecessor_idx][source_type]
+            if not use_rendered_ending and os.path.isfile(source_path):
                 source_event.set()
-            reuse_source = self._playback_predecessors.get(shot_idx)
-            if by_idx[shot_idx].reuse_previous_last_frame is True and reuse_source is not None:
+            if use_rendered_ending:
                 first_frame_task = self._reuse_previous_last_frame(
                     shot_idx, reuse_source, only_shots=wanted, progress=progress
                 )
@@ -1517,31 +1653,67 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         video_path = self.clip_path(shot_description.idx)
         if os.path.exists(video_path):
             print(f"🚀 Skipped generating video for shot {shot_description.idx}, already exists.")
-            _emit_render_progress(progress, "video_clip_exists", f"Video clip for shot {shot_description.idx} already exists", {"shot_idx": shot_description.idx, "path": video_path})
-        else:
-            _emit_render_progress(progress, "video_clip_waiting_for_frames", f"Waiting for frames before video clip {shot_description.idx}", {"shot_idx": shot_description.idx})
-            # A bracketed clip cannot wander: the model is pinned to both ends.
-            # Given only a start frame it is free to invent the rest of the shot,
-            # which is what makes the room drift across a clip and the cut into the
-            # next shot read as a jump.
-            await self.frame_events[shot_description.idx]["first_frame"].wait()
-            frame_paths = [self.frame_path(shot_description.idx, "first_frame")]
-            if self.frame_bracketing:
-                await self.frame_events[shot_description.idx]["last_frame"].wait()
-                frame_paths.append(self.frame_path(shot_description.idx, "last_frame"))
-
-            print(f"🎬 Starting video generation for shot {shot_description.idx}...")
-            _emit_render_progress(progress, "video_clip_start", f"Generating video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "frame_count": len(frame_paths)})
-            video_output = await self.video_generator.generate_single_video(
-                prompt=self._review_note(shot_description.idx, shot_description.motion_desc + "\n" + shot_description.audio_desc),
-                reference_image_paths=frame_paths,
-                duration_seconds=duration_seconds,
-                progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
+            _emit_render_progress(
+                progress,
+                "video_clip_exists",
+                f"Video clip for shot {shot_description.idx} already exists",
+                {"shot_idx": shot_description.idx, "path": video_path},
             )
-            os.makedirs(os.path.dirname(video_path), exist_ok=True)
-            video_output.save(video_path)
-            print(f"☑️ Generated video for shot {shot_description.idx}, saved to {video_path}.")
-            _emit_render_progress(progress, "video_clip_done", f"Generated video clip for shot {shot_description.idx}", {"shot_idx": shot_description.idx, "path": video_path})
+            return
+        source = self._playback_predecessors.get(shot_description.idx)
+        if source is not None:
+            source_description = source.get("description")
+            same_camera = (
+                source_description is not None
+                and not source.get("cross_scene")
+                and source_description.cam_idx == shot_description.cam_idx
+            )
+            mode = self._uses_rendered_ending(
+                shot_description,
+                source,
+                global_chained=self._global_chained_keyframes,
+                same_camera=same_camera,
+            )
+            if mode is not None and not self._continuity_cache_matches(
+                shot_description.idx, source, mode
+            ):
+                raise RuntimeError(
+                    f"Cannot generate video for shot {shot_description.idx}: its first frame is not bound "
+                    f"to the current rendered ending of predecessor {source['slot']}. Prepare or redraw "
+                    "the first frame before the provider call."
+                )
+        _emit_render_progress(
+            progress,
+            "video_clip_waiting_for_frames",
+            f"Waiting for frames before video clip {shot_description.idx}",
+            {"shot_idx": shot_description.idx},
+        )
+        await self.frame_events[shot_description.idx]["first_frame"].wait()
+        frame_paths = [self.frame_path(shot_description.idx, "first_frame")]
+        if self.frame_bracketing:
+            await self.frame_events[shot_description.idx]["last_frame"].wait()
+            frame_paths.append(self.frame_path(shot_description.idx, "last_frame"))
+        _emit_render_progress(
+            progress,
+            "video_clip_start",
+            f"Generating video clip for shot {shot_description.idx}",
+            {"shot_idx": shot_description.idx, "frame_count": len(frame_paths)},
+        )
+        video_output = await self.video_generator.generate_single_video(
+            prompt=self._review_note(shot_description.idx, shot_description.motion_desc + "\n" + shot_description.audio_desc),
+            reference_image_paths=frame_paths,
+            duration_seconds=duration_seconds,
+            progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
+        )
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        video_output.save(video_path)
+        print(f"☑️ Generated video for shot {shot_description.idx}, saved to {video_path}.")
+        _emit_render_progress(
+            progress,
+            "video_clip_done",
+            f"Generated video clip for shot {shot_description.idx}",
+            {"shot_idx": shot_description.idx, "path": video_path},
+        )
 
     async def generate_frame_for_single_shot(
         self,
@@ -1602,7 +1774,6 @@ class Script2VideoPipeline(ModelScopedArtifacts):
             )
             os.makedirs(os.path.dirname(frame_image_path), exist_ok=True)
             frame_image.save(frame_image_path)
-            self._mark_frame_fresh(shot_idx, frame_type)
             print(f"☑️ Generated {frame_type} frame for shot {shot_idx}, saved to {frame_image_path}.")
             _emit_render_progress(progress, "frame_done", f"Generated {frame_type} for shot {shot_idx}", {"shot_idx": shot_idx, "frame_type": frame_type, "path": frame_image_path})
 
@@ -1634,13 +1805,53 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         keyframes = shot_record.get("keyframes", {}) if isinstance(shot_record, dict) else {}
         return isinstance(keyframes, dict) and bool(keyframes.get("invalidated_at"))
 
+    def _reviewed_keyframes_match(self, shot_idx: int) -> bool:
+        """Current image approvals, not an old generation recipe, authorize video inputs."""
+        root = canonical_render_root(self.working_dir)
+        try:
+            acceptance = json.loads((root.parent / "render_acceptance.json").read_text(encoding="utf-8"))
+            record = acceptance[root.name]["shots"][self._shot_slot(shot_idx)]["keyframes"]
+            if not record.get("accepted_at") or record.get("invalidated_at") or record.get("rejected_at"):
+                return False
+            artifacts = record.get("artifacts")
+            if not isinstance(artifacts, list) or not artifacts:
+                return False
+            project = Path(self._continuity_project_dir()).resolve()
+            locked = set()
+            for artifact in artifacts:
+                if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+                    return False
+                path = (project / artifact["path"]).resolve()
+                if not path.is_relative_to(project) or not path.is_file():
+                    return False
+                if path.stat().st_size != artifact.get("size") or self._sha256_file(str(path)) != artifact.get("sha256"):
+                    return False
+                locked.add(path)
+            required = ("first_frame", "last_frame") if self.frame_bracketing else ("first_frame",)
+            return all(Path(self.frame_path(shot_idx, kind)).resolve() in locked for kind in required)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+
+    def _cached_rendered_ending_first_is_current(self, shot_idx: int) -> bool:
+        source = self._playback_predecessors.get(shot_idx)
+        if source is None:
+            return False
+        return any(
+            self._continuity_cache_matches(shot_idx, source, mode)
+            for mode in ("reuse", "reframe")
+        )
+
     def _assert_frame_cache_usable(self, shot_idx: int) -> bool:
         invalidated = self._frame_keyframes_invalidated(shot_idx)
         if invalidated and not self._is_redrawn(shot_idx):
-            if any(os.path.isfile(self.frame_path(shot_idx, kind)) for kind in ("first_frame", "last_frame")):
+            has_frames = any(
+                os.path.isfile(self.frame_path(shot_idx, kind))
+                for kind in ("first_frame", "last_frame")
+            )
+            if has_frames and not self._cached_rendered_ending_first_is_current(shot_idx):
                 raise RuntimeError(
-                    f"Keyframes for shot {self._shot_slot(shot_idx)} were invalidated; explicitly redraw the shot "
-                    "after approving its current set references."
+                    f"Keyframes for shot {self._shot_slot(shot_idx)} were invalidated; explicitly prepare "
+                    "its current rendered ending or redraw the shot after approving its current set references."
                 )
         return invalidated
 
@@ -1813,34 +2024,36 @@ class Script2VideoPipeline(ModelScopedArtifacts):
         }
         pending: Dict[int, int] = {}
         if chained:
-            for position, shot in enumerate(ordered):
+            frame_types = ("first_frame", "last_frame") if self.frame_bracketing else ("first_frame",)
+            for shot in ordered:
                 if wanted is not None and shot.idx not in wanted:
                     continue
-                camera = camera_by_shot[shot.idx]
                 invalidated = self._assert_frame_cache_usable(shot.idx)
-                previous = ordered[position - 1] if position else None
-                same_camera = previous is not None and camera_by_shot[previous.idx].idx == camera.idx
-                reuse_previous = (
-                    shot.reuse_previous_last_frame
-                    if shot.reuse_previous_last_frame is not None
-                    else same_camera
+                source = self._playback_predecessors.get(shot.idx)
+                source_description = source.get("description") if source else None
+                same_camera = (
+                    source_description is not None
+                    and not source.get("cross_scene")
+                    and source_description.cam_idx == shot.cam_idx
                 )
-                for frame_type in ("first_frame", "last_frame"):
-                    if os.path.isfile(self.frame_path(shot.idx, frame_type)) and not self._is_redrawn(shot.idx) and not invalidated:
+                mode = self._uses_rendered_ending(
+                    shot, source, global_chained=True, same_camera=same_camera
+                )
+                for frame_type in frame_types:
+                    current_rendered_first = (
+                        frame_type == "first_frame"
+                        and mode is not None
+                        and self._continuity_cache_matches(shot.idx, source, mode)
+                    )
+                    if (
+                        os.path.isfile(self.frame_path(shot.idx, frame_type))
+                        and not self._is_redrawn(shot.idx)
+                        and (not invalidated or current_rendered_first)
+                    ):
                         continue
                     needs_source = frame_type == "last_frame" or (
-                        previous is not None and not reuse_previous
+                        frame_type == "first_frame" and mode == "reframe"
                     )
-                    if position == 0 and frame_type == "first_frame":
-                        external_previous = self._external_playback_predecessor()
-                        if external_previous is not None and shot.reuse_previous_last_frame is False:
-                            needs_source = True
-                        elif external_previous is not None and shot.reuse_previous_last_frame is True:
-                            needs_source = False
-                        else:
-                            needs_source = camera.parent_shot_idx is not None and (
-                                camera.missing_info is not None or self._is_redrawn(shot.idx)
-                            )
                     pending[shot.idx] = max(pending.get(shot.idx, 0), int(needs_source))
         else:
             frame_types = ("first_frame", "last_frame") if self.frame_bracketing else ("first_frame",)

@@ -9,8 +9,7 @@ import {performance} from 'node:perf_hooks';
 import {readAgentConfig, saveAgentConfig} from './config-store.mjs';
 import {closeMediaCache, serveArtifact, serveThumbnail} from './media-serving.mjs';
 import {createAgentMessageQueue} from './agent-message-queue.mjs';
-import {applySetReferenceImage, approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, removeShot, rerenderPrompt, restoreShot, selectPortraitCharacter, selectSetReference, storeWorkspaceUpload, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance} from './server-lib.mjs';
-import {getShotRestartPlan, restartShot} from './server-lib.mjs';
+import {applySetReferenceImage, approvePortraitCharacter, artifactContentType, assembleFilm, deleteAsset, deleteAssets, deleteSession, getAssetDeletionPlan, getAssetsDeletionPlan, listSessionArtifacts, moveShot, readContinuityReview, readFilmProgress, readFilmSnapshot, readPortraitOptions, readProjectMetadata, readRemovedShots, readRenderAcceptance, readSessionHistory, readSessionState, readShotPlan, readShotPlans, updateProjectMetadata, updateRenderAcceptance, updateShotPlan, readSetReferences, updateSetReference, updateSetReferenceAcceptance, prepareRenderedEndingForShot, getShotRestartPlan, restartShot} from './server-lib.mjs';
 import {BoundedPerformanceLog, createBridgeStreamState, isSseBackpressureExceeded, safeRuntimePerformanceRecord, validateAgentMetricsPayload} from './bridge-streaming.mjs';
 
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +26,8 @@ let agentProcess = null;
 let activeSessionId = '';
 const agentQueue = createAgentMessageQueue();
 const bridgeStreamState = createBridgeStreamState();
+let sessionDeletionInProgress = false;
+let sessionMetadataUpdateInProgress = 0;
 const performanceLog = new BoundedPerformanceLog(repoRoot, () => console.warn('Unable to persist bounded bridge performance telemetry'));
 const turnContexts = new Map();
 const messageSessions = new Map();
@@ -53,14 +54,23 @@ const server = createServer(async (request, response) => {
       if (!body || typeof body !== 'object' || Array.isArray(body)) {
         return sendJson(response, 400, {error: 'A JSON object body is required'});
       }
-      const project = await updateProjectMetadata(repoRoot, {
-        sessionId: typeof body.sessionId === 'string' ? body.sessionId : '',
-        projectName: body.projectName,
-        idea: body.idea,
-        userRequirement: body.userRequirement,
-        style: body.style,
-        invalidate: body.invalidate,
-      });
+      if (sessionDeletionInProgress) {
+        return sendJson(response, 409, {error: 'A project is being deleted. Wait for deletion to finish before updating project details.'});
+      }
+      sessionMetadataUpdateInProgress += 1;
+      let project;
+      try {
+        project = await updateProjectMetadata(repoRoot, {
+          sessionId: typeof body.sessionId === 'string' ? body.sessionId : '',
+          projectName: body.projectName,
+          idea: body.idea,
+          userRequirement: body.userRequirement,
+          style: body.style,
+          invalidate: body.invalidate,
+        });
+      } finally {
+        sessionMetadataUpdateInProgress -= 1;
+      }
       if (!project) return sendJson(response, 404, {error: 'Project not found'});
       const onActiveSession = project.session.sessionId === activeSessionId;
       // `invalidated` doubles as the candidate list on the unconfirmed call, so
@@ -103,11 +113,36 @@ const server = createServer(async (request, response) => {
       if (!current.sessions.some((session) => session.sessionId === sessionId)) {
         return sendJson(response, 404, {error: 'Project not found'});
       }
-      if (sessionId === activeSessionId) stopAgent('delete');
-      const state = await deleteSession(repoRoot, sessionId);
-      activeSessionId = state.activeSessionId;
-      broadcast({type: 'sessions_changed', ...state});
-      return sendJson(response, 200, state);
+      if (sessionDeletionInProgress) {
+        return sendJson(response, 409, {error: 'Another project deletion is already in progress. The current request has not been cancelled.'});
+      }
+      if (sessionMetadataUpdateInProgress > 0) {
+        return sendJson(response, 409, {error: 'Project details are being updated. Wait for the update to finish before deleting a project.'});
+      }
+      const queue = agentQueue.snapshot();
+      if (queue.busy || queue.pending.length > 0) {
+        return sendJson(response, 409, {error: 'The agent has active or queued work. Wait for it to finish before deleting a project. The current request has not been cancelled.'});
+      }
+
+      sessionDeletionInProgress = true;
+      const boundAgentSessionId = activeSessionId;
+      const preserveRunningAgent = Boolean(agentProcess) && sessionId !== boundAgentSessionId;
+      try {
+        const state = await deleteSession(repoRoot, sessionId, async () => {
+          const child = sessionId === boundAgentSessionId ? agentProcess : null;
+          if (!child) return;
+          const exited = child.exitCode !== null || child.signalCode !== null
+            ? Promise.resolve()
+            : new Promise((resolve) => child.once('exit', resolve));
+          stopAgent('delete');
+          await exited;
+        });
+        activeSessionId = preserveRunningAgent ? boundAgentSessionId : state.activeSessionId;
+        broadcast({type: 'sessions_changed', ...state});
+        return sendJson(response, 200, state);
+      } finally {
+        sessionDeletionInProgress = false;
+      }
     }
     if (url.pathname === '/api/history' && request.method === 'GET') {
       const sessionId = url.searchParams.get('session') || '';
@@ -315,6 +350,21 @@ const server = createServer(async (request, response) => {
         return sendJson(response, error.statusCode || 400, {error: error.message});
       }
     }
+    if (url.pathname === '/api/rendered-ending' && request.method === 'POST') {
+      let body;
+      try { body = await readJsonBody(request); }
+      catch (error) { return sendJson(response, 400, {error: error.message}); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return sendJson(response, 400, {error: 'A JSON object body is required'});
+      }
+      try {
+        const payload = await prepareRenderedEndingForShot(repoRoot, body, () => agentQueue.hasWorkFor(body.sessionId));
+        return payload ? sendJson(response, 200, payload) : sendJson(response, 404, {error: 'Project not found'});
+      } catch (error) {
+        return sendJson(response, error.statusCode || 500, {error: error.message});
+      }
+    }
+
     if (url.pathname === '/api/assemble' && request.method === 'POST') {
       let body;
       try { body = await readJsonBody(request); }
@@ -419,6 +469,9 @@ const server = createServer(async (request, response) => {
       if (!body || typeof body !== 'object' || Array.isArray(body)) {
         return sendJson(response, 400, {error: 'A JSON object body is required'});
       }
+      if (sessionDeletionInProgress) {
+        return sendJson(response, 409, {error: 'A project is being deleted. The current request has not been cancelled.'});
+      }
       const text = typeof body.text === 'string' ? body.text.trim() : '';
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
       if (!text) return sendJson(response, 400, {error: 'Message text is required'});
@@ -484,6 +537,11 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 async function startAgent({newSession, sessionId, projectName = '', style = '', userRequirement = ''}) {
+  if (sessionDeletionInProgress) {
+    const error = new Error('A project is being deleted. Wait for deletion to finish before creating a project or restarting the agent.');
+    error.statusCode = 409;
+    throw error;
+  }
   if (newSession && sessionId) throw new Error('Choose either a new or existing session');
   if (agentQueue.hasWorkFor(activeSessionId)) {
     const error = new Error('The agent has active or queued work. Wait for it to finish before creating a project or restarting the agent. The current request has not been cancelled.');

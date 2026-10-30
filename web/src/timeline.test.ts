@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {activeRedraw, askedRenderFinished, blockingSlots, canRedo, characterChips, clipCostLine, failedRedraw, filmPosition, missingKeyframes, missingSlots, moveTarget, needsReview, planDirty, planInconsistencies, redoOneText, redoPhase, redoRequestText, redoableRejections, rejections, renderActivity, renderClipText, renderRequestText, renderStatusLine, rowNeedsAttention, slotName, slotsInFilmOrder, stageCounts, stageTitle, slotTitle, toggleCharacter} from './timeline';
+import {activeRedraw, askedRenderFinished, blockingSlots, canRedo, characterChips, clipCostLine, failedRedraw, filmPosition, missingKeyframes, missingSlots, moveTarget, needsReview, planDirty, planInconsistencies, rejections, renderActivity, renderClipText, renderRequestText, renderStatusLine, rowNeedsAttention, slotName, slotsInFilmOrder, stageCounts, stageTitle, slotTitle, toggleCharacter} from './timeline';
 import type {AcceptanceSlot, AcceptanceStage, AcceptanceState} from './types';
 
 describe('where a shot plays', () => {
@@ -157,63 +157,6 @@ describe('turning rejections into a re-render', () => {
     ]);
   });
 
-  it('keeps session rejections visible but excludes them and empty keys from bulk redraws', () => {
-    const stages: AcceptanceStage[] = [
-      stage({stage: 'portraits', scope: 'session', slots: [
-        {shot: null, state: 'rejected', artifacts: ['portrait.png'], reason: 'wrong face'},
-      ]}),
-      stage({stage: 'keyframes', slots: [
-        {shot: '2', state: 'rejected', artifacts: ['shots/2/first_frame.png'], reason: 'wrong room'},
-      ]}),
-      stage({stage: 'clips', slots: [
-        {shot: '4', state: 'rejected', artifacts: ['shots/4/video.mp4'], reason: 'wrong motion'},
-      ]}),
-      stage({stage: 'final_video', scope: 'session', slots: [
-        {shot: null, state: 'rejected', artifacts: ['final_video.mp4'], reason: 'bad ending'},
-      ]}),
-    ];
-    const rejected = rejections(stages);
-    const redoable = redoableRejections(rejected);
-
-    expect(rejected).toHaveLength(4);
-    expect(redoable.map((item) => item.shot)).toEqual(['2', '4']);
-    expect(redoRequestText(rejected)).toContain('redo_shots=["2", "4"]');
-    expect(redoRequestText(rejected)).not.toContain('wrong face');
-    expect(redoRequestText(rejections([stage({stage: 'portraits', scope: 'session', slots: [
-      {shot: null, state: 'rejected', artifacts: ['portrait.png'], reason: 'wrong face'},
-    ]})]))).toBe('');
-  });
-
-  it('quotes the reasons verbatim in the instruction', () => {
-    const text = redoRequestText([{title: 'Shot 6', reason: 'her dress is blue here but pink everywhere else', shot: '5', stage: 'keyframes'}]);
-
-    expect(text).toContain('- Shot 6 (slot key "5"): her dress is blue here but pink everywhere else');
-    expect(text).toContain('Redraw exactly these shots in stills, and no others');
-    expect(text).toContain('Every other shot and every accepted artifact stays as it is');
-  });
-
-  it('names the shots it is allowed to touch, so a redraw cannot spread', () => {
-    const items = [
-      {title: 'Shot 6', reason: 'her dress is blue', shot: '5', stage: 'keyframes'},
-      {title: 'Shot 7', reason: 'the room is a different room', shot: '11', stage: 'clips'},
-    ];
-
-    expect(redoRequestText(items)).toContain('redo_shots=["5", "11"]');
-    // Keyframes are redrawn before the clips animated from them, whatever the set holds.
-    expect(redoRequestText(items)).toContain('stop_after="stills"');
-  });
-
-  it('redraws clips alone when only clips were rejected', () => {
-    expect(redoRequestText([{title: 'Shot 2', reason: 'the ceiling sags', shot: '1', stage: 'clips'}])).toContain('stop_after="video"');
-  });
-
-  it('says so rather than inventing a note when none was typed', () => {
-    expect(redoRequestText([{title: 'Shot 3', reason: '', shot: '2', stage: 'keyframes'}])).toContain('- Shot 3 (slot key "2"): no reason given');
-  });
-
-  it('asks for nothing when nothing was rejected', () => {
-    expect(redoRequestText([])).toBe('');
-  });
 });
 
 describe('a slot that can be redrawn', () => {
@@ -234,11 +177,6 @@ describe('a slot that can be redrawn', () => {
     expect(canRedo('final_video', {shot: null, state: 'rendered', artifacts: ['final_video.mp4']} as AcceptanceSlot)).toBe(false);
   });
 
-  it('maps a stage to the phase that redraws it', () => {
-    expect(redoPhase('keyframes')).toBe('stills');
-    expect(redoPhase('clips')).toBe('video');
-    expect(redoPhase('portraits')).toBeNull();
-  });
 });
 
 describe('slot titles', () => {
@@ -251,33 +189,6 @@ describe('slot titles', () => {
   });
 });
 
-describe('redrawing one slot from its card', () => {
-  it('asks for that shot alone, with the note against it', () => {
-    const text = redoOneText('script2video', 'keyframes', {shot: '4', state: 'rejected', artifacts: ['shots/4/first_frame.png'], reason: 'the door is open here and shut everywhere else'});
-
-    expect(text).toContain('Redraw exactly these shots in script2video in stills, and no others');
-    // The card's title and the slot key are both stated: one is 1-based, the other is not.
-    expect(text).toContain('Shot 5 (slot key "4"): the door is open here and shut everywhere else');
-    expect(text).toContain('render_mode="script2video"');
-    // The note guard is lifted: this request names the slot itself, and the guard exists for a
-    // person reading the card's 1-based name as a slot key.
-    expect(text).toContain('Run vimax_render_video with exactly these arguments and no others: render_mode="script2video", redo_shots=["4"], stop_after="stills", allow_unreviewed_redo=true.');
-    expect(text).toContain('a redraw never moves the sequence to another root');
-  });
-
-  it('quotes the note a redraw was last asked for, not just a live rejection', () => {
-    const text = redoOneText('script2video', 'keyframes', {
-      shot: '2', state: 'rendered', artifacts: ['shots/2/first_frame.png'],
-      note: 'Wife should match the studio shot.', redoneAt: '2026-09-20T20:00:00',
-    });
-
-    expect(text).toContain('Shot 3 (slot key "2"): Wife should match the studio shot.');
-  });
-
-  it('redraws a clip-only slot with the video phase', () => {
-    expect(redoOneText('script2video', 'clips', {shot: '4', state: 'rendered', artifacts: ['shots/4/video.mp4']})).toContain('stop_after="video"');
-  });
-});
 
 describe('what the render is doing', () => {
   // The status was written at 15:23:41, so these are that clock plus a number of seconds.

@@ -1,4 +1,4 @@
-import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, AssetDeletionPlan, AssetDeletionRequest, AssetDeletionResponse, AssetsDeletionPlan, AssetsDeletionRequest, AssetsDeletionResponse, BrowserAgentMetricsPayload, ContinuityPayload, JsonValue, Message, PortraitMutationRequest, PortraitMutationResponse, PortraitOptions, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, SetReferenceAcceptanceRequest, SetReferenceInventory, SetReferenceSelectionRequest, SetReferenceUpdateRequest, ShotPlan, ShotPlanUpdateRequest, ShotRestartPlan, WorkspaceUpload} from './types';
+import type {AcceptanceUpdateRequest, AgentConfig, AgentEvent, Artifact, AssemblyCorrectionReport, AssetDeletionPlan, AssetDeletionRequest, AssetDeletionResponse, AssetsDeletionPlan, AssetsDeletionRequest, AssetsDeletionResponse, BrowserAgentMetricsPayload, ContinuityPayload, JsonValue, Message, PortraitMutationRequest, PortraitMutationResponse, PortraitOptions, ProjectMetadata, ProjectUpdateRequest, ProjectUpdateResponse, RemovedShot, RenderAcceptance, SessionSummary, SetReferenceAcceptanceRequest, SetReferenceInventory, SetReferenceSelectionRequest, SetReferenceUpdateRequest, ShotPlan, ShotPlanUpdateRequest, ShotRestartPlan, WorkspaceUpload} from './types';
 import type {FilmProgress, FilmSnapshot} from './filmSession';
 
 export async function getSessions() {
@@ -132,7 +132,7 @@ export async function applySetReferenceImage(payload: {
   return request<SetReferenceInventory>('/api/set-reference-image', {method: 'POST', body: JSON.stringify(payload)});
 }
 export type AssembleRequest = {sessionId: string; root: string; revision?: string};
-export type AssembleResponse = {path: string; reused: boolean; shotCount: number};
+export type AssembleResponse = {path: string; reused: boolean; shotCount: number; correction: AssemblyCorrectionReport};
 
 export async function assembleFilm(payload: AssembleRequest) {
   return request<AssembleResponse>('/api/assemble', {method: 'POST', body: JSON.stringify(payload)});
@@ -191,6 +191,13 @@ export async function removeShot(payload: {sessionId: string; root: string; slot
 export async function readShotPlans(sessionId: string, root: string) {
   const query = new URLSearchParams({session: sessionId, root});
   return request<{root: string; plans: ShotPlan[]}>(`/api/shot-plans?${query}`);
+}
+
+/** Prepare a reviewed predecessor video's actual ending locally, without generation. */
+export async function prepareRenderedEnding(payload: {
+  sessionId: string; root: string; slot: string; previousSlot: string; previousClipSha256: string; revision: string;
+}) {
+  return request<ShotPlan>('/api/rendered-ending', {method: 'POST', body: JSON.stringify(payload)});
 }
 
 /** The shots taken out of the film, with what is kept for each. */

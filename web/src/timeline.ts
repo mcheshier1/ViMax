@@ -204,13 +204,6 @@ export function canRedo(stage: string, slot: AcceptanceSlot): boolean {
 /** The stages a redo can redraw: keyframes and clips, one shot at a time. */
 export const REDOABLE_STAGES = new Set(['keyframes', 'clips']);
 
-/** The phase a redraw of a stage runs, matching the render gate's vocabulary. */
-export function redoPhase(stage: string): 'stills' | 'video' | null {
-  if (stage === 'keyframes') return 'stills';
-  if (stage === 'clips') return 'video';
-  return null;
-}
-
 /**
  * Whether anything on disk is waiting for a human. The Timeline is the surface that
  * exists to answer this, so it is the tab a render should open on.
@@ -251,68 +244,6 @@ export function rejections(stages: AcceptanceStage[]): Rejection[] {
   return stages.flatMap((stage) => stage.slots
     .filter((slot) => slot.state === 'rejected')
     .map((slot) => ({title: slotTitle(stage.stage, slot), reason: (slot.reason || '').trim(), shot: slotKey(slot), stage: stage.stage})));
-}
-
-/** Rejections that can be sent to the shot-scoped redraw tool. */
-export function redoableRejections(items: Rejection[]): Rejection[] {
-  return items.filter((item) => REDOABLE_STAGES.has(item.stage) && item.shot.trim().length > 0);
-}
-
-/**
- * The instruction that turns typed guidance into a redraw. The reasons are quoted
- * verbatim: they are the user's words about what went wrong, and the point of recording
- * them is that the regeneration answers them instead of guessing again. The shots are
- * named explicitly so a redraw cannot quietly spread into shots nobody asked about.
- */
-export function redoRequestText(items: Rejection[], root = ''): string {
-  const redoable = redoableRejections(items);
-  if (redoable.length === 0) return '';
-  const stages = [...new Set(redoable.map((item) => item.stage))];
-  const phase = redoOrderedPhase(stages);
-  // The slot key is stated beside the name on the card: the Timeline numbers shots from
-  // one and the keys are shot directories numbered from zero, so "Shot 3" is slot "2".
-  const lines = redoable.map((item) => `- ${item.title} (slot key "${item.shot}"): ${item.reason || 'no reason given'}`);
-  return [
-    `Redraw exactly these shots${root ? ` in ${root}` : ''} in ${phase}, and no others:`,
-    ...lines,
-    '',
-    // A redraw asked for from a card names the slot itself, so the guard that exists to stop a
-    // person confusing the card's "Shot 3" with slot 3 has nothing to protect here — and it has
-    // been refusing an honest redraw because some *other* shot carries a rejection note.
-    `Run vimax_render_video with exactly these arguments and no others: ${root ? `render_mode="${root}", ` : ''}${redoArgument(redoable)}, stop_after="${phase}", allow_unreviewed_redo=true.`,
-    `The render clears those shots\' artifacts and puts each note into the prompt it redraws from, so state the problem in your own words above if the note is thin.`,
-    `Every other shot and every accepted artifact stays as it is. Return the ${phase} outputs for review; do not begin another generation phase.`,
-    'Do not change render_mode: a redraw never moves the sequence to another root.',
-  ].join('\n');
-}
-
-/**
- * The instruction to redraw one slot, from the card the user is looking at. It is the
- * same request as the header's, scoped to the slot whose button was pressed.
- */
-export function redoOneText(root: string, stage: string, slot: AcceptanceSlot, note = ''): string {
-  return redoRequestText([{
-    title: slotTitle(stage, slot),
-    // A slot redrawn before carries its note as the reason it was redrawn: the request has
-    // to quote that, or the second redraw repeats the first one's mistake. A note typed
-    // against the plan takes precedence, because it is the newer thing said about this shot.
-    reason: (note || slot.reason || slot.note || '').trim(),
-    shot: slotKey(slot),
-    stage,
-  }], root);
-}
-
-/** `redo_shots=["2"]`, the explicit form of the same request. */
-export function redoArgument(items: Rejection[]): string {
-  return `redo_shots=[${redoableRejections(items).map((item) => JSON.stringify(item.shot)).join(', ')}]`;
-}
-
-/**
- * The phase a mixed set of redraws has to stop at: keyframes are redrawn before the
- * clips animated from them, and both need the user's eyes before anything else is spent.
- */
-export function redoOrderedPhase(stages: string[]): 'stills' | 'video' {
-  return stages.some((stage) => redoPhase(stage) === 'stills') ? 'stills' : 'video';
 }
 
 export type RenderActivity = 'idle' | 'running' | 'stalled' | 'interrupted' | 'finished' | 'failed' | 'blocked';

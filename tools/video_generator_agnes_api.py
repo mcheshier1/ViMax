@@ -7,7 +7,12 @@ import random
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
+import base64
+from io import BytesIO
+
 import aiohttp
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from interfaces.video_output import VideoOutput
 from utils.image import image_path_to_b64
@@ -45,18 +50,22 @@ class VideoGeneratorAgnesAPI:
             self.clip_seconds,
             allowed=allowed_durations,
         )
+        resolution = _resolution(self.resolution)
+        if self.model == "agnes-video-2.5-flash" and resolution != "720P":
+            raise ValueError("Agnes Video 2.5 Flash supports 720p resolution only")
         payload = {
             "model": self.model,
             "prompt": prompt,
             "mode": "keyframe" if paths else "text",
             "seconds": str(duration),
-            "size": _resolution(self.resolution),
+            "size": resolution,
             "aspect_ratio": aspect_ratio,
         }
         if paths:
-            payload["first_frame"] = image_path_to_b64(paths[0])
+            frame_size = _reference_size(aspect_ratio, resolution)
+            payload["first_frame"] = _reference_frame_to_b64(paths[0], frame_size)
             if len(paths) > 1:
-                payload["last_frame"] = image_path_to_b64(paths[-1])
+                payload["last_frame"] = _reference_frame_to_b64(paths[-1], frame_size)
         progress = kwargs.get("progress")
         if progress:
             progress("video_create", f"Creating Agnes video with {self.model}", {"model": self.model, "duration": duration, "resolution": payload["size"]})
@@ -208,3 +217,57 @@ def _resolution(value: str) -> str:
     if normalized in {"720P", "1080P", "1K", "2K"}:
         return normalized
     raise ValueError(f"Unsupported Agnes resolution: {value}; use 720p, 1080p, 1K, or 2K")
+
+
+_REFERENCE_CANVASES = {
+    "720P": {
+        "21:9": (1470, 630), "16:9": (1280, 720), "4:3": (1112, 834),
+        "1:1": (960, 960), "3:4": (834, 1112), "9:16": (720, 1280),
+    },
+    "1080P": {
+        "21:9": (2206, 946), "16:9": (1920, 1080), "4:3": (1664, 1248),
+        "1:1": (1440, 1440), "3:4": (1248, 1664), "9:16": (1080, 1920),
+    },
+    "2K": {
+        "21:9": (2940, 1260), "16:9": (2560, 1440), "4:3": (2224, 1668),
+        "1:1": (1920, 1920), "3:4": (1668, 2224), "9:16": (1440, 2560),
+    },
+}
+
+
+def _reference_size(aspect_ratio: str, resolution: str) -> tuple[int, int]:
+    if resolution == "1K":
+        if aspect_ratio == "1:1":
+            return (1024, 1024)
+        raise ValueError("Agnes 1K output is fixed at 1024x1024; keyframe references require aspect_ratio='1:1'")
+    try:
+        return _REFERENCE_CANVASES[resolution][aspect_ratio]
+    except (KeyError, TypeError):
+        supported = ", ".join(_REFERENCE_CANVASES["720P"])
+        raise ValueError(f"Unsupported Agnes reference aspect ratio: {aspect_ratio}; use one of {supported}") from None
+
+
+def _reference_frame_to_b64(image_path: str, size: tuple[int, int]) -> str:
+    """Create a request-local, EXIF-correct, aspect-preserving keyframe image."""
+    try:
+        with Image.open(image_path) as source:
+            orientation = source.getexif().get(274, 1)
+            oriented = ImageOps.exif_transpose(source)
+            if orientation == 1 and oriented.size == size:
+                return image_path_to_b64(image_path)
+            oriented.load()
+            has_alpha = "A" in oriented.getbands() or "transparency" in oriented.info
+            image = oriented.convert("RGBA" if has_alpha else "RGB")
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise ValueError(f"Unable to use Agnes keyframe image {image_path!r}: {exc}") from exc
+
+    fitted = ImageOps.contain(image, size, method=Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    position = ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2)
+    if fitted.mode == "RGBA":
+        canvas.paste(fitted.convert("RGB"), position, fitted.getchannel("A"))
+    else:
+        canvas.paste(fitted, position)
+    encoded = BytesIO()
+    canvas.save(encoded, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(encoded.getvalue()).decode('ascii')}"
